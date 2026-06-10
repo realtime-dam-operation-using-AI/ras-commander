@@ -42,7 +42,9 @@ Type RM Length L Ch R  = 1 ,12345.67,   100.0,   100.0,   100.0
 Call these static methods directly for common geometry operations:
 
 ```python
-from ras_commander import RasGeometry, RasGeo
+from ras_commander import RasGeometry
+from ras_commander.geom import GeomLandCover
+from ras_commander.hdf import HdfLandCover
 
 # Get cross sections from geometry file
 xs_df = RasGeometry.get_cross_sections(geom_file)
@@ -50,8 +52,24 @@ xs_df = RasGeometry.get_cross_sections(geom_file)
 # Get river/reach structure
 rivers = RasGeometry.get_rivers(geom_file)
 
-# Modify 2D Manning's n values
-RasGeo.set_2d_mannings_n(geom_file, new_n_values)
+# Modify 2D Manning's n base table (plain text geometry)
+GeomLandCover.set_base_mannings_n(geom_file, mannings_df)
+
+# Modify land cover sidecar (raster class -> n mapping)
+HdfLandCover.set_landcover_raster_map(sidecar_hdf, {"Forest": 0.12})
+```
+
+## Manning's n Block Limit
+
+HEC-RAS enforces a **hard limit of 20 Manning's n blocks per 1D cross section**. Block counts of 21 or more are rejected at compute time with a `data_errors` limit violation. Verified empirically on HEC-RAS 6.6 across Muncie, Channel Modification, and Beaver Creek examples.
+
+```python
+from ras_commander.geom import GeomCrossSection
+
+# Constant available for programmatic checks
+GeomCrossSection.MAX_MANNINGS_N_BLOCKS  # 20
+
+# set_mannings_n() raises ValueError if mann_df exceeds 20 rows
 ```
 
 ## Bank Station Interpolation
@@ -82,6 +100,29 @@ if len(stations) > 500:
 
 Use `_find_xs_section_end()` to dynamically search to the end of each XS section. Do not impose a fixed search range limit -- the parser searches until it finds the next `Type RM Length L Ch R =` header, `River Reach=` block, or end of file. This handles XS with arbitrarily many GIS cut line points (verified with 462-point real-world FEMA models).
 
+## 2D Flow Area Subgrid Sampling Options
+
+For HEC-RAS 6.x 2D models, check and configure subgrid sampling:
+
+```python
+from ras_commander import GeomStorage
+
+# Read current settings
+settings = GeomStorage.get_2d_flow_area_settings("model.g01")
+print(settings[['name', 'spatially_varied_mann_on_faces', 'composite_classification']])
+
+# Enable both (recommended best practice)
+GeomStorage.set_2d_flow_area_settings(
+    "model.g01", "Perimeter 1",
+    spatially_varied_mann_on_faces=True,
+    composite_classification=True,
+)
+```
+
+**Reference**: [HEC-RAS Subgrid Concept](https://www.hec.usace.army.mil/confluence/rasdocs/d2sd/ras2dsedtr/latest/numerical-methods/subgrid-concept)
+
+`RasCheck` automatically suggests enabling these when disabled (WARNING severity).
+
 ## Cross-References
 
 **Agents** (delegate when needed):
@@ -93,6 +134,7 @@ Use `_find_xs_section_end()` to dynamically search to the end of each XS section
 - `qa_repair_geometry` -- Use to fix blocked obstructions and geometry errors
 
 **Rules** (auto-loaded context):
+- `.claude/rules/hec-ras/land-cover-mannings-n.md` -- Land cover Manning's n override architecture and NaN semantics
 - `.claude/rules/python/state-machine-empty-line-handling.md` -- Read when parsing multi-line geometry blocks
 
 **Primary sources**:

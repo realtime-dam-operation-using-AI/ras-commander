@@ -50,9 +50,9 @@ This library demonstrates the **LLM Forward** approach to engineering software d
 
 This repository has several methods of interaction with Large Language Models and LLM-Assisted Coding built right in:
 
-1. **[Claude Code Agentic Infrastructure](https://github.com/gpt-cmdr/ras-commander/tree/main/.claude)**: A comprehensive cognitive infrastructure built for [Anthropic's Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI tool. The `.claude/` directory contains specialized **agents** (domain experts for HDF analysis, geometry parsing, USGS integration, remote execution), **skills** (workflow templates for common tasks like plan execution and results extraction), **rules** (auto-loaded coding patterns and best practices), and **commands** (slash commands for common operations). The root `CLAUDE.md` provides strategic guidance while `AGENTS.md` files throughout the codebase offer scoped context. This hierarchical knowledge system enables Claude Code to understand ras-commander's static class patterns, HEC-RAS domain concepts, and testing approaches - making it an effective pair programming partner for hydraulic engineering automation. Just open the repository in Claude Code (`claude` in terminal) to leverage the full infrastructure.
+1. **[Claude Code Agentic Infrastructure](https://github.com/gpt-cmdr/ras-commander/tree/main/.claude)**: A comprehensive cognitive infrastructure built for [Anthropic's Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI tool. The `.claude/` directory contains specialized **agents**, **skills**, **rules**, and **commands**. Claude loads `CLAUDE.md`, which imports the shared `AGENTS.md` contract so Claude and Codex stay aligned.
 
-2. **[Third-Party AI Framework Support](https://github.com/gpt-cmdr/ras-commander/tree/main/.cursor/rules)**: The repository supports common AI coding frameworks including **Cursor IDE** (`.cursor/rules/`), **AGENTS.md standard** (scoped guidance files throughout codebase), and other LLM-assisted development tools. All framework configurations point to the authoritative `CLAUDE.md` and `.claude/rules/` documentation - no content duplication. Just open the repository in your preferred AI-assisted IDE to leverage the built-in context.
+2. **Codex Support**: Codex reads the canonical `AGENTS.md` hierarchy directly. Shared skills can be exposed through the generated `.agents/skills/` bridge without copying skill content. Claude Code and Codex are the production harnesses for this repository; other tools may still read the markdown context but are not the standard setup.
 
 3. **[Full Documentation on ReadTheDocs](https://ras-commander.readthedocs.io/)**: Comprehensive API documentation, user guides, and example notebooks. Includes installation guide, quick start, and detailed class references.
 
@@ -102,6 +102,15 @@ HDF Data Access & Analysis
 - Infiltration and soil data handling
 - Land cover and terrain data integration
 - Weighted parameter calculations for hydrologic modeling
+
+Headless 2D Mesh Generation (NEW — `GeomMesh`)
+- **Programmatic mesh generation** without the HEC-RAS GUI — calls RasMapperLib .NET methods via pythonnet
+- Cell size control, breakline spacing (near/far), and automatic mesh quality fixing
+- Text-first architecture: edits `.g##` text, compiles HDF as needed, never accepts HDF as input
+- Multi-tier auto-fix loop: short-segment removal, aspect-ratio escalation, midpoint insertion, perimeter simplification, Douglas-Peucker
+- Breakline-aware seed generation via .NET `RegenerateMeshPoints` (reflection on private method)
+- Mesh sensitivity analysis workflow — see `examples/230_mesh_sensitivity_analysis.ipynb`
+- Requires: HEC-RAS 6.6 installed (for RasMapperLib DLLs), `pip install pythonnet`
 
 RASMapper Data Integration
 - RASMapper configuration parsing (.rasmap files)
@@ -330,7 +339,7 @@ RasCmdr.compute_parallel(["01", ..., "10"])  # Runs only modified plans
 
 ```python
 # Initialize with version
-init_ras_project(project_path, "4.1")  # or "41", "5.0.6", "506", "6.6", etc.
+init_ras_project(project_path, "4.1")  # or "41", "5.0.6", "506", "7.0", etc.
 
 # Run a plan (auto-sets as current, blocks until complete)
 success, messages = RasControl.run_plan("02")
@@ -359,9 +368,9 @@ RAS Commander allows working with multiple HEC-RAS projects simultaneously:
 ```python
 # Initialize multiple projects
 project1 = RasPrj()
-init_ras_project(path1, "6.6", ras_object=project1)
+init_ras_project(path1, "7.0", ras_object=project1)
 project2 = RasPrj()
-init_ras_project(path2, "6.6", ras_object=project2)
+init_ras_project(path2, "7.0", ras_object=project2)
 
 # Perform operations on each project
 RasCmdr.compute_plan("01", ras_object=project1, dest_folder=folder1)
@@ -561,25 +570,25 @@ boundary = HdfFluvialPluvial.calculate_fluvial_pluvial_boundary(
 Check out the examples in the repository to learn how to use RAS Commander:
 
 ### Project Setup
-- `00_Using_RasExamples.ipynb`: Download and extract HEC-RAS example projects
-- `01_project_initialization.ipynb`: Initialize HEC-RAS projects and explore their components
+- `100_using_ras_examples.ipynb`: Download and extract HEC-RAS example projects
+- `101_project_initialization.ipynb`: Initialize HEC-RAS projects and explore their components
 
 ### File Operations
-- `02_plan_and_geometry_operations.ipynb`: Clone and modify plan and geometry files
-- `03_unsteady_flow_operations.ipynb`: Extract and modify boundary conditions
-- `09_plan_parameter_operations.ipynb`: Retrieve and update plan parameters
+- `103_plan_and_geometry_operations.ipynb`: Clone and modify plan and geometry files
+- `300_unsteady_flow_operations.ipynb`: Extract and modify boundary conditions
+- `104_plan_parameter_operations.ipynb`: Retrieve and update plan parameters
 
 ### Execution Modes
-- `05_single_plan_execution.ipynb`: Execute a single plan with specific options
-- `06_executing_plan_sets.ipynb`: Different ways to specify and execute plan sets
-- `07_sequential_plan_execution.ipynb`: Run multiple plans in sequence
-- `08_parallel_execution.ipynb`: Run multiple plans in parallel
+- `110_single_plan_execution.ipynb`: Execute a single plan with specific options
+- `111_executing_plan_sets.ipynb`: Different ways to specify and execute plan sets
+- `112_sequential_plan_execution.ipynb`: Run multiple plans in sequence
+- `113_parallel_execution.ipynb`: Run multiple plans in parallel
 
 ### Legacy Version Support
-- `17_legacy_1d_automation_with_hecrascontroller_and_rascontrol.ipynb`: Using RasControl for HEC-RAS 3.x-6.x via COM interface
+- `121_legacy_hecrascontroller_and_rascontrol.ipynb`: Using RasControl for HEC-RAS 3.x-6.x via COM interface
 
 ### Advanced Operations
-- `04_multiple_project_operations.ipynb`: Work with multiple HEC-RAS projects simultaneously
+- `102_multiple_project_operations.ipynb`: Work with multiple HEC-RAS projects simultaneously
 
 These examples demonstrate practical applications of RAS Commander for automating HEC-RAS workflows, from basic operations to advanced scenarios.
 
@@ -616,16 +625,16 @@ This project follows a specific style guide to maintain consistency across the c
 
 ## Acknowledgments
 
-RAS Commander is based on the HEC-Commander project's "Command Line is All You Need" approach, leveraging the HEC-RAS command-line interface for automation. The initial development of this library was presented in the HEC-Commander Tools repository. In a 2024 Australian Water School webinar, Bill demonstrated the derivation of basic HEC-RAS automation functions from plain language instructions. Leveraging the previously developed code and AI tools, the library was created. The primary tools used for this initial development were Anthropic's Claude, GPT-4, Google's Gemini Experimental models, and the Cursor AI Coding IDE.
+RAS Commander is based on the HEC-Commander project's "Command Line is All You Need" approach, leveraging the HEC-RAS command-line interface for automation. The initial development of this library was presented in the HEC-Commander Tools repository. In a 2024 Australian Water School webinar, Bill demonstrated the derivation of basic HEC-RAS automation functions from plain language instructions. Leveraging the previously developed code and LLM Coding tools, the library was created. The primary tools used for this initial development were Anthropic's Claude, GPT-4, Google's Gemini Experimental models, and the Cursor LLM-Assisted Coding IDE -- especially CLI tools such as Claude Code and Codex.
 
 Additionally, we would like to acknowledge the following notable contributions and attributions for open source projects which significantly influenced the development of RAS Commander:
 
-1. Contributions: Sean Micek's [`funkshuns`](https://github.com/openSourcerer9000/funkshuns), [`TXTure`](https://github.com/openSourcerer9000/TXTure), and [`RASmatazz`](https://github.com/openSourcerer9000/RASmatazz) libraries provided inspiration, code examples and utility functions which were adapted with AI for use in RAS Commander. Sean has also contributed heavily to 
+1. Contributions: Sean Micek's [`funkshuns`](https://github.com/openSourcerer9000/funkshuns), [`TXTure`](https://github.com/openSourcerer9000/TXTure), and [`RASmatazz`](https://github.com/openSourcerer9000/RASmatazz) libraries provided inspiration, code examples and utility functions which were adapted with LLM assistance for use in RAS Commander. Sean has also contributed heavily to 
 
 - Development of additional HDF functions for detailed analysis and mapping of HEC-RAS results within the RasHdf class.
 - Development of the prototype `RasCmdr` class for executing HEC-RAS simulations.
 
-2. Attribution: The [`pyHMT2D`](https://github.com/psu-efd/pyHMT2D/) project by Xiaofeng Liu, which provided insights into HDF file handling methods for HEC-RAS outputs.  Many of the functions in the [Ras_2D_Data.py](https://github.com/psu-efd/pyHMT2D/blob/main/pyHMT2D/Hydraulic_Models_Data/RAS_2D/RAS_2D_Data.py) file were adapted with AI for use in RAS Commander. 
+2. Attribution: The [`pyHMT2D`](https://github.com/psu-efd/pyHMT2D/) project by Xiaofeng Liu, which provided insights into HDF file handling methods for HEC-RAS outputs.  Many of the functions in the [Ras_2D_Data.py](https://github.com/psu-efd/pyHMT2D/blob/main/pyHMT2D/Hydraulic_Models_Data/RAS_2D/RAS_2D_Data.py) file were adapted with LLM assistance for use in RAS Commander. 
 
    Xiaofeng Liu, Ph.D., P.E.,    Associate Professor, Department of Civil and Environmental Engineering
    Institute of Computational and Data Sciences, Penn State University
@@ -639,6 +648,10 @@ These acknowledgments recognize the contributions and inspirations that have hel
 5. [HEC-Commander Tools](https://github.com/gpt-cmdr/HEC-Commander) - Inspiration and initial code base for the development of RAS Commander.
 
 6. Attribution: Glenn Heistand's [`ras-agent`](https://github.com/gheistand/ras-agent) (CHAMP -- Illinois State Water Survey) -- an automated HEC-RAS pipeline that converts pour points into flood maps. The ras-agent pipeline's Linux execution patterns (`runner.py`), HDF results extraction (`results.py`), and Cloud-Optimized GeoTIFF rasterization directly informed the development of several ras-commander methods including `RasCmdr.compute_plan_linux()`, `HdfResultsMesh.get_mesh_max_depth()`, `HdfResultsMesh.export_max_depth_raster()`, `RasUtils.dos2unix()`, and `HdfBase.strip_results()`.
+
+7. Attribution and Contribution: Gyan Basyal's [`pydsstools`](https://github.com/gyanz/pydsstools) and [`rivia`](https://github.com/gyanz/rivia) packages. Gyan's pydsstools was particularly influential in ras-commander's DSS handling approach -- its cross-version DSS6/DSS7 support philosophy, HEC epoch time conversion pattern, catalog-based lazy loading design, and TimeSeriesContainer wrapping informed the architecture of ras-commander's `RasDss` module. Gyan's rivia package is the source of the StoreAllMaps approach implemented in the ras-commander RasProcess module. 
+
+8. Attribution: Michael Koohafkan's [`dssrip2`](https://github.com/mkoohafkan/dssrip2) -- an R package for reading and writing HEC-DSS files. The dssrip2 project's HEC Monolith JAR download and management approach was directly replicated in ras-commander's `_hec_monolith.py` module, including the Maven artifact specifications, platform-specific native library handling, and automatic download/cache strategy. This enabled ras-commander to provide a pure-Python DSS reading capability via the same Java bridge architecture that dssrip2 pioneered for R.
 
 ## Official RAS Commander AI-Generated Songs:
 

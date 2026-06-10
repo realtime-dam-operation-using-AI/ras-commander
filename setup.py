@@ -34,10 +34,15 @@ class CustomBuildPy(build_py):
 
 setup(
     name="ras-commander",
-    version="0.92.0",
-    packages=find_packages(),
+    version="0.98.0",
+    packages=find_packages(include=['ras_commander', 'ras_commander.*']),
     include_package_data=True,
     package_data={
+        "ras_commander": [
+            "resources/*.json",
+            "resources/land_classification/*.hdf",
+            "resources/templates/*/*",
+        ],
         "ras_commander.native": [
             "RasStoreMapHelper.exe",
             "RasStoreMapHelper.cs",
@@ -69,7 +74,7 @@ setup(
         'fsspec>=2023.0.0',  # Required for Atlas14Grid remote HTTP access
         'pywin32>=227; sys_platform == "win32"',    # Required for RasControl COM interface (Windows only)
         'psutil>=5.6.6',   # Required for RasControl process management
-        'hms-commander>=0.2.0',  # Atlas 14 DataFrame API with standardized return format
+        'hms-commander>=0.3.1',  # Storm generator updates and Atlas 14 DataFrame API
     ],
     extras_require={
         # Remote execution backends (PsExec worker has no extra deps)
@@ -88,13 +93,17 @@ setup(
             'azure-mgmt-compute>=30.0',
         ],
         # GUI automation and screenshot capture (Windows only)
-        'gui': ['Pillow>=9.0'],
+        'gui': ['Pillow>=9.0', 'comtypes>=1.4.0; sys_platform == "win32"'],
         # USGS gauge data integration
         'usgs': ['dataretrieval>=1.0'],
         # Precipitation enhancements
         'precip-huc12': ['pygeohydro>=0.19.0'],  # HUC12 watershed boundaries for Atlas14Variance
         # Notebook dependencies (raster visualization, coordinate systems)
         'notebooks': ['rasterio', 'pyproj', 'aiohttp', 'dataretrieval>=1.0'],
+        # RasMapperLib pythonnet interop: headless mesh generation and
+        # polyline profile queries for velocity, WSE, flow, time-series,
+        # pipe-network, and plan-difference renderers (Windows HEC-RAS install required)
+        'mesh': ['pythonnet>=3.0.5'],
         # DSS file operations (requires Java JRE/JDK 8+)
         'dss': ['pyjnius'],
         # Everything (all optional dependencies)
@@ -106,11 +115,13 @@ setup(
             'azure-identity>=1.14',
             'azure-mgmt-compute>=30.0',
             'Pillow>=9.0',
+            'comtypes>=1.4.0; sys_platform == "win32"',
             'dataretrieval>=1.0',
             'pygeohydro>=0.19.0',
             'rasterio',
             'pyproj',
             'aiohttp',
+            'pythonnet>=3.0.5',
             'pyjnius',
         ],
     })

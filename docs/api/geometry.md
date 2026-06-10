@@ -9,10 +9,73 @@ Comprehensive 1D geometry parsing and modification.
 ### Cross Section Methods
 
 - `get_cross_sections(geom)` - List all cross sections
+- `build_cross_section(input_spec=None, **kwargs)` - Build a complete Type 1 cross-section geometry entry from station/elevation, terrain, adjacent XS, bank, Manning's n, and reach-length inputs
 - `get_station_elevation(geom, river, reach, station)` - Get station-elevation pairs
 - `set_station_elevation(geom, river, reach, station, sta_elev)` - Modify station-elevation
 - `get_mannings_n(geom, river, reach, station)` - Get Manning's n values
 - `get_bank_stations(geom, river, reach, station)` - Get bank station locations
+
+### Cross Section Builder
+
+`GeomCrossSection.build_cross_section()` returns a `CrossSectionBuildResult`
+with resolved station/elevation, bank stations, Manning's n breakpoints, reach
+lengths, fallback messages, and formatted `.g##` geometry lines. The method
+accepts either keyword arguments or a `CrossSectionBuildInput` dataclass.
+
+```python
+from ras_commander import (
+    CrossSectionBankStations,
+    CrossSectionManningsN,
+    CrossSectionReachLengths,
+    GeomCrossSection,
+)
+
+result = GeomCrossSection.build_cross_section(
+    river="Example River",
+    reach="Main",
+    rs="1000",
+    terrain_profile=terrain_df,  # columns: station/elevation or Station/Elevation
+    cut_line=[(0.0, 0.0), (500.0, 0.0)],
+    river_centerline=[(250.0, -50.0), (250.0, 50.0)],
+)
+
+entry_text = result.text
+```
+
+Fallback behavior is intentionally visible. Every fallback logs at `ERROR`
+level with `river|reach|RS` and also appears in `result.fallback_messages`.
+The builder always writes required `Bank Sta=`, `#Sta/Elev=`, and `#Mann=`
+records when enough station/elevation data can be resolved.
+
+Resolution order:
+
+- Station/elevation: explicit `station_elevation`, terrain profile or
+  `RasTerrainMod.get_terrain_profile()`, then adjacent XS interpolation.
+- Bank stations: explicit station/elevation, explicit stations with terrain
+  elevations, river-centerline intersection with default 20-unit main-channel
+  width, then profile-interpolated bank elevations when terrain is unavailable.
+- Manning's n: controlled by `mannings_strategy`. `auto` prefers land cover,
+  neighboring XS interpolation, user values, then defaults (`MC=0.06`,
+  `LOB=ROB=0.08`). Strategies `landcover`, `neighbor`, `user`, and `default`
+  make a source preferred.
+- Point count: station/elevation output is capped at 500 points using a
+  Douglas-Peucker-style reducer that preserves endpoints, banks, the thalweg,
+  and major slope breaks.
+
+Fully specified inputs avoid fallbacks:
+
+```python
+result = GeomCrossSection.build_cross_section(
+    river="Example River",
+    reach="Main",
+    rs="1000",
+    station_elevation=survey_df,
+    bank_stations=CrossSectionBankStations(120.0, 180.0, 534.2, 533.8),
+    mannings_n=CrossSectionManningsN(lob=0.08, channel=0.05, rob=0.08),
+    reach_lengths=CrossSectionReachLengths(left=400.0, channel=390.0, right=410.0),
+)
+assert result.fallback_messages == []
+```
 
 ### Storage Area Methods
 
@@ -40,6 +103,59 @@ Parsing utilities for HEC-RAS geometry files.
 - `parse_count_line(line)` - Parse count header line
 - `interpolate_bank_station(sta_elev, bank)` - Interpolate bank station elevation
 
+## GeomReferenceFeatures
+
+Reference line and reference point helpers for 2D calibration and native
+reference-line output.
+
+### Reference Line Methods
+
+- `add_reference_lines(geom_file, lines, storage_area)` - Insert manually
+  supplied reference lines into a `.g##` file
+- `generate_reference_lines_from_longitudinal_line(...)` - Generate
+  transverse reference-line dictionaries at regular station intervals along a
+  named longitudinal line
+- `add_reference_lines_from_longitudinal_line(...)` - Generate and write
+  transverse reference lines through the existing `.g##` writer
+- `get_reference_lines(geom_file)` - Read reference lines from a `.g##` file
+
+### Automated Reference Lines
+
+```python
+from ras_commander import GeomReferenceFeatures
+
+reference_lines = GeomReferenceFeatures.generate_reference_lines_from_longitudinal_line(
+    centerlines_gdf,
+    longitudinal_line_name="Main River",
+    spacing=500.0,
+    line_length=1500.0,
+    name_template="MainRiver_{station_int}",
+)
+
+GeomReferenceFeatures.add_reference_lines(
+    "MyModel.g01",
+    reference_lines,
+    storage_area="Perimeter 1",
+)
+```
+
+For result-guided orientation, pass `orientation="velocity"` or
+`orientation="depth_velocity"` with `orientation_plan_hdf`. Generated lines fall
+back to normal-to-line orientation unless `orientation_fallback="raise"` is set.
+
+## GeomMesh
+
+Headless 2D mesh generation helpers and compiled geometry HDF refinement-region
+utilities.
+
+### Refinement Region Methods
+
+- `add_refinement_region(geom_number, polygon, spacing_dx, ...)` - Add one refinement polygon to an existing compiled geometry HDF.
+- `add_flowline_refinement_regions(geom_number, flowlines, buffer_width, ...)` - Buffer GeoDataFrame or LineString channel flowlines into refinement-region polygons, optionally simplify/trim them, write them through `add_refinement_region()`, and return FID/name/spacing mappings.
+- `get_refinement_regions(geom_number)` - Read refinement-region FID, name, and spacing values from a compiled geometry HDF.
+- `set_refinement_region_spacing(geom_number, spacing_dx, ...)` - Update spacing for one or more existing refinement regions.
+- `set_refinement_region_name(geom_number, new_name, ...)` - Rename an existing refinement region.
+
 ## RasStruct
 
 Inline structure parsing.
@@ -58,12 +174,132 @@ Inline structure parsing.
 - `get_bridge_abutment(geom, river, reach, station)` - Get abutment data
 - `get_bridge_approach_sections(geom, river, reach, station)` - Get approach sections
 - `get_bridge_coefficients(geom, river, reach, station)` - Get coefficients
+- `get_hydraulic_methods(geom, river, reach, station)` - Get bridge low-flow/high-flow method selections from `Bridge Culvert-`, `Deck Dist Width WeirC`, `BR Coef=`, and `WSPro=` records
+- `set_hydraulic_methods(geom, river, reach, station, low_flow_method=..., high_flow_method=..., weir_coefficient=...)` - Set bridge modeling approach method selections and related coefficients
 - `get_bridge_htab(geom, river, reach, station)` - Get HTAB settings
+
+Accepted `low_flow_method` values are `energy`, `momentum`, `yarnell`, and `wspro`.
+Accepted `high_flow_method` values are `energy` and `pressure_weir`.
+Optional compute flags are `use_energy`, `use_momentum`, `use_yarnell`, and `use_wspro`.
+Optional coefficient fields include `momentum_cd`, `yarnell_k`, `pressure_flow_submerged_inlet_cd`, `pressure_flow_submerged_inlet_outlet_cd`, and positive `weir_coefficient`.
+Unsupported combinations, such as disabling the selected low-flow method or selecting Momentum/Yarnell without an existing or supplied coefficient, raise `ValueError`.
 
 ### Culvert Methods
 
-- `get_culverts(geom)` - List culverts
-- `get_all_culverts(geom, river, reach, station)` - Get all culverts at location
+- `GeomCulvert.get_culverts(geom, river, reach, station)` - Get all culverts at a bridge/culvert structure
+- `GeomCulvert.get_all(geom, river=None, reach=None)` - Get all culverts in a geometry file
+- `GeomCulvert.set_culverts(geom, river, reach, station, culverts)` - Replace culvert records at an existing bridge/culvert structure
+- `GeomCulvert.set_culvert(geom, river, reach, station, culvert=None, culvert_index=None, culvert_name=None, **kwargs)` - Update one culvert by index/name or append a new one
+- `GeomCulvert.get_adjacent_cross_sections(geom, river, reach, station)` - Find the nearest upstream and downstream cross sections around a structure
+- `GeomCulvert.set_adjacent_ineffective_flow(geom, river, reach, station, upstream_ineffective=None, downstream_ineffective=None, ...)` - Coordinate ineffective-flow writes on adjacent cross sections
+
+`set_culverts()` accepts a DataFrame, list of dictionaries, or one dictionary. Shape can be supplied as `Shape` code or `ShapeName`. Required fields are `Shape`/`ShapeName`, `Span`, `Length`, `ManningsN`, `EntranceLoss`, `ExitLoss`, `InletType`, `OutletType`, `UpstreamInvert`, and `DownstreamInvert`; non-circular shapes also require `Rise`. Single-barrel records require `UpstreamStation` and `DownstreamStation`. Multi-barrel records require `NumBarrels` and matching `BarrelStations` pairs.
+
+```python
+from ras_commander.geom.GeomCulvert import GeomCulvert
+
+GeomCulvert.set_culverts(
+    "model.g01",
+    "River",
+    "Reach",
+    "1000",
+    [
+        {
+            "ShapeName": "Circular",
+            "Span": 6,
+            "Length": 50,
+            "ManningsN": 0.013,
+            "EntranceLoss": 0.5,
+            "ExitLoss": 1.0,
+            "InletType": 1,
+            "OutletType": 1,
+            "UpstreamInvert": 25.1,
+            "UpstreamStation": 996,
+            "DownstreamInvert": 25.0,
+            "DownstreamStation": 996,
+            "CulvertName": "Culvert #1",
+        },
+        {
+            "ShapeName": "Box",
+            "Span": 4,
+            "Rise": 4,
+            "Length": 55,
+            "ManningsN": 0.015,
+            "EntranceLoss": 0.3,
+            "ExitLoss": 1.0,
+            "InletType": 8,
+            "OutletType": 1,
+            "UpstreamInvert": 27.5,
+            "DownstreamInvert": 27.0,
+            "NumBarrels": 2,
+            "BarrelStations": [(980, 980), (1020, 1020)],
+            "CulvertName": "Twin Box",
+        },
+    ],
+)
+```
+
+## GeomCrossSection
+
+Cross-section authoring and blocked-obstruction management.
+
+### Cross Section Builder
+
+- `build_cross_section(input_spec=None, **kwargs)` - Build complete cross-section geometry entry from terrain, survey, or adjacent XS data
+- `get_blocked_obstructions(geom_file, river, reach, rs)` - Read blocked obstructions for a cross section
+- `set_blocked_obstructions(geom_file, river, reach, rs, obstructions)` - Write blocked obstructions
+
+See the [Cross Section Builder](#cross-section-builder) section above for resolution order and fallback behavior.
+
+## GeomBridge
+
+Bridge geometry authoring (deck profiles, piers, abutments, approach sections).
+
+### Methods
+
+- `build_bridge(geom_file, river, reach, rs, **bridge_params)` - Author complete bridge geometry
+- `get_bridge_deck(geom_file, river, reach, rs)` - Read bridge deck profile
+- `set_bridge_deck(geom_file, river, reach, rs, deck_data)` - Write bridge deck profile
+
+## GeomBcLines
+
+2D boundary condition line geometry authoring.
+
+### Methods
+
+- `add_bc_line(geom_file, flow_area, name, coordinates, bc_type)` - Add BC line to 2D flow area
+- `get_bc_lines(geom_file, flow_area=None)` - Read existing BC lines
+- `remove_bc_line(geom_file, flow_area, name)` - Remove a BC line
+
+## GeomLateral
+
+Lateral structure parsing and modification.
+
+### Methods
+
+- `get_lateral_structures(geom_file)` - List lateral structures
+- `get_lateral_weir_profile(geom_file, name)` - Get weir profile data
+
+## GeomStorage
+
+Storage area and 2D flow area geometry parsing and writing.
+
+### Methods
+
+- `get_storage_areas(geom_file)` - List storage areas with elevation-volume data
+- `get_2d_flow_areas(geom_file)` - List 2D flow areas with settings
+- `get_2d_flow_area_settings(geom_file)` - Read 2D flow area computation settings
+- `set_2d_flow_area_settings(geom_file, area_name, **settings)` - Write 2D flow area settings (subgrid sampling, composite classification)
+- `write_2d_flow_area_perimeter(geom_file, area_name, coordinates, ...)` - Write 2D flow area perimeter
+
+## GeomLevee
+
+Levee station-elevation parsing and modification.
+
+### Methods
+
+- `get_levees(geom_file, river=None, reach=None, rs=None)` - Read levee data for cross sections
+- `set_levees(geom_file, river, reach, rs, levee_data)` - Write levee station-elevation data
 
 ## RasBreach
 

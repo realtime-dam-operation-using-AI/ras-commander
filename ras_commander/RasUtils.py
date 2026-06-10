@@ -113,7 +113,7 @@ class RasUtils:
         path = Path(directory_path)
         try:
             path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Directory ensured: {path}")
+            logger.debug(f"Directory ensured: {path}")
         except Exception as e:
             logger.error(f"Failed to create directory {path}: {e}")
             raise
@@ -181,7 +181,10 @@ class RasUtils:
     })
 
     @staticmethod
-    def ignore_windows_reserved(directory, contents):
+    def ignore_windows_reserved(
+        directory: str | Path,
+        contents: list[str],
+    ) -> set[str]:
         """
         Ignore function for shutil.copytree that skips Windows reserved device names.
 
@@ -271,7 +274,7 @@ class RasUtils:
         if path.exists():
             try:
                 size = path.stat().st_size
-                logger.info(f"Size of {path}: {size} bytes")
+                logger.debug(f"Size of {path}: {size} bytes")
                 return size
             except Exception as e:
                 logger.error(f"Failed to get size for {path}: {e}")
@@ -305,7 +308,7 @@ class RasUtils:
         if path.exists():
             try:
                 mtime = path.stat().st_mtime
-                logger.info(f"Last modification time of {path}: {mtime}")
+                logger.debug(f"Last modification time of {path}: {mtime}")
                 return mtime
             except Exception as e:
                 logger.exception(f"Failed to get modification time for {path}")
@@ -327,7 +330,7 @@ class RasUtils:
         Parameters:
         ras_number (Union[str, int, float, Path, Number]): Input number in various formats:
             - int: 1, 2, 3, etc.
-            - str: "1", "01", "001", etc.
+            - str: "1", "01", "001", "p01", ".p01", "project.p01", etc.
             - float: 1.0, 2.0 (must be whole numbers)
             - Path: Path("project.p05") - extracts number from extension
             - Number: numpy.int64(1), etc.
@@ -347,6 +350,8 @@ class RasUtils:
         >>> RasUtils.normalize_ras_number("01")
         '01'
         >>> RasUtils.normalize_ras_number("001")
+        '01'
+        >>> RasUtils.normalize_ras_number("p01")
         '01'
         >>> RasUtils.normalize_ras_number(np.int64(5))
         '05'
@@ -380,9 +385,29 @@ class RasUtils:
 
         # Convert to integer for validation
         try:
-            # Handle string inputs - strip leading zeros before conversion
+            # Handle string inputs including bare prefixed forms ("p01") and
+            # filename/path strings ("project.p01").
             if isinstance(ras_number, str):
-                stripped = ras_number.lstrip('0')
+                text = ras_number.strip()
+                path_suffix = Path(text).suffix
+                if (
+                    len(path_suffix) >= 3
+                    and path_suffix[0] == "."
+                    and path_suffix[1].isalpha()
+                    and path_suffix[2:].isdigit()
+                ):
+                    text = path_suffix[2:]
+                elif (
+                    len(text) >= 2
+                    and text[0] == "."
+                    and text[1].isalpha()
+                    and text[2:].isdigit()
+                ):
+                    text = text[2:]
+                elif len(text) >= 2 and text[0].isalpha() and text[1:].isdigit():
+                    text = text[1:]
+
+                stripped = text.lstrip('0')
                 if not stripped or not stripped.isdigit():
                     # Handle edge cases like "0", "00", or non-numeric strings
                     if not stripped:  # Was all zeros
@@ -451,7 +476,7 @@ class RasUtils:
         # Handle direct file path input
         plan_path = Path(current_plan_number_or_path)
         if plan_path.is_file():
-            logger.info(f"Using provided plan file path: {plan_path}")
+            logger.debug(f"Using provided plan file path: {plan_path}")
             return plan_path
 
         # Handle plan number input - use centralized normalization
@@ -470,7 +495,7 @@ class RasUtils:
             logger.error(f"Plan file does not exist: {full_plan_path}")
             raise FileNotFoundError(f"Plan file does not exist: {full_plan_path}")
         
-        logger.info(f"Constructed plan file path: {full_plan_path}")
+        logger.debug(f"Constructed plan file path: {full_plan_path}")
         return full_plan_path
 
     @staticmethod
@@ -490,7 +515,9 @@ class RasUtils:
         max_attempts (int): Maximum number of removal attempts.
         initial_delay (float): Initial delay between attempts in seconds.
         is_folder (bool): If True, the path is treated as a folder; if False, it's treated as a file.
-        ras_object (RasPrj, optional): RAS object to use. If None, uses the default ras object.
+        ras_object (RasPrj, optional): Accepted for backward compatibility. The
+            cleanup does not require an initialized RAS project, so it can be used
+            before project extraction or during worker-folder cleanup.
 
         Returns:
         bool: True if the file or folder was successfully removed, False otherwise.
@@ -499,22 +526,18 @@ class RasUtils:
         >>> success = RasUtils.remove_with_retry(Path("temp_folder"), is_folder=True)
         >>> print(f"Removal successful: {success}")
         """
-        
-        ras_obj = ras_object or ras
-        ras_obj.check_initialized()
-
         path = Path(path)
         for attempt in range(1, max_attempts + 1):
             try:
                 if path.exists():
                     if is_folder:
                         shutil.rmtree(path)
-                        logger.info(f"Folder removed: {path}")
+                        logger.debug(f"Folder removed: {path}")
                     else:
                         path.unlink()
-                        logger.info(f"File removed: {path}")
+                        logger.debug(f"File removed: {path}")
                 else:
-                    logger.info(f"Path does not exist, nothing to remove: {path}")
+                    logger.debug(f"Path does not exist, nothing to remove: {path}")
                 return True
             except PermissionError as pe:
                 if attempt < max_attempts:
@@ -620,7 +643,7 @@ class RasUtils:
             ras_obj.geom_df = ras_obj.get_geom_entries()
             ras_obj.flow_df = ras_obj.get_flow_entries()
             ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
-            logger.info("RAS object dataframes have been refreshed.")
+            logger.debug("RAS object dataframes have been refreshed.")
         except Exception as e:
             logger.exception("Failed to refresh RasPrj dataframes")
             raise
@@ -690,7 +713,7 @@ class RasUtils:
             return data_source.copy()
         elif isinstance(data_source, Path):
             ext = data_source.suffix.replace('.', '', 1)
-            logger.info(f"Converting file with extension '{ext}' to DataFrame.")
+            logger.debug(f"Converting file with extension '{ext}' to DataFrame.")
             if ext == 'csv':
                 return pd.read_csv(data_source, **kwargs)
             elif ext.startswith('x'):
@@ -829,7 +852,7 @@ class RasUtils:
         percent_bias = RasUtils.calculate_percent_bias(observed_values, predicted_values)
         
         metrics = {'cor': correlation, 'rmse': rmse, 'pb': percent_bias}
-        logger.info(f"Calculated error metrics: {metrics}")
+        logger.debug(f"Calculated error metrics: {metrics}")
         return metrics
 
     
@@ -854,12 +877,12 @@ class RasUtils:
         >>> RasUtils.update_file(Path("example.txt"), update_content, "Hello")
         """
         try:
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
-            
+
             updated_lines = update_function(lines, *args) if args else update_function(lines)
-            
-            with open(file_path, 'w') as f:
+
+            with open(file_path, 'w', encoding='utf-8', errors='replace') as f:
                 f.writelines(updated_lines)
             logger.info(f"Successfully updated file: {file_path}")
         except Exception as e:
@@ -935,13 +958,13 @@ class RasUtils:
         ras_obj.check_initialized()
         
         try:
-            with open(prj_file, 'r') as f:
+            with open(prj_file, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
-            
+
             new_line = f"{file_type} File={file_type[0].lower()}{new_num}\n"
             lines.append(new_line)
-            
-            with open(prj_file, 'w') as f:
+
+            with open(prj_file, 'w', encoding='utf-8', errors='replace') as f:
                 f.writelines(lines)
             logger.info(f"Project file updated with new {file_type} entry: {new_num}")
         except Exception as e:
@@ -972,7 +995,7 @@ class RasUtils:
         target = f"{file_type} File={prefix}{number}"
 
         try:
-            with open(prj_file, 'r') as f:
+            with open(prj_file, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
 
             new_lines = [line for line in lines if line.strip() != target]
@@ -981,7 +1004,7 @@ class RasUtils:
                 logger.warning(f"Entry '{target}' not found in {prj_file}")
                 return
 
-            with open(prj_file, 'w') as f:
+            with open(prj_file, 'w', encoding='utf-8', errors='replace') as f:
                 f.writelines(new_lines)
             logger.info(f"Removed {file_type} entry {number} from project file")
         except Exception as e:
@@ -1013,7 +1036,7 @@ class RasUtils:
         new_line_content = f"{file_type} File={prefix}{new_number}"
 
         try:
-            with open(prj_file, 'r') as f:
+            with open(prj_file, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
 
             found = False
@@ -1027,7 +1050,7 @@ class RasUtils:
                 logger.warning(f"Entry '{old_line}' not found in {prj_file}")
                 return
 
-            with open(prj_file, 'w') as f:
+            with open(prj_file, 'w', encoding='utf-8', errors='replace') as f:
                 f.writelines(lines)
             logger.info(f"Renamed {file_type} entry {old_number} to {new_number} in project file")
         except Exception as e:
@@ -1930,3 +1953,214 @@ class RasUtils:
 
         logger.info(f"dos2unix: converted {modified_count} files in {project_dir}")
         return modified_count
+
+    @staticmethod
+    def _scan_native_linux_ras(roots) -> Dict[str, Path]:
+        """Scan native-Linux HEC-RAS install roots for RasUnsteady solver binaries.
+
+        A native Linux install has no Ras.exe; the executable is the RasUnsteady
+        solver (under ``bin_ras/`` for some 5.0.x layouts). Returns a mapping of
+        ``{version-folder-name: Path(RasUnsteady)}``. Platform-agnostic so it is
+        directly unit-testable (CLB-883).
+        """
+        found: Dict[str, Path] = {}
+        for root in roots:
+            root = Path(root)
+            if not root.exists():
+                continue
+            for child in sorted(root.iterdir()):
+                if not child.is_dir():
+                    continue
+                exe = None
+                for binname in ("RasUnsteady", "rasUnsteady", "rasUnsteady64"):
+                    for cand in (child / binname, child / "bin_ras" / binname):
+                        if cand.is_file():
+                            exe = cand
+                            break
+                    if exe is not None:
+                        break
+                if exe is not None:
+                    found.setdefault(child.name, exe)
+        return found
+
+    @staticmethod
+    @log_call
+    def discover_ras_versions() -> Dict[str, Path]:
+        """
+        Discover installed HEC-RAS versions by scanning Windows Registry,
+        filesystem, and Wine prefixes (on Linux).
+
+        Resolution order:
+        1. Windows Registry (HKLM, WOW6432Node, HKCU) -- Windows only
+        2. Standard filesystem paths (Program Files) -- Windows only
+        3. Native Linux installs (/opt/hecras/<ver>, /opt/HEC-RAS/<ver>,
+           ~/hecras/<ver>, or $RAS_COMMANDER_LINUX_RAS_ROOT) -- Linux only
+        4. Wine prefix paths (~/.wine, /opt/hecras-wine, etc.) -- Linux only
+
+        Returns:
+            Dict[str, Path]: Mapping of version string -> Path to the executable.
+            On Windows/Wine this is ``Ras.exe``; for native Linux installs there
+            is no Ras.exe, so it maps to the ``RasUnsteady`` solver binary (use
+            ``.parent`` as ``ras_exe_dir`` for ``RasCmdr.compute_plan_linux``).
+            Example: {"6.6": Path("C:/Program Files (x86)/HEC/HEC-RAS/6.6/Ras.exe")}
+        """
+        discovered: Dict[str, Path] = {}
+
+        # Version folder names matching RasPrj.get_ras_exe()
+        ras_version_folders = [
+            "7.0", "6.7 Beta 5", "6.7 Beta 4", "6.6", "6.5", "6.4.1", "6.3.1", "6.3", "6.2",
+            "6.1", "6.0", "5.0.7", "5.0.6", "5.0.5", "5.0.4", "5.0.3",
+            "5.0.1", "5.0", "4.1.0", "4.0"
+        ]
+
+        version_aliases = {
+            "4.1": "4.1.0", "41": "4.1.0", "410": "4.1.0",
+            "40": "4.0", "50": "5.0", "501": "5.0.1", "503": "5.0.3",
+            "504": "5.0.4", "505": "5.0.5", "506": "5.0.6", "507": "5.0.7",
+            "60": "6.0", "61": "6.1", "62": "6.2", "63": "6.3",
+            "631": "6.3.1", "6.4": "6.4.1", "64": "6.4.1", "641": "6.4.1",
+            "65": "6.5", "66": "6.6", "6.7": "6.7 Beta 5", "67": "6.7 Beta 5",
+            "70": "7.0",
+        }
+
+        def _normalize_version(raw: str, install_dir: Optional[Path] = None) -> str:
+            v = str(raw).strip()
+            if v in version_aliases:
+                return version_aliases[v]
+            if install_dir is not None:
+                fn = install_dir.name.strip()
+                if fn in version_aliases:
+                    return version_aliases[fn]
+                if fn in ras_version_folders:
+                    return fn
+            return v
+
+        def _add(version: str, exe_path: Path, source: str) -> None:
+            if version in discovered:
+                logger.debug(f"Skipping duplicate HEC-RAS {version} from {source}")
+                return
+            discovered[version] = exe_path
+            logger.info(f"Discovered HEC-RAS {version} at {exe_path} via {source}")
+
+        def _scan_root(root_dir: Path, source_label: str) -> None:
+            """Scan a directory containing versioned HEC-RAS subfolders."""
+            if not root_dir.exists():
+                return
+            # Check known folder names first
+            for folder_name in ras_version_folders:
+                exe = root_dir / folder_name / "Ras.exe"
+                if exe.is_file():
+                    v = _normalize_version(folder_name, exe.parent)
+                    _add(v, exe, source_label)
+            # Glob for any other folders with Ras.exe
+            try:
+                for exe in sorted(root_dir.glob("*/Ras.exe")):
+                    v = _normalize_version(exe.parent.name, exe.parent)
+                    _add(v, exe, source_label)
+            except OSError as exc:
+                logger.warning(f"Filesystem scan failed for {root_dir}: {exc}")
+
+        # --- Windows: Registry + Program Files ---
+        if os.name == 'nt':
+            # Registry scan
+            try:
+                import winreg
+
+                def _is_no_more(exc: OSError) -> bool:
+                    return getattr(exc, "winerror", None) == 259
+
+                hive_map = {
+                    "HKLM": winreg.HKEY_LOCAL_MACHINE,
+                    "HKCU": winreg.HKEY_CURRENT_USER,
+                }
+                registry_locations = [
+                    ("HKLM", r"SOFTWARE\HEC\HEC-RAS"),
+                    ("HKLM", r"SOFTWARE\WOW6432Node\HEC\HEC-RAS"),
+                    ("HKCU", r"SOFTWARE\HEC\HEC-RAS"),
+                ]
+                install_value_names = (
+                    "InstallDir", "InstallPath", "Install Path",
+                    "Path", "ExePath", "RasExePath",
+                )
+
+                for hive_name, subkey_path in registry_locations:
+                    try:
+                        with winreg.OpenKey(hive_map[hive_name], subkey_path) as root_key:
+                            idx = 0
+                            while True:
+                                try:
+                                    vk_name = winreg.EnumKey(root_key, idx)
+                                except OSError as exc:
+                                    if _is_no_more(exc):
+                                        break
+                                    break
+                                idx += 1
+                                try:
+                                    with winreg.OpenKey(root_key, vk_name) as vk:
+                                        install_val = None
+                                        for val_name in install_value_names:
+                                            try:
+                                                val, _ = winreg.QueryValueEx(vk, val_name)
+                                                if val:
+                                                    install_val = str(val)
+                                                    break
+                                            except (FileNotFoundError, OSError):
+                                                continue
+                                        if install_val:
+                                            p = Path(os.path.expandvars(install_val.strip().strip('"')))
+                                            if p.suffix.lower() != '.exe':
+                                                p = p / "Ras.exe"
+                                            if p.name.lower() == "ras.exe" and p.is_file():
+                                                v = _normalize_version(vk_name, p.parent)
+                                                _add(v, p, f"registry {hive_name}\\{subkey_path}")
+                                except (FileNotFoundError, OSError):
+                                    continue
+                    except (FileNotFoundError, OSError):
+                        continue
+            except ImportError:
+                logger.debug("winreg not available, skipping registry scan")
+
+            # Filesystem scan (standard Windows paths)
+            _scan_root(Path("C:/Program Files (x86)/HEC/HEC-RAS"), "filesystem (x86)")
+            _scan_root(Path("C:/Program Files/HEC/HEC-RAS"), "filesystem")
+
+        # --- Linux: native install scan ---
+        else:
+            # Native Linux HEC-RAS installs have no Ras.exe; the RasUnsteady
+            # solver binary is the executable. Maps version -> RasUnsteady path
+            # (callers for compute_plan_linux use ``.parent`` as ras_exe_dir).
+            # Roots are configurable via $RAS_COMMANDER_LINUX_RAS_ROOT (CLB-883).
+            linux_native_roots = [
+                Path(os.path.expanduser("~/hecras")),
+                Path("/opt/hecras"),
+                Path("/opt/HEC-RAS"),
+            ]
+            env_root = os.environ.get("RAS_COMMANDER_LINUX_RAS_ROOT")
+            if env_root:
+                linux_native_roots.insert(0, Path(env_root))
+            for _folder, _exe in RasUtils._scan_native_linux_ras(linux_native_roots).items():
+                _add(_normalize_version(_folder, _exe.parent), _exe, "linux native")
+
+            # --- Linux: Wine prefix scan ---
+            wine_prefix_candidates = [
+                Path(os.path.expanduser("~/.wine")),
+                Path("/opt/hecras-wine"),
+                Path(os.path.expanduser("~/hecras-wine")),
+            ]
+            # Also check WINEPREFIX env var
+            env_prefix = os.environ.get("WINEPREFIX")
+            if env_prefix:
+                wine_prefix_candidates.insert(0, Path(env_prefix))
+
+            for prefix in wine_prefix_candidates:
+                drive_c = prefix / "drive_c"
+                if not drive_c.exists():
+                    continue
+                logger.debug(f"Scanning Wine prefix: {prefix}")
+                # Standard HEC-RAS locations under drive_c
+                _scan_root(drive_c / "Program Files (x86)" / "HEC" / "HEC-RAS", f"wine {prefix}")
+                _scan_root(drive_c / "Program Files" / "HEC" / "HEC-RAS", f"wine {prefix}")
+                _scan_root(drive_c / "HEC-RAS", f"wine {prefix}")
+
+        logger.info(f"Discovered {len(discovered)} installed HEC-RAS version(s)")
+        return discovered

@@ -201,11 +201,15 @@ class RasPrj:
             logger.warning("RasMap module not available. RASMapper data will not be loaded.")
             self.rasmap_df = pd.DataFrame(columns=['projection_path', 'profile_lines_path', 'soil_layer_path', 
                                                 'infiltration_hdf_path', 'landcover_hdf_path', 'terrain_hdf_path', 
+                                                'reference_map_layer_names', 'reference_map_layer_path',
+                                                'basemap_layer_names', 'basemap_layer_path',
                                                 'current_settings'])
         except Exception as e:
             logger.error(f"Error initializing RASMapper data: {e}")
             self.rasmap_df = pd.DataFrame(columns=['projection_path', 'profile_lines_path', 'soil_layer_path',
                                                 'infiltration_hdf_path', 'landcover_hdf_path', 'terrain_hdf_path',
+                                                'reference_map_layer_names', 'reference_map_layer_path',
+                                                'basemap_layer_names', 'basemap_layer_path',
                                                 'current_settings'])
 
         self.refresh_project_crs()
@@ -299,7 +303,7 @@ class RasPrj:
                 self._set_flow_path(idx, row)
                 
                 if not self.suppress_logging:
-                    logger.info(f"Plan {row['plan_number']} paths set up")
+                    logger.debug(f"Plan {row['plan_number']} paths set up")
             except Exception as e:
                 logger.error(f"Error processing plan file {row['plan_number']}: {e}")
 
@@ -434,6 +438,11 @@ class RasPrj:
             'UNET 1D Methodology',
             'UNET D2 SolverType',
             'UNET D2 Name',
+            'Write IC File',
+            'Write IC File at Fixed DateTime',
+            'IC Time',
+            'Write IC File Reoccurance',
+            'Write IC File at Sim End',
             'description'  # Special case for description block
         }
 
@@ -449,8 +458,9 @@ class RasPrj:
                 raise ValueError(f"Plan file not found: {plan_file_path}")
 
         try:
-            with open(plan_file_path, 'r') as file:
-                content = file.read()
+            content, _ = read_file_with_fallback_encoding(plan_file_path)
+            if content is None:
+                raise IOError(f"Failed to read plan file with any encoding: {plan_file_path}")
         except IOError as e:
             logger.error(f"Error reading plan file {plan_file_path}: {e}")
             raise
@@ -527,7 +537,12 @@ class RasPrj:
                 'UNET Use Existing IB Tables': r'UNET Use Existing IB Tables=(.+)',
                 'UNET 1D Methodology': r'UNET 1D Methodology=(.+)',
                 'UNET D2 SolverType': r'UNET D2 SolverType=(.+)',
-                'UNET D2 Name': r'UNET D2 Name=(.+)'
+                'UNET D2 Name': r'UNET D2 Name=(.+)',
+                'Write IC File': r'Write IC File=(.*)',
+                'Write IC File at Fixed DateTime': r'Write IC File at Fixed DateTime=(.*)',
+                'IC Time': r'IC Time=(.*)',
+                'Write IC File Reoccurance': r'Write IC File Reoccurance=(.*)',
+                'Write IC File at Sim End': r'Write IC File at Sim End=(.*)',
             }
             
             # END Exception to Style Guide
@@ -576,33 +591,38 @@ class RasPrj:
         pattern = re.compile(rf"{entry_type} File=(\w+)")
 
         try:
-            with open(self.prj_file, 'r', encoding='utf-8') as file:
-                for line in file:
-                    match = pattern.match(line.strip())
-                    if match:
-                        file_name = match.group(1)
-                        full_path = str(self.project_folder / f"{self.project_name}.{file_name}")
-                        entry_number = file_name[1:]
-                        
-                        entry = {
-                            f'{entry_type.lower()}_number': entry_number,
-                            'full_path': full_path
-                        }
-                        
-                        # Handle entry type-specific parsing
-                        if entry_type == 'Unsteady':
-                            entry.update(self._process_unsteady_entry(entry_number, full_path))
-                        elif entry_type == 'Flow':
-                            entry.update(self._process_flow_entry(entry_number, full_path))
-                        else:
-                            entry.update(self._process_default_entry())
-                        
-                        # Handle Plan entries
-                        if entry_type == 'Plan':
-                            entry.update(self._process_plan_entry(entry_number, full_path))
-                        
-                        entries.append(entry)
-            
+            content, encoding = read_file_with_fallback_encoding(self.prj_file)
+            if content is None:
+                raise IOError(
+                    f"Could not read project file {self.prj_file} with any supported encoding"
+                )
+
+            for line in content.splitlines():
+                match = pattern.match(line.strip())
+                if match:
+                    file_name = match.group(1)
+                    full_path = str(self.project_folder / f"{self.project_name}.{file_name}")
+                    entry_number = file_name[1:]
+
+                    entry = {
+                        f'{entry_type.lower()}_number': entry_number,
+                        'full_path': full_path
+                    }
+
+                    # Handle entry type-specific parsing
+                    if entry_type == 'Unsteady':
+                        entry.update(self._process_unsteady_entry(entry_number, full_path))
+                    elif entry_type == 'Flow':
+                        entry.update(self._process_flow_entry(entry_number, full_path))
+                    else:
+                        entry.update(self._process_default_entry())
+
+                    # Handle Plan entries
+                    if entry_type == 'Plan':
+                        entry.update(self._process_plan_entry(entry_number, full_path))
+
+                    entries.append(entry)
+
             df = pd.DataFrame(entries)
             return self._format_dataframe(df, entry_type)
         
@@ -709,11 +729,13 @@ class RasPrj:
                 'Flow Title': r'Flow Title=(.+)',
                 'Program Version': r'Program Version=(.+)',
                 'Use Restart': r'Use Restart=(.+)',
+                'Restart Filename': r'Restart Filename=(.+)',
                 'Precipitation Mode': r'Precipitation Mode=(.+)',
                 'Wind Mode': r'Wind Mode=(.+)',
                 'Met BC=Precipitation|Mode': r'Met BC=Precipitation\|Mode=(.+)',
                 'Met BC=Evapotranspiration|Mode': r'Met BC=Evapotranspiration\|Mode=(.+)',
                 'Met BC=Precipitation|Expanded View': r'Met BC=Precipitation\|Expanded View=(.+)',
+                'Met BC=Precipitation|Constant Value': r'Met BC=Precipitation\|Constant Value=(.+)',
                 'Met BC=Precipitation|Constant Units': r'Met BC=Precipitation\|Constant Units=(.+)',
                 'Met BC=Precipitation|Gridded Source': r'Met BC=Precipitation\|Gridded Source=(.+)'
             }
@@ -976,7 +998,7 @@ class RasPrj:
 
         if self.project_crs:
             if not self.suppress_logging:
-                logger.info(
+                logger.debug(
                     f"Resolved project CRS: {self.project_crs} "
                     f"(source={self.project_crs_source})"
                 )
@@ -1025,10 +1047,9 @@ class RasPrj:
                     return RasUtils.safe_resolve(prj_file)
             for prj_file in prj_files:
                 try:
-                    with open(prj_file, 'r') as file:
-                        content = file.read()
-                        if "Proj Title=" in content:
-                            return RasUtils.safe_resolve(prj_file)
+                    content, _ = read_file_with_fallback_encoding(prj_file)
+                    if content and "Proj Title=" in content:
+                        return RasUtils.safe_resolve(prj_file)
                 except Exception:
                     continue
         return None
@@ -1087,7 +1108,7 @@ class RasPrj:
 
         try:
             # Read the project file
-            with open(self.prj_file, 'r') as f:
+            with open(self.prj_file, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
 
             # Find and update the Current Plan line
@@ -1110,7 +1131,7 @@ class RasPrj:
                 raise ValueError("Could not find 'Proj Title=' or 'Current Plan=' in project file")
 
             # Write back to file
-            with open(self.prj_file, 'w') as f:
+            with open(self.prj_file, 'w', encoding='utf-8', errors='replace') as f:
                 f.writelines(lines)
 
             logger.info(f"Set current plan to p{plan_number_str} in {self.prj_file}")
@@ -1296,13 +1317,22 @@ class RasPrj:
         geom_entries = []
 
         try:
-            with open(self.prj_file, 'r') as f:
-                for line in f:
-                    match = geom_pattern.search(line)
-                    if match:
-                        geom_entries.append(match.group(1))
+            content, encoding = read_file_with_fallback_encoding(self.prj_file)
+            if content is None:
+                raise IOError(
+                    f"Could not read project file {self.prj_file} with any supported encoding"
+                )
+            logger.debug("Parsed geometry entries from %s using %s encoding", self.prj_file, encoding)
+
+            for line in content.splitlines():
+                match = geom_pattern.search(line)
+                if match:
+                    geom_entries.append(match.group(1))
         
             geom_df = pd.DataFrame({'geom_file': geom_entries})
+            if geom_df.empty:
+                logger.warning(f"No geometry entries found in {self.prj_file}")
+                return pd.DataFrame(columns=['geom_file', 'geom_number', 'full_path', 'hdf_path'])
             geom_df['geom_number'] = geom_df['geom_file'].str.extract(r'(\d+)$')
             geom_df['full_path'] = geom_df['geom_file'].apply(lambda x: str(self.project_folder / f"{self.project_name}.{x}"))
             geom_df['hdf_path'] = geom_df['full_path'] + ".hdf"
@@ -1378,7 +1408,7 @@ class RasPrj:
                     logger.debug(f"Failed to extract title/description for {row['geom_file']}: {e}")
 
             if not self.suppress_logging:  # Only log if suppress_logging is False
-                logger.info(f"Found {len(geom_df)} geometry entries")
+                logger.debug(f"Found {len(geom_df)} geometry entries")
             return geom_df
         except Exception as e:
             logger.error(f"Error reading geometry entries from project file: {e}")
@@ -1440,27 +1470,27 @@ class RasPrj:
             >>> ras.print_data()  # Displays complete project overview
         """
         self.check_initialized()
-        logger.info(f"--- Data for {self.project_name} ---")
-        logger.info(f"Project folder: {self.project_folder}")
-        logger.info(f"PRJ file: {self.prj_file}")
-        logger.info(f"HEC-RAS executable: {self.ras_exe_path}")
-        logger.info(
+        logger.debug(f"--- Data for {self.project_name} ---")
+        logger.debug(f"Project folder: {self.project_folder}")
+        logger.debug(f"PRJ file: {self.prj_file}")
+        logger.debug(f"HEC-RAS executable: {self.ras_exe_path}")
+        logger.debug(
             f"Project CRS: {self.project_crs} "
             f"(source={self.project_crs_source})"
         )
-        logger.info("Plan files:")
-        logger.info(f"\n{self.plan_df}")
-        logger.info("Flow files:")
-        logger.info(f"\n{self.flow_df}")
-        logger.info("Unsteady flow files:")
-        logger.info(f"\n{self.unsteady_df}")
-        logger.info("Geometry files:")
-        logger.info(f"\n{self.geom_df}")
-        logger.info("HDF entries:")
-        logger.info(f"\n{self.get_hdf_entries()}")
-        logger.info("Boundary conditions:")
-        logger.info(f"\n{self.boundaries_df}")
-        logger.info("----------------------------")
+        logger.debug("Plan files:")
+        logger.debug(f"\n{self.plan_df}")
+        logger.debug("Flow files:")
+        logger.debug(f"\n{self.flow_df}")
+        logger.debug("Unsteady flow files:")
+        logger.debug(f"\n{self.unsteady_df}")
+        logger.debug("Geometry files:")
+        logger.debug(f"\n{self.geom_df}")
+        logger.debug("HDF entries:")
+        logger.debug(f"\n{self.get_hdf_entries()}")
+        logger.debug("Boundary conditions:")
+        logger.debug(f"\n{self.boundaries_df}")
+        logger.debug("----------------------------")
 
     @log_call
     def get_boundary_conditions(self) -> pd.DataFrame:
@@ -1503,7 +1533,7 @@ class RasPrj:
         
         # Check if unsteady_df is empty
         if self.unsteady_df.empty:
-            logger.info("No unsteady flow files found in the project.")
+            logger.debug("No unsteady flow files found in the project.")
             return pd.DataFrame()  # Return an empty DataFrame
         
         for _, row in self.unsteady_df.iterrows():
@@ -1511,8 +1541,10 @@ class RasPrj:
             unsteady_number = row['unsteady_number']
             
             try:
-                with open(unsteady_file_path, 'r') as file:
-                    content = file.read()
+                content, _ = read_file_with_fallback_encoding(unsteady_file_path)
+                if content is None:
+                    logger.error(f"Failed to read unsteady file with any encoding: {unsteady_file_path}")
+                    continue
             except IOError as e:
                 logger.error(f"Error reading unsteady file {unsteady_file_path}: {e}")
                 continue
@@ -1527,7 +1559,7 @@ class RasPrj:
                     logger.debug(f"Unparsed lines for boundary condition {i} in unsteady file {unsteady_number}:\n{unparsed_lines}")
         
         if not boundary_data:
-            logger.info("No boundary conditions found in unsteady flow files.")
+            logger.debug("No boundary conditions found in unsteady flow files.")
             return pd.DataFrame()  # Return an empty DataFrame if no boundary conditions were found
         
         boundaries_df = pd.DataFrame(boundary_data)
@@ -1554,7 +1586,9 @@ class RasPrj:
             'river_reach_name': fields[0] if len(fields) > 0 else '',
             'river_station': fields[1] if len(fields) > 1 else '',
             'storage_area_name': fields[2] if len(fields) > 2 else '',
-            'pump_station_name': fields[3] if len(fields) > 3 else ''
+            'pump_station_name': fields[3] if len(fields) > 3 else '',
+            'area_2d': fields[5] if len(fields) > 5 else '',
+            'bc_line_name': fields[7] if len(fields) > 7 else ''
         })
         parsed_lines.add(0)
         
@@ -1567,7 +1601,11 @@ class RasPrj:
             'Precipitation Hydrograph=': 'Precipitation Hydrograph',
             'Rating Curve=': 'Rating Curve',
             'Friction Slope=': 'Normal Depth',
-            'Gate Name=': 'Gate Opening'
+            'Gate Name=': 'Gate Opening',
+            'Observed Stage and Flow Hydrograph=': 'Observed Stage and Flow',
+            'Ground Water Interflow=': 'Ground Water Interflow',
+            'Navigation Dam=': 'Navigation Dam',
+            'Rule Operation=': 'Rule Operation',
         }
         
         bc_info['bc_type'] = 'Unknown'
@@ -1586,7 +1624,9 @@ class RasPrj:
         # Parse other fields
         known_fields = ['Interval', 'DSS Path', 'Use DSS', 'Use Fixed Start Time', 'Fixed Start Date/Time',
                         'Is Critical Boundary', 'Critical Boundary Flow', 'DSS File',
-                        'Flow Hydrograph QMult', 'Flow Hydrograph QMin']
+                        'Flow Hydrograph QMult', 'Flow Hydrograph QMin', 'Flow Hydrograph Slope',
+                        'Stage Hydrograph TW Check', 'Friction Slope',
+                        'Ground Water Darcy K', 'Ground Water Darcy K/day', 'Ground Water Darcy Distance']
         for i, line in enumerate(lines):
             if '=' in line:
                 key, value = line.split('=', 1)
@@ -1594,6 +1634,22 @@ class RasPrj:
                 if key in known_fields:
                     bc_info[key] = value.strip()
                     parsed_lines.add(i)
+
+        # Parse Friction Slope into typed columns
+        if 'Friction Slope' in bc_info:
+            fs_raw = bc_info['Friction Slope']
+            fs_parts = [p.strip() for p in fs_raw.split(',')]
+            try:
+                bc_info['friction_slope_value'] = float(fs_parts[0])
+            except (ValueError, IndexError):
+                bc_info['friction_slope_value'] = None
+            if len(fs_parts) > 1:
+                try:
+                    bc_info['critical_fallback_flag'] = int(fs_parts[1])
+                except ValueError:
+                    bc_info['critical_fallback_flag'] = None
+            else:
+                bc_info['critical_fallback_flag'] = None
 
         # Parse DSS Path components if available
         if 'DSS Path' in bc_info and bc_info['DSS Path']:
@@ -1840,7 +1896,7 @@ class RasPrj:
             pd.DataFrame: Updated results_df
 
         Example:
-            >>> init_ras_project("path/to/project", "6.6")
+            >>> init_ras_project("path/to/project", "7.0")
             >>> ras.update_results_df(["01"])  # Update specific plan
             >>> ras.update_results_df()  # Update all plans
             >>> print(ras.results_df[['plan_number', 'completed', 'has_errors']])
@@ -1890,14 +1946,22 @@ class RasPrj:
             else:
                 self.results_df = pd.DataFrame()  # Clear all if updating all
 
-            # Concatenate new results, excluding all-NA/empty frames (avoids FutureWarning)
-            frames = [df for df in [self.results_df, new_results] if not df.empty and not df.isna().all().all()]
+            # Concatenate new results, dropping all-NA columns first (avoids pandas FutureWarning
+            # about empty/all-NA entries changing dtype inference behavior in future versions)
+            frames = []
+            for df in [self.results_df, new_results]:
+                if df.empty:
+                    continue
+                # Drop columns where every value is NA — these trigger the FutureWarning
+                df_clean = df.dropna(axis=1, how='all')
+                if not df_clean.empty:
+                    frames.append(df_clean)
             if frames:
                 self.results_df = pd.concat(frames, ignore_index=True)
             else:
                 self.results_df = new_results
 
-        logger.info(f"Updated results_df with {len(new_results)} plan(s)")
+        logger.debug(f"Updated results_df with {len(new_results)} plan(s)")
         return self.results_df
 
     @log_call
@@ -1934,7 +1998,8 @@ def init_ras_project(
     ras_project_folder,
     ras_version=None,
     ras_object=None,
-    load_results_summary=True
+    load_results_summary=True,
+    hide_intro=False
 ) -> 'RasPrj':
     """
     Initialize a RAS project for use with the ras-commander library.
@@ -1953,7 +2018,7 @@ def init_ras_project(
                                           - File is validated to have .prj extension
                                           - File content is checked for "Proj Title=" marker
                                           - Parent folder is used as the project folder
-        ras_version (str, optional): The version of RAS to use (e.g., "6.6") OR
+        ras_version (str, optional): The version of RAS to use (e.g., "7.0") OR
                                      a full path to the Ras.exe file (e.g., "D:/Programs/HEC/HEC-RAS/6.6/Ras.exe").
                                      If None, will attempt to detect from plan files.
         ras_object (RasPrj, optional): If None, updates the global 'ras' object.
@@ -1965,6 +2030,9 @@ def init_ras_project(
                                                     basic results via ras.results_df without needing
                                                     to re-scan HDF files. Set to False for faster
                                                     initialization when results are not needed.
+        hide_intro (bool, default=False): If True, suppress the agent intro banner that is
+                                          printed after initialization. The banner provides
+                                          API guidance for AI agents using the library.
 
     Returns:
         RasPrj: An initialized RasPrj instance.
@@ -1976,19 +2044,19 @@ def init_ras_project(
 
     Example:
         >>> # Initialize using project folder (existing behavior)
-        >>> init_ras_project("/path/to/project", "6.6")
+        >>> init_ras_project("/path/to/project", "7.0")
         >>> print(f"Initialized project: {ras.project_name}")
         >>>
         >>> # Initialize using direct .prj file path (new feature)
-        >>> init_ras_project("/path/to/project/MyModel.prj", "6.6")
+        >>> init_ras_project("/path/to/project/MyModel.prj", "7.0")
         >>> print(f"Initialized project: {ras.project_name}")
         >>>
         >>> # Create a new RasPrj instance with .prj file
-        >>> my_project = init_ras_project("/path/to/project/MyModel.prj", "6.6", "new")
+        >>> my_project = init_ras_project("/path/to/project/MyModel.prj", "7.0", "new")
         >>> print(f"Created project instance: {my_project.project_name}")
         >>>
         >>> # Skip results loading for faster initialization
-        >>> init_ras_project("/path/to/project", "6.6", load_results_summary=False)
+        >>> init_ras_project("/path/to/project", "7.0", load_results_summary=False)
     """
     # Convert to Path object for consistent handling
     # Use safe_resolve to preserve drive letters on Windows mapped network drives
@@ -2062,31 +2130,31 @@ def init_ras_project(
     else:
         # No version specified, try to detect from plan files
         detected_version = None
-        logger.info("No HEC-RAS Version Specified.Attempting to detect HEC-RAS version from plan files.")
-        
+        logger.debug("No HEC-RAS version specified. Detecting from plan files.")
+
         # Look for .pXX files in project folder
-        logger.info(f"Searching for plan files in {project_folder}")
+        logger.debug(f"Searching for plan files in {project_folder}")
         # Search for any file with .p01 through .p99 extension, regardless of base name
         plan_files = list(project_folder.glob("*.p[0-9][0-9]"))
         
         if not plan_files:
-            logger.info(f"No plan files found in {project_folder}")
+            logger.debug(f"No plan files found in {project_folder}")
         
         for plan_file in plan_files:
-            logger.info(f"Found plan file: {plan_file.name}")
+            logger.debug(f"Found plan file: {plan_file.name}")
             content, encoding = read_file_with_fallback_encoding(plan_file)
             
             if not content:
-                logger.info(f"Could not read content from {plan_file.name}")
+                logger.debug(f"Could not read content from {plan_file.name}")
                 continue
                 
-            logger.info(f"Successfully read plan file with {encoding} encoding")
+            logger.debug(f"Successfully read plan file with {encoding} encoding")
             
             # Look for Program Version in plan file
             for line in content.splitlines():
                 if line.startswith("Program Version="):
                     version = line.split("=")[1].strip()
-                    logger.info(f"Found Program Version={version} in {plan_file.name}")
+                    logger.debug(f"Found Program Version={version} in {plan_file.name}")
                     
                     # Replace 00 in version string if present
                     if "00" in version:
@@ -2094,15 +2162,15 @@ def init_ras_project(
                     
                     # Try to get RAS executable for this version
                     test_exe_path = get_ras_exe(version)
-                    logger.info(f"Checking RAS executable path: {test_exe_path}")
+                    logger.debug(f"Checking RAS executable path: {test_exe_path}")
                     
                     if test_exe_path != "Ras.exe":
                         detected_version = version
                         ras_exe_path = test_exe_path
-                        logger.debug(f"Found valid HEC-RAS version {version} in plan file {plan_file.name}")
+                        logger.info(f"Detected HEC-RAS version {version} from {plan_file.name}")
                         break
                     else:
-                        logger.info(f"Version {version} not found in default installation path")
+                        logger.debug(f"Version {version} not found in default installation path")
             
             if detected_version:
                 break
@@ -2148,7 +2216,54 @@ def init_ras_project(
         f"GitHub: https://github.com/gpt-cmdr/ras-commander"
     )
     logger.info(f"Project initialized: {ras_object.project_name} | Folder: {ras_object.project_folder}")
-    logger.debug(f"Using HEC-RAS executable: {ras_exe_path}")
+    logger.info(f"Using HEC-RAS executable: {ras_exe_path}")
+
+    if not hide_intro:
+        _obj = "ras" if ras_object is ras else "ras_object"
+        logger.info(
+            "\n"
+            "═══════════════════════════════════════════════════════════════════════\n"
+            "ras-commander | HEC-RAS Automation Library\n"
+            "Docs: https://gpt-cmdr.github.io/ras-commander/\n"
+            "Repo: https://github.com/gpt-cmdr/ras-commander\n"
+            "═══════════════════════════════════════════════════════════════════════\n"
+            "\n"
+            "PROJECT DATAFRAMES (single source of truth — use these, not file globbing):\n"
+            f"  {_obj}.plan_df        Plans, HDF paths, geometry/flow associations\n"
+            f"  {_obj}.geom_df        Geometry files and HDF preprocessor paths\n"
+            f"  {_obj}.flow_df        Steady flow files\n"
+            f"  {_obj}.unsteady_df    Unsteady flow files and configurations\n"
+            f"  {_obj}.boundaries_df  Boundary conditions (type, name, location)\n"
+            f"  {_obj}.results_df     Lightweight HDF results summaries\n"
+            f"  {_obj}.rasmap_df      RASMapper layers, terrain, land cover paths\n"
+            "\n"
+            "KEY APIS (static classes — call directly, never instantiate):\n"
+            "  Execution:    RasCmdr.compute_plan() / compute_parallel() / compute_test_mode()\n"
+            "  Plan Files:   RasPlan.clone_plan() / clone_geom() / set_geom()\n"
+            "  Unsteady:     RasUnsteady — IC/BC management, gate openings, precipitation\n"
+            "  Geometry:     GeomCrossSection, GeomBridge, GeomStorage, GeomLateral, GeomMesh\n"
+            "  HDF Results:  HdfResultsPlan.get_wse() / get_compute_messages()\n"
+            "                HdfResultsMesh.get_mesh_max_ws() / get_mesh_cells_timeseries()\n"
+            "                HdfMesh.get_mesh_cell_points()\n"
+            "  QA/QC:        RasCheck.run_check() / RasFixit (geometry repair)\n"
+            "  DSS:          RasDss.get_timeseries() / check_pathname()\n"
+            "  USGS:         UsgsGaugeSpatial, GaugeMatcher, RasUsgsBoundaryGeneration\n"
+            "  Precipitation: StormGenerator, Atlas14Storm, PrecipAorc, Atlas14Variance\n"
+            "  Terrain:      RasTerrain.create_terrain_hdf() / RasTerrainMod\n"
+            "\n"
+            "MULTI-PROJECT: Pass ras_object= to all API calls when using local RasPrj instances.\n"
+            "\n"
+            "EXAMPLES: 100+ notebooks in examples/ (100s=execution, 200s=geometry, 300s=unsteady,\n"
+            "  400s=HDF results, 500s=remote, 800s=QA/QC, 900s=data integration).\n"
+            "  Review relevant notebooks before assembling new workflows.\n"
+            "\n"
+            "PLATFORM: Most HEC-RAS operations require Windows. Linux/Wine support for\n"
+            "  headless execution, data access, geometry modification, and preprocessing\n"
+            "  is available via RasProcess (HEC-RAS 6.6+). See ras_commander/RasProcess.py.\n"
+            "  Remote distributed execution: ras_commander/remote/ (PsExec, Docker, SSH, cloud).\n"
+            "═══════════════════════════════════════════════════════════════════════"
+        )
+
     return ras_object
 
 @log_call
@@ -2164,7 +2279,7 @@ def get_ras_exe(ras_version=None):
     4. As a fallback, return "Ras.exe" but log an error
     
     Args:
-        ras_version (str, optional): Either a version number (e.g., "6.6") or 
+        ras_version (str, optional): Either a version number (e.g., "7.0") or 
                                      a full path to the HEC-RAS executable 
                                      (e.g., "D:/Programs/HEC/HEC-RAS/6.6/Ras.exe").
     
@@ -2172,7 +2287,7 @@ def get_ras_exe(ras_version=None):
         str: The full path to the HEC-RAS executable or "Ras.exe" if not found.
     
     Note:
-        - HEC-RAS version numbers include: "6.6", "6.5", "6.4.1", "6.3", etc.
+        - HEC-RAS version numbers include: "7.0", "6.6", "6.5", "6.4.1", "6.3", etc.
         - The default installation path follows: C:/Program Files (x86)/HEC/HEC-RAS/{version}/Ras.exe
         - For non-standard installations, provide the full path to Ras.exe
         - Returns "Ras.exe" if no valid path is found, with error logged
@@ -2189,9 +2304,9 @@ def get_ras_exe(ras_version=None):
             return default_path
     
     # ACTUAL folder names in C:/Program Files (x86)/HEC/HEC-RAS/
-    # This list matches the exact folder names on disk (verified 2025-10-30)
+    # This list matches the exact folder names on disk (verified 2026-04-19)
     ras_version_folders = [
-        "6.7 Beta 4", "6.6", "6.5", "6.4.1", "6.3.1", "6.3", "6.2", "6.1", "6.0",
+        "7.0", "6.7 Beta 5", "6.7 Beta 4", "6.6", "6.5", "6.4.1", "6.3.1", "6.3", "6.2", "6.1", "6.0",
         "5.0.7", "5.0.6", "5.0.5", "5.0.4", "5.0.3", "5.0.1", "5.0",
         "4.1.0", "4.0"
     ]
@@ -2225,8 +2340,11 @@ def get_ras_exe(ras_version=None):
         "641": "6.4.1",
         "65": "6.5",
         "66": "6.6",
-        "6.7": "6.7 Beta 4", # User passes "6.7" → finds "6.7 Beta 4"
-        "67": "6.7 Beta 4",
+        "6.7": "6.7 Beta 5", # User passes "6.7" → finds "6.7 Beta 5"
+        "6.70": "6.7 Beta 5", # HEC-RAS 6.7 plan files write Program Version=6.70
+        "6.7.0": "6.7 Beta 5", # Legacy dotted normalization rewrites 6.70 to 6.7.0
+        "67": "6.7 Beta 5",
+        "70": "7.0",
     }
 
     # Check if input is a direct path to an executable
@@ -2237,13 +2355,40 @@ def get_ras_exe(ras_version=None):
 
     version_str = str(ras_version)
 
+    # Normalize compact dotted legacy formats before alias lookup:
+    #   5.03 -> 5.0.3
+    #   6.31 -> 6.3.1
+    #   4.10 -> 4.1.0
+    legacy_dotted_match = re.fullmatch(r'(\d)\.(\d{2})', version_str)
+    if legacy_dotted_match:
+        major, compact_minor = legacy_dotted_match.groups()
+        version_str = f"{major}.{compact_minor[0]}.{int(compact_minor[1])}"
+        logger.debug(f"Normalized legacy dotted version '{ras_version}' to '{version_str}'")
+
     # Check if there's an alias for this version
     if version_str in version_aliases:
         actual_folder = version_aliases[version_str]
         logger.debug(f"Mapped version '{version_str}' to folder '{actual_folder}'")
         version_str = actual_folder
 
-    # Check if this is a known folder name
+    # PRIMARY: Use discover_ras_versions() to find actual install location.
+    # This handles non-standard installs, new versions, and registry-based discovery.
+    try:
+        from .RasUtils import RasUtils
+        discovered = RasUtils.discover_ras_versions()
+        if version_str in discovered:
+            exe_path = discovered[version_str]
+            logger.info(f"HEC-RAS {version_str} found via version discovery: {exe_path}")
+            return str(exe_path)
+        # Also check if the original user input (before alias resolution) matches
+        if str(ras_version) != version_str and str(ras_version) in discovered:
+            exe_path = discovered[str(ras_version)]
+            logger.debug(f"HEC-RAS {ras_version} found via version discovery: {exe_path}")
+            return str(exe_path)
+    except Exception as e:
+        logger.debug(f"Version discovery failed, falling back to hardcoded paths: {e}")
+
+    # FALLBACK: Hardcoded path construction (original logic, kept for robustness)
     if version_str in ras_version_folders:
         default_path = Path(f"C:/Program Files (x86)/HEC/HEC-RAS/{version_str}/Ras.exe")
         if default_path.is_file():
@@ -2253,12 +2398,10 @@ def get_ras_exe(ras_version=None):
             error_msg = f"HEC-RAS Version {version_str} folder exists but Ras.exe not found at expected path. Running HEC-RAS will fail."
             logger.error(error_msg)
             return "Ras.exe"
-    
-    # Final fallback: Try to find a matching version from folder list
+
+    # FALLBACK 2: Fuzzy match against known folder list
     try:
-        # Try to find a matching version from our list
         for known_folder in ras_version_folders:
-            # Check for partial matches or compact formats
             if version_str in known_folder or known_folder.replace('.', '') == version_str:
                 default_path = Path(f"C:/Program Files (x86)/HEC/HEC-RAS/{known_folder}/Ras.exe")
                 if default_path.is_file():
@@ -2277,3 +2420,128 @@ def get_ras_exe(ras_version=None):
     error_msg = f"HEC-RAS Version {ras_version} is not recognized or installed. Running HEC-RAS will fail unless a valid installed version is specified."
     logger.error(error_msg)
     return "Ras.exe"
+
+
+# Bundled seed-template versions shipped under ras_commander/resources/templates/.
+# No greenfield templates are provided for HEC-RAS versions before 6.6.
+AVAILABLE_TEMPLATE_VERSIONS = ("6.6", "7.0")
+
+
+def create_project_from_template(
+    dest_dir: Union[str, Path],
+    project_name: str = "Project",
+    version: str = "7.0",
+    target_crs: Optional[Any] = None,
+    overwrite: bool = False,
+) -> Path:
+    """
+    Create a new HEC-RAS project from a bundled, terrain-stripped seed template.
+
+    Copies the seed template for the requested HEC-RAS version into ``dest_dir``,
+    renames ``TEMPLATE.*`` -> ``{project_name}.*``, rewrites the ``.rasmap``
+    geometry references, and (optionally) reprojects the bundled projection file
+    from its default (EPSG:5070, meters) to ``target_crs``.
+
+    The seed ships a blank 2D geometry (ready for a ``Storage Area Is2D`` flow
+    area) with **no terrain**. After creating the project, attach a terrain and
+    author the 2D flow-area perimeter, then build the mesh, e.g.::
+
+        prj = create_project_from_template("out", "EtherHollow", version="7.0",
+                                           target_crs="EPSG:2256")  # ft CRS
+        init_ras_project("out", "7.0")
+        GeomStorage.set_2d_flow_area_perimeter(...)        # author perimeter
+        GeomMesh.generate_computation_points(...)          # initial mesh points
+        RasCmdr.compute_plan(..., force_geompre=True)      # HEC-RAS builds mesh
+
+    Args:
+        dest_dir: Directory for the new project (created if needed).
+        project_name: Base name for the project files (no extension). HEC-RAS
+            requires all component files to share this basename.
+        version: Bundled template version. Only ``"6.6"`` and ``"7.0"`` are
+            available; no greenfield templates exist for versions before 6.6.
+        target_crs: Optional target CRS for the bundled projection ``.prj``.
+            Accepts anything ``pyproj.CRS.from_user_input`` understands (EPSG
+            int, ``"EPSG:2256"``, WKT, a ``pyproj.CRS``). The template default is
+            EPSG:5070 (meters); for a US Customary (feet) model pass a feet-based
+            CRS. HEC-RAS does not convert projection units, so the CRS units must
+            match the project's unit system. When None, the projection is left as
+            the template default.
+        overwrite: If False (default) and ``{project_name}.prj`` already exists in
+            ``dest_dir``, raise ``FileExistsError``.
+
+    Returns:
+        Path to the created HEC-RAS project (``.prj``) file.
+
+    Raises:
+        ValueError: If ``version`` is not a bundled template.
+        FileExistsError: If the project already exists and ``overwrite`` is False.
+    """
+    import shutil
+
+    version = str(version)
+    if version not in AVAILABLE_TEMPLATE_VERSIONS:
+        raise ValueError(
+            f"No bundled template for HEC-RAS version {version!r}. Available: "
+            f"{list(AVAILABLE_TEMPLATE_VERSIONS)} (no greenfield templates before 6.6)."
+        )
+
+    template_dir = (
+        Path(__file__).resolve().parent / "resources" / "templates" / f"RAS_{version}"
+    )
+    if not template_dir.is_dir():
+        raise FileNotFoundError(
+            f"Bundled template directory not found: {template_dir}"
+        )
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    new_prj = dest_dir / f"{project_name}.prj"
+    if new_prj.exists() and not overwrite:
+        raise FileExistsError(
+            f"Project '{project_name}.prj' already exists in {dest_dir}. "
+            f"Pass overwrite=True to replace it."
+        )
+
+    # 1. Copy + rename the TEMPLATE.* component files (.prj/.g01/.g01.hdf/.rasmap).
+    #    HEC-RAS references components by extension (g01, p01), so a shared
+    #    basename keeps all internal references valid.
+    renamed: Dict[str, Path] = {}
+    for src in sorted(template_dir.glob("TEMPLATE.*")):
+        out = dest_dir / src.name.replace("TEMPLATE", project_name, 1)
+        shutil.copyfile(src, out)
+        renamed[src.name] = out
+
+    # 2. Projection file -> {project}.projection.prj, reprojecting if requested.
+    proj_src = template_dir / "EPSG_5070.prj"
+    proj_out = dest_dir / f"{project_name}.projection.prj"
+    if target_crs is not None:
+        from pyproj import CRS
+
+        proj_out.write_text(
+            CRS.from_user_input(target_crs).to_wkt("WKT1_ESRI"), encoding="utf-8"
+        )
+    elif proj_src.exists():
+        shutil.copyfile(proj_src, proj_out)
+
+    # 3. Rewrite the HEC project title.
+    hec_prj = renamed.get("TEMPLATE.prj")
+    if hec_prj and hec_prj.exists():
+        txt = hec_prj.read_text(encoding="utf-8", errors="replace")
+        txt = txt.replace("Proj Title=TEMPLATE", f"Proj Title={project_name}", 1)
+        hec_prj.write_text(txt, encoding="utf-8")
+
+    # 4. Rewrite the .rasmap geometry filename references so RASMapper resolves
+    #    the renamed geometry HDF (the .rasmap references it by full filename).
+    rasmap = renamed.get("TEMPLATE.rasmap")
+    if rasmap and rasmap.exists():
+        txt = rasmap.read_text(encoding="utf-8", errors="replace")
+        txt = txt.replace("TEMPLATE.g01.hdf", f"{project_name}.g01.hdf")
+        rasmap.write_text(txt, encoding="utf-8")
+
+    logger.info(
+        f"Created project '{project_name}' from RAS {version} template in "
+        f"{dest_dir}"
+        + (f" (reprojected to {target_crs})" if target_crs is not None else "")
+    )
+    return new_prj

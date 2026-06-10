@@ -14,7 +14,7 @@ The `rasmap_df` DataFrame is automatically populated when you call `init_ras_pro
 from ras_commander import init_ras_project, ras
 
 # Initialize project - automatically parses .rasmap file
-init_ras_project(r"C:\Projects\MyRasModel", "6.6")
+init_ras_project(r"C:\Projects\MyRasModel", "7.0")
 
 # Access rasmap DataFrame
 print(ras.rasmap_df)
@@ -34,58 +34,214 @@ The `rasmap_df` typically contains paths to:
 ### Accessing Specific Data Paths
 
 ```python
-# Example: Get terrain HDF path
-terrain_path = ras.rasmap_df['terrain_hdf_path'][0]
+# rasmap_df is a compact project summary. Several columns contain lists.
+summary = ras.rasmap_df.iloc[0]
 
-# Example: Get infiltration data path
-infiltration_path = ras.rasmap_df['infiltration_hdf_path'][0][0]
+terrain_paths = summary["terrain_hdf_path"]
+landcover_paths = summary["landcover_hdf_path"]
+soil_paths = summary["soil_layer_path"]
+infiltration_paths = summary["infiltration_hdf_path"]
 
-# Example: Get land cover layer path
-landcover_path = ras.rasmap_df['landcover_hdf_path'][0]
+print(terrain_paths)
 ```
+
+For discoverable automation, prefer the layer-list methods below. They return one row per RASMapper layer rather than one compact project-summary row.
+
+## Discovering RASMapper Layers
+
+`RasMap` can list terrain, land-cover, soils, and infiltration layers directly from the `.rasmap` catalog. These methods are useful when building QA/QC tools because they expose the layer names that users see in RASMapper and the paths that automation needs.
+
+```python
+from ras_commander import RasExamples, RasMap
+
+project_path = RasExamples.extract_project("BaldEagleCrkMulti2D")
+
+terrain_layers = RasMap.list_terrain_layers(project_path)
+landcover_layers = RasMap.list_landcover_layers(project_path)
+soils_layers = RasMap.list_soils_layers(project_path)
+infiltration_layers = RasMap.list_infiltration_layers(project_path)
+
+print(terrain_layers[[
+    "name",
+    "filename",
+    "resolved_path",
+    "checked",
+    "type",
+    "resample_method",
+    "surface_on",
+]])
+
+print(landcover_layers[[
+    "name",
+    "classification_kind",
+    "resolved_path",
+    "selected_parameter",
+]])
+```
+
+### Layer Discovery Methods
+
+| Method | Reads | Typical use |
+|--------|-------|-------------|
+| `RasMap.list_terrain_layers(project_path)` | `.rasmap` `Terrains/Layer` entries | Find valid terrain layer names and HDF paths |
+| `RasMap.list_land_classification_layers(project_path)` | `.rasmap` `Type="LandCoverLayer"` entries | Inspect every land-classification style layer |
+| `RasMap.list_landcover_layers(project_path)` | Filtered land-classification rows | Manning's n / land-cover sidecar workflows |
+| `RasMap.list_soils_layers(project_path)` | Filtered land-classification rows | Hydrologic soils discovery |
+| `RasMap.list_infiltration_layers(project_path)` | Filtered land-classification rows | Infiltration sidecar discovery |
+
+!!! note "rasmap_df vs list methods"
+    `ras.rasmap_df` remains a compact initialization summary. Use it when you want a quick project overview. Use `RasMap.list_*_layers()` when users need names, per-layer metadata, and paths for a workflow.
+
+## Geometry HDF Associations
+
+HEC-RAS stores layer availability in the `.rasmap` file, but compiled geometry and plan/result HDF files also carry `/Geometry` attributes that record which terrain, land-cover, infiltration, and sediment bed-material layers are associated with a geometry.
+
+Use `RasMap.get_hdf_geometry_association()` for read-only QA/QC:
+
+```python
+from pathlib import Path
+from ras_commander import RasMap
+
+project_path = Path(r"C:\Projects\MyModel")
+geometry_hdf = project_path / "MyModel.g01.hdf"
+plan_hdf = project_path / "MyModel.p01.hdf"
+
+geometry_assoc = RasMap.get_hdf_geometry_association(geometry_hdf)
+plan_assoc = RasMap.get_hdf_geometry_association(plan_hdf)
+
+print(geometry_assoc.get("terrain_hdf_path"))
+print(geometry_assoc.get("terrain_layer_name"))
+print(plan_assoc.get("landcover_hdf_path"))
+```
+
+Common returned keys include:
+
+| Key | HEC-RAS attribute |
+|-----|-------------------|
+| `terrain_hdf_path` | `Terrain Filename` |
+| `terrain_layer_name` | `Terrain Layername` |
+| `landcover_hdf_path` | `Land Cover Filename` |
+| `landcover_layer_name` | `Land Cover Layername` |
+| `infiltration_hdf_path` | `Infiltration Filename` |
+| `infiltration_layer_name` | `Infiltration Layername` |
+| `sediment_soils_hdf_path` | `SedimentSoilsFilename` |
+
+### Writing Geometry Associations
+
+Use `RasMap.associate_geometry_layers()` to write HEC-style `/Geometry` association attributes to an existing compiled geometry HDF.
+
+```python
+from pathlib import Path
+from ras_commander import RasMap
+
+project_path = Path(r"C:\Projects\MyModel")
+geometry_hdf = project_path / "MyModel.g01.hdf"
+terrain_hdf = project_path / "Terrain" / "ExistingTerrain.hdf"
+landcover_hdf = project_path / "Land Classification" / "LandCover.hdf"
+
+RasMap.associate_geometry_layers(
+    project_path,
+    geometry_hdf,
+    terrain_hdf_path=terrain_hdf,
+    landcover_hdf_path=landcover_hdf,
+)
+
+updated = RasMap.get_hdf_geometry_association(geometry_hdf)
+print(updated["terrain_hdf_path"])
+print(updated["landcover_hdf_path"])
+```
+
+!!! warning "Existing compiled geometry HDF required"
+    `RasMap.associate_geometry_layers()` updates attributes on an existing `.g##.hdf`. It does not compile a plain-text `.g##` file into HDF and does not create missing geometry datasets. Treat true `.g##` to `.g##.hdf` generation as HEC-RAS/Ras.exe behavior unless a native endpoint is explicitly available.
+
+!!! tip "Layer name resolution"
+    When possible, ras-commander resolves `Terrain Layername`, `Land Cover Layername`, and `Infiltration Layername` from the `.rasmap` catalog. If the layer cannot be found in `.rasmap`, it falls back to the file stem.
+
+### Native RasProcess Reference Validator
+
+`RasProcess.validate_geometry_association_cli()` wraps the native `RasProcess.exe SetGeometryAssociation` command as a reference validator. It is intentionally not the primary workflow because the native command mutates the supplied HDF in place.
+
+```python
+from ras_commander import RasProcess
+
+result = RasProcess.validate_geometry_association_cli(
+    geometry_hdf,
+    terrain_hdf_path=terrain_hdf,
+    landcover_hdf_path=landcover_hdf,
+    ras_version="7.0",
+)
+
+print(result["passed"])
+print(result["command_args"])
+print(result["mismatches"])
+```
+
+!!! danger "Validation/reference only"
+    Run the native validator only on a disposable copy or a model you intentionally want `RasProcess.exe` to mutate. Normal automation should use `RasMap.associate_geometry_layers()`.
 
 ## Map Layer Management
 
-The `RasMap` class provides methods for managing custom map layers in RASMapper, allowing you to add GeoJSON or shapefile layers programmatically.
+`RasMap` can read and write top-level RASMapper `MapLayers` entries. These include reference map layers such as shapefiles and GeoJSON, plus standard HEC-RAS basemap layers such as USGS Topo or Google Hybrid.
 
-### Adding Custom Map Layers
+### Discovering Map Layers
 
 ```python
-from ras_commander import init_ras_project, RasMap
+from ras_commander import RasMap
 
-init_ras_project(r"C:\Projects\MyModel", "6.6")
+all_layers = RasMap.list_map_layers(r"C:\Projects\MyModel")
+reference_layers = RasMap.list_reference_map_layers(r"C:\Projects\MyModel")
+basemap_layers = RasMap.list_basemap_layers(r"C:\Projects\MyModel")
+standard_basemaps = RasMap.list_standard_basemap_layers()
 
-# Add a GeoJSON layer to RASMapper
-RasMap.add_map_layer(
+print(all_layers[["name", "type", "category", "filename"]])
+print(standard_basemaps["name"].tolist())
+```
+
+`RasMap.list_map_layers()` returns a DataFrame when called with an explicit project path. The legacy active-project call shape, `RasMap.list_map_layers()`, is still available for older notebooks and returns `list[dict]` with a `FutureWarning`.
+
+### Adding Reference Map Layers
+
+```python
+from ras_commander import RasMap
+
+RasMap.add_reference_map_layer(
+    r"C:\Projects\MyModel",
+    r"C:\Projects\MyModel\custom_layers\boundaries.geojson",
     layer_name="Boundary Conditions",
-    file_path="./custom_layers/boundaries.geojson",
-    layer_type="PolylineFeatureLayer"
+    layer_type="PolylineFeatureLayer",
+)
+
+RasMap.add_reference_map_layer(
+    r"C:\Projects\MyModel",
+    r"C:\GIS\levee_centerline.shp",
+    layer_name="Levee Centerline",
 )
 ```
 
 !!! warning "WGS84 Requirement for GeoJSON"
-    GeoJSON files for RASMapper **must** be in WGS84 (EPSG:4326) coordinate system:
+    GeoJSON files for RASMapper must be in WGS84 (EPSG:4326) coordinates. `RasMap.add_reference_map_layer()` validates this before editing the `.rasmap` and raises `ValueError` when the source is projected or otherwise not WGS84-compatible.
+
     ```python
-    # Always reproject before saving GeoJSON for RASMapper
     gdf_wgs84 = gdf.to_crs("EPSG:4326")
     gdf_wgs84.to_file("output.geojson", driver="GeoJSON")
     ```
 
-### Listing and Removing Layers
+### Adding Basemap Layers
 
 ```python
-# List all custom map layers
-layers = RasMap.list_map_layers()
-for layer in layers:
-    print(f"  {layer['name']}: {layer['filename']}")
+RasMap.add_basemap_layer(r"C:\Projects\MyModel", "USGS Topo", checked=True)
+RasMap.add_basemap_layer(r"C:\Projects\MyModel", "Google Hybrid", checked=False)
+```
 
-# Remove a layer by name
+### Removing Layers
+
+```python
 RasMap.remove_map_layer("Old Analysis Layer")
 ```
 
 ## Geometry Visibility Control
 
-Control which geometry layers are visible in RASMapper. This is useful when a project has multiple geometries and you want to focus on a specific one.
+Control which geometry layers are visible in RASMapper. This is useful when a project has multiple geometries and you want to focus on a specific one. For documentation and QA/QC workflows, you can also toggle child geometry elements, set a deterministic RASMapper view, open standalone RASMapper, and capture a screenshot.
 
 ### Listing Geometries
 
@@ -129,6 +285,216 @@ The geometry visibility functions accept multiple identifier formats:
 | By name | `"1D-2D Dam Break Model"` | Full geometry name |
 | Filename | `"g08.hdf"` | Filename pattern |
 
+### Geometry Element View Control
+
+Use `RasMap.list_geometry_layers()` when you need the geometry tree that users
+see inside RASMapper. The returned DataFrame includes one row for each compiled
+geometry and one row for each child element such as cross sections, 2D flow
+areas, mesh perimeters, and structures.
+
+```python
+from ras_commander import RasMap
+
+layers = RasMap.list_geometry_layers(r"C:\Projects\MyModel")
+print(layers[[
+    "layer_id",
+    "category",
+    "geometry_number",
+    "layer_type",
+    "checked",
+    "geometry_hdf_path",
+]])
+```
+
+Toggle child geometry elements with `set_geometry_layer_visibility()`. The
+`exclusive=True` option hides other geometry elements first, which is useful for
+clean screenshots. For structure or breakline review, keep the 2D flow area
+visible with the target structure layer so the mesh/area context remains in the
+snapshot.
+
+```python
+RasMap.set_geometry_layer_visibility(
+    r"C:\Projects\MyModel",
+    geometry_number="04",
+    layer_type=["RASD2FlowArea", "LateralStructureLayer"],
+    checked=True,
+    exclusive=True,
+)
+```
+
+Use the matching result and map-layer state helpers to build figure recipes.
+Calling them without a selector targets all layers in that section; calling them
+with `exclusive=True` hides non-matching layers and shows only the selected
+context.
+
+```python
+# Hide all result rasters for a clean geometry/terrain figure
+RasMap.set_result_layer_visibility(
+    r"C:\Projects\MyModel",
+    checked=False,
+)
+
+# Or show only one plan/layer result
+RasMap.set_result_layer_visibility(
+    r"C:\Projects\MyModel",
+    plan_name="Existing Conditions",
+    layer_name="Depth",
+    checked=True,
+    exclusive=True,
+)
+
+# Show only land-classification map layers, or select by name/type
+RasMap.set_map_layer_visibility(
+    r"C:\Projects\MyModel",
+    category="land_classification",
+    checked=True,
+    exclusive=True,
+)
+```
+
+RASMapper visibility is layer-based, but ras-commander can build
+feature-focused viewports from compiled geometry HDFs. This does not hide the
+rest of the RASMapper layer. It uses the selected feature only to center the
+viewport, then zooms out enough to show the surrounding mesh, terrain, land
+cover, and profile context. Use `list_geometry_features()` to discover feature
+names and ids for supported layer types such as 2D flow areas, lateral
+structures, breaklines, and cross sections.
+
+```python
+features = RasMap.list_geometry_features(
+    r"C:\Projects\MyModel\MyModel.g04.hdf",
+    layer_type="LateralStructureLayer",
+)
+print(features[[
+    "feature_id",
+    "feature_index",
+    "feature_name",
+    "min_x",
+    "min_y",
+    "max_x",
+    "max_y",
+]])
+```
+
+RASMapper stores the current viewport in project coordinates. You can write it
+directly or let ras-commander compute bounds from the compiled geometry HDF:
+
+```python
+# Write an exact project-coordinate viewport
+RasMap.set_current_view(
+    r"C:\Projects\MyModel",
+    min_x=402800,
+    min_y=1799900,
+    max_x=413100,
+    max_y=1806400,
+)
+
+# Or zoom to a geometry element using HDF coordinate datasets
+RasMap.zoom_to_geometry_layer(
+    r"C:\Projects\MyModel",
+    geometry_number="04",
+    layer_type="LateralStructureLayer",
+    feature_name="Lateral Structure 1",
+)
+```
+
+When a feature selector is provided and `padding_fraction` is omitted,
+ras-commander expands the feature extent by 50% overall, which is 25% padding on
+each side. Pass `padding_fraction=` explicitly when a tighter or wider view is
+needed.
+
+For terrain-backed review images, turn on the terrain layer and ask RASMapper
+to update raster legends from the current view. The legend checkbox is stored as
+`RegenerateForScreen="True"` on `SurfaceFill` XML entries; ras-commander sets it
+for terrain and result surfaces by default.
+
+```python
+RasMap.set_terrain_layer_visibility(
+    r"C:\Projects\MyModel",
+    terrain_name="TerrainWithChannel",
+    checked=True,
+    exclusive=True,
+)
+RasMap.set_update_legend_with_view(r"C:\Projects\MyModel")
+```
+
+Then launch standalone RASMapper and capture what it draws:
+
+```python
+process = RasMap.open_rasmapper(r"C:\Projects\MyModel", ras_version="6.6")
+snapshot = RasMap.capture_rasmapper_snapshot(
+    pid=process.pid,
+    output_path=r"C:\Projects\MyModel\qa\lateral_structure_view.png",
+    delay_seconds=3,
+    timeout_seconds=1800,
+)
+RasMap.close_rasmapper(pid=process.pid)
+```
+
+!!! note "Standalone RASMapper endpoint"
+    `RasMap.open_rasmapper()` launches `RasMapper.exe model.rasmap` directly.
+    It does not automate HEC-RAS menus. Configure the `.rasmap` layer and
+    `CurrentView` state before opening the window.
+
+### Spatial Review Packages
+
+For agentic QA/QC and repeatable documentation, use
+`RasMap.create_spatial_review_package()` as the higher-level workflow. It writes
+an evidence bundle with before/after `.rasmap` XML, layer catalogs, preflight
+checks, view metadata, and a findings template. Screenshot capture is optional
+so the same workflow can run headlessly in tests or with standalone RASMapper on
+a Windows review machine.
+
+The current worked examples for this workflow family are
+[122_rasmapper_spatial_review.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/122_rasmapper_spatial_review.ipynb)
+for review-bundle orchestration and
+[123_rasmapper_geometry_layer_updates.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/123_rasmapper_geometry_layer_updates.ipynb)
+for mutation-backed geometry refresh and validation.
+
+By default, review packages and screenshots are written to a project subfolder
+named `RASMapper Screenshots`. Pass `output_dir=` only when a workflow needs a
+different location.
+
+```python
+review = RasMap.create_spatial_review_package(
+    r"C:\Projects\MyModel",
+    geometry_number="04",
+    layer_type=["RASD2FlowArea", "LateralStructureLayer"],
+    feature_name="Lateral Structure 1",
+    terrain_name="TerrainWithChannel",
+    result_plan_name="Existing Conditions",
+    result_layer_name="Depth",
+    map_layer_category="land_classification",
+    capture_snapshot=True,
+    snapshot_timeout_seconds=1800,
+    ras_version="6.6",
+)
+
+print(review["artifacts"])
+print(review["preflight"])
+```
+
+The package includes:
+
+- `review_state.json` - machine-readable setup, preflight, view, and artifact metadata
+- `rasmap_before.xml` / `rasmap_after.xml` - presentation-state audit trail
+- `geometry_layers.csv`, `result_layers.csv`, `map_layers.csv`, and `layers.csv` - discoverable layer catalogs
+- `geometry_features.csv` and `selected_features.csv` - HDF feature catalog and selected viewport target
+- `selected_result_layers.csv` and `selected_map_layers.csv` - selected figure context
+- `findings.md` - review template for agent or engineer notes
+- `rasmapper_spatial_review.png` - optional RASMapper screenshot
+
+By default, `create_spatial_review_package()` hides result and map layers so
+geometry, terrain, and selected structure context are not obscured. Pass
+`include_results=True`, `include_map_layers=True`, or specific result/map layer
+selectors to intentionally include those layers in the figure.
+
+The standalone RASMapper wait timeout defaults to 1800 seconds because large
+projects can take many minutes to open. Override `timeout_seconds` on
+`capture_rasmapper_snapshot()` or `snapshot_timeout_seconds` on
+`create_spatial_review_package()` when a workflow needs a shorter smoke-test
+timeout or a longer review window.
+
 ## Terrain Data Access
 
 The `RasMap` class provides methods for working with terrain datasets.
@@ -154,6 +520,8 @@ print(f"Available terrains: {terrains}")
 
 This is useful when you have multiple terrain datasets and need to specify which one to use for map generation or analysis.
 
+For richer terrain metadata, use `RasMap.list_terrain_layers(project_path)` as shown above.
+
 ## Land Cover and Soil Layers
 
 Land cover and soil data are critical for 2D modeling, controlling Manning's n roughness and infiltration parameters.
@@ -163,8 +531,9 @@ Land cover and soil data are critical for 2D modeling, controlling Manning's n r
 Land cover datasets define Manning's n values across 2D flow areas. These are typically stored as HDF files referenced in the RASMapper configuration.
 
 ```python
-# Get land cover layer path from rasmap_df
-landcover_path = ras.rasmap_df['landcover_hdf_path'][0]
+# Discover land-cover sidecars and RASMapper layer names
+landcover_layers = RasMap.list_landcover_layers(project_path)
+landcover_path = landcover_layers.iloc[0]["resolved_path"]
 
 # Land cover is used for Manning's n assignment
 # See Manning's n Calibration section below for modification
@@ -175,8 +544,9 @@ landcover_path = ras.rasmap_df['landcover_hdf_path'][0]
 Soil layers define hydrologic soil groups (A, B, C, D) used for infiltration calculations.
 
 ```python
-# Get soil layer path from rasmap_df
-soil_path = ras.rasmap_df['soil_hdf_path'][0]
+# Discover hydrologic soils layers
+soils_layers = RasMap.list_soils_layers(project_path)
+soil_path = soils_layers.iloc[0]["resolved_path"]
 
 # Soil data is used with infiltration methods
 # See Infiltration Data Handling section below
@@ -368,7 +738,7 @@ RASMapper Calculated Layers perform raster algebra on plan results. The most com
 ```python
 from ras_commander import init_ras_project, RasMap
 
-init_ras_project(r"C:\Projects\FloodModel", "6.6")
+init_ras_project(r"C:\Projects\FloodModel", "7.0")
 
 # Discover available plan result layers
 plans = RasMap.list_results_plans()
@@ -610,7 +980,7 @@ from ras_commander import (
 )
 
 # 1. Initialize project
-init_ras_project(r"C:\Projects\FloodModel", "6.6")
+init_ras_project(r"C:\Projects\FloodModel", "7.0")
 
 # 2. Check available spatial data
 print("Available terrains:", RasMap.get_terrain_names(RasMap.get_rasmap_path()))

@@ -38,7 +38,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Union, Optional, List, Dict, Any
+from typing import Union, Optional, List, Dict, Any, Tuple
 from datetime import datetime
 import shutil
 import platform
@@ -115,7 +115,7 @@ class RasProcess:
 
     Example (Windows - unchanged):
         >>> from ras_commander import init_ras_project, RasProcess
-        >>> init_ras_project("path/to/project", "6.6")
+        >>> init_ras_project("path/to/project", "7.0")
         >>> results = RasProcess.store_maps(
         ...     plan_number="01",
         ...     output_folder="Maps",
@@ -127,7 +127,7 @@ class RasProcess:
     Example (Linux with Wine):
         >>> from ras_commander import init_ras_project, RasProcess
         >>> # Auto-detects Linux and uses default Wine prefix
-        >>> init_ras_project("/path/to/project", "6.6")
+        >>> init_ras_project("/path/to/project", "7.0")
         >>> results = RasProcess.store_maps(plan_number="01")
         >>>
         >>> # Or configure Wine explicitly:
@@ -193,7 +193,9 @@ class RasProcess:
 
         Args:
             wine_prefix: Path to WINEPREFIX (default: auto-detect from WINE_PREFIX_PATHS)
-            wine_executable: Wine binary name or path (default: "wine")
+            wine_executable: Wine binary name or path used to launch
+                            Windows executables under Wine. Auxiliary tools
+                            such as ``winepath`` are resolved automatically.
             ras_install_dir: Path to directory containing RasProcess.exe and DLLs.
                            Can be a Linux path (under drive_c/) or left None for auto-detect.
 
@@ -266,6 +268,51 @@ class RasProcess:
         return config
 
     @staticmethod
+    def _build_wine_env(
+        wine_config: WineConfig = None,
+        include_winedebug: bool = True,
+    ) -> Dict[str, str]:
+        """Build environment variables for Wine subprocess execution."""
+        config = wine_config or RasProcess._get_wine_config()
+
+        env = {**os.environ, "DISPLAY": ""}
+        if config and config.wine_prefix:
+            env["WINEPREFIX"] = str(config.wine_prefix)
+        if include_winedebug:
+            env["WINEDEBUG"] = "-all"
+
+        return env
+
+    @staticmethod
+    def _resolve_wine_tool_executable(
+        tool_name: str,
+        wine_config: WineConfig = None,
+    ) -> str:
+        """
+        Resolve an auxiliary Wine tool for the configured Wine install.
+
+        For the main Wine runner, returns the configured ``wine_executable``.
+        For tools like ``winepath``, prefer a sibling binary next to a
+        path-based executable (for example ``/opt/wine/bin/wine64`` ->
+        ``/opt/wine/bin/winepath``). Otherwise fall back to the generic tool
+        name on ``PATH``.
+        """
+        config = wine_config or RasProcess._get_wine_config()
+        if config is None:
+            return tool_name
+
+        if tool_name == "wine":
+            return str(config.wine_executable)
+
+        wine_executable = Path(str(config.wine_executable))
+        if wine_executable.parent != Path(".") or wine_executable.is_absolute():
+            sibling_tool = wine_executable.with_name(tool_name)
+            if sibling_tool.exists():
+                return str(sibling_tool)
+
+        return tool_name
+
+    @staticmethod
     def _linux_to_wine_path(linux_path: Union[str, Path]) -> str:
         """
         Convert a Linux filesystem path to a Wine/Windows path.
@@ -291,14 +338,25 @@ class RasProcess:
             wine_config = RasProcess._get_wine_config()
             if wine_config:
                 try:
+                    winepath_executable = (
+                        RasProcess._resolve_wine_tool_executable(
+                            "winepath",
+                            wine_config,
+                        )
+                    )
                     result = subprocess.run(
-                        [wine_config.wine_executable + "path", "-w", str(linux_path)],
-                        capture_output=True, text=True, timeout=10,
-                        env={**os.environ, "WINEPREFIX": str(wine_config.wine_prefix), "DISPLAY": ""}
+                        [winepath_executable, "-w", str(linux_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        env=RasProcess._build_wine_env(
+                            wine_config,
+                            include_winedebug=False,
+                        ),
                     )
                     if result.returncode == 0:
                         return result.stdout.strip()
-                except Exception:
+                except (OSError, subprocess.TimeoutExpired):
                     pass
             # Fallback: return as-is (Wine can sometimes handle Unix paths)
             logger.warning(f"Cannot convert to Wine path (no drive_c/ found): {linux_path}")
@@ -348,7 +406,7 @@ class RasProcess:
         args: List[str],
         wine_config: WineConfig = None,
         working_dir: Path = None,
-    ) -> tuple:
+    ) -> Tuple[List[str], Dict[str, str], Optional[str]]:
         """
         Build a Wine-wrapped command line.
 
@@ -374,14 +432,12 @@ class RasProcess:
         else:
             exe_wine_path = exe_str  # Bare filename, let Wine find it
 
-        cmd = [config.wine_executable, exe_wine_path] + args
+        cmd = [
+            RasProcess._resolve_wine_tool_executable("wine", config),
+            exe_wine_path,
+        ] + args
 
-        env = {
-            **os.environ,
-            "WINEPREFIX": str(config.wine_prefix),
-            "DISPLAY": "",  # Headless — no X11 needed
-            "WINEDEBUG": "-all",  # Suppress Wine debug output
-        }
+        env = RasProcess._build_wine_env(config)
 
         cwd = str(working_dir) if working_dir else None
 
@@ -392,6 +448,9 @@ class RasProcess:
     def check_wine_environment() -> Dict[str, Any]:
         """
         Verify the Wine environment is properly configured for RasProcess.
+
+        Uses the configured ``wine_executable`` when one was provided via
+        ``configure_wine()``.
 
         Returns a dict with status of each component:
         - wine_found: bool
@@ -421,12 +480,23 @@ class RasProcess:
             "hdf5_found": False,
         }
 
+        config = RasProcess._get_wine_config()
+        wine_executable = RasProcess._resolve_wine_tool_executable(
+            "wine",
+            config,
+        )
+
         # Check wine binary
         try:
             proc = subprocess.run(
-                ["wine", "--version"],
-                capture_output=True, text=True, timeout=10,
-                env={**os.environ, "DISPLAY": ""}
+                [wine_executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=RasProcess._build_wine_env(
+                    config,
+                    include_winedebug=False,
+                ),
             )
             if proc.returncode == 0:
                 result["wine_found"] = True
@@ -435,7 +505,6 @@ class RasProcess:
             pass
 
         # Check Wine prefix
-        config = RasProcess._get_wine_config()
         if config and config.wine_prefix:
             result["wine_prefix"] = str(config.wine_prefix)
             result["prefix_exists"] = config.wine_prefix.exists()
@@ -476,7 +545,7 @@ class RasProcess:
     @log_call
     def setup_wine_environment(
         wine_prefix: Union[str, Path] = "/opt/hecras-wine",
-        ras_version: str = "6.6",
+        ras_version: str = "7.0",
     ) -> None:
         """
         Print setup instructions for the Wine environment.
@@ -566,7 +635,7 @@ Step 5: Configure (optional — auto-detection usually works)
         On Linux, searches within the Wine prefix drive_c/ directory.
 
         Args:
-            ras_version: Optional specific version to look for (e.g., "6.6").
+            ras_version: Optional specific version to look for (e.g., "7.0").
                         If None, searches all known paths.
 
         Returns:
@@ -727,6 +796,119 @@ Step 5: Configure (optional — auto-detection usually works)
 
     @staticmethod
     @log_call
+    def validate_geometry_association_cli(
+        hdf_path: Union[str, Path],
+        terrain_hdf_path: Optional[Union[str, Path]] = None,
+        landcover_hdf_path: Optional[Union[str, Path]] = None,
+        infiltration_hdf_path: Optional[Union[str, Path]] = None,
+        sediment_soils_hdf_path: Optional[Union[str, Path]] = None,
+        ras_version: str = None,
+        timeout: int = 600,
+        ras_object=None,
+    ) -> Dict[str, Any]:
+        """
+        Validate geometry association behavior against RasProcess.exe.
+
+        Warning:
+            This method runs RasProcess.exe ``SetGeometryAssociation`` in-place
+            and mutates the supplied geometry HDF. It is a reference/validation
+            path only. Normal workflows should call
+            ``RasMap.associate_geometry_layers(...)``, which writes the same
+            ``/Geometry`` association attributes through Python-native h5py.
+
+        Args:
+            hdf_path: Existing geometry HDF to mutate and validate.
+            terrain_hdf_path: Optional terrain HDF to associate.
+            landcover_hdf_path: Optional land-cover/Manning's n HDF.
+            infiltration_hdf_path: Optional infiltration HDF.
+            sediment_soils_hdf_path: Optional sediment bed-material soils HDF.
+            ras_version: Optional HEC-RAS version for RasProcess.exe lookup.
+            timeout: Command timeout in seconds.
+            ras_object: Optional RasPrj object. Present for API consistency.
+
+        Returns:
+            Dict containing command args, return code, stdout/stderr,
+            before/after association attrs, expected attrs, mismatches, and
+            ``passed``.
+        """
+        from ._geometry_association import (
+            build_expected_geometry_association_attrs,
+            build_set_geometry_association_args,
+            compare_expected_geometry_association_attrs,
+            read_geometry_association,
+            safe_resolve_path,
+        )
+
+        hdf_path = safe_resolve_path(hdf_path)
+        if not hdf_path.exists():
+            raise FileNotFoundError(f"Geometry HDF not found: {hdf_path}")
+
+        supplied = {
+            "terrain_hdf_path": terrain_hdf_path,
+            "landcover_hdf_path": landcover_hdf_path,
+            "infiltration_hdf_path": infiltration_hdf_path,
+            "sediment_soils_hdf_path": sediment_soils_hdf_path,
+        }
+        if all(path is None for path in supplied.values()):
+            raise ValueError("Provide at least one geometry association path.")
+
+        resolved_paths: Dict[str, Path] = {}
+        for key, path_value in supplied.items():
+            if path_value is None:
+                continue
+            resolved_path = safe_resolve_path(path_value)
+            if not resolved_path.exists():
+                raise FileNotFoundError(
+                    f"Association artifact not found for {key}: {resolved_path}"
+                )
+            resolved_paths[key] = resolved_path
+
+        before = read_geometry_association(hdf_path, resolve_paths=True)
+        expected_attrs = build_expected_geometry_association_attrs(
+            hdf_path,
+            resolved_paths,
+            project_folder=hdf_path.parent,
+        )
+
+        rasprocess = RasProcess.find_rasprocess(ras_version)
+        if rasprocess is None:
+            raise FileNotFoundError("RasProcess.exe not found")
+
+        command_args = build_set_geometry_association_args(
+            hdf_path,
+            resolved_paths,
+            path_formatter=RasProcess._resolve_path_for_rasprocess,
+        )
+        result = RasProcess._run_rasprocess(
+            rasprocess,
+            command_args,
+            timeout=timeout,
+            working_dir=hdf_path.parent,
+        )
+
+        after = read_geometry_association(hdf_path, resolve_paths=True)
+        mismatches = compare_expected_geometry_association_attrs(
+            hdf_path,
+            after,
+            expected_attrs,
+        )
+        passed = result.returncode == 0 and not mismatches
+
+        return {
+            "rasprocess_path": str(rasprocess),
+            "command_args": command_args,
+            "return_code": result.returncode,
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
+            "before": before,
+            "after": after,
+            "expected_attrs": expected_attrs,
+            "mismatches": mismatches,
+            "passed": passed,
+        }
+
+    @staticmethod
+    @log_call
     def get_plan_timestamps(
         plan_number: str,
         ras_object=None
@@ -861,9 +1043,20 @@ Step 5: Configure (optional — auto-detection usually works)
                 )
                 return False
 
-            with rasterio.open(tif_path, 'r+') as dst:
-                dst.transform = transform
-                dst.crs = crs
+            tif_path = Path(tif_path)
+            tmp_path = tif_path.with_name(f"{tif_path.stem}.georef_tmp{tif_path.suffix}")
+            with rasterio.open(tif_path) as src:
+                data = src.read()
+                profile = src.profile.copy()
+                tags = src.tags()
+
+            profile.update(crs=crs, transform=transform)
+            with rasterio.open(tmp_path, "w", **profile) as dst:
+                dst.write(data)
+                if tags:
+                    dst.update_tags(**tags)
+
+            tmp_path.replace(tif_path)
 
             logger.info(f"Fixed georeferencing: {tif_path}")
             return True
@@ -871,6 +1064,44 @@ Step 5: Configure (optional — auto-detection usually works)
         except Exception as e:
             logger.error(f"Failed to fix georeferencing for {tif_path}: {e}")
             return False
+
+    @staticmethod
+    def _drop_unreadable_tifs(
+        generated_files: Dict[str, List[Path]],
+    ) -> Dict[str, List[Path]]:
+        """
+        Remove invalid GeoTIFFs from StoreAllMaps results.
+
+        HEC-RAS can occasionally emit a partial or corrupt TIFF for a single
+        stored-map timestep. Downstream animation code treats a missing timestep
+        as dry/no-data, but it cannot recover from a path that exists and then
+        fails during raster read.
+        """
+        if not HAS_RASTERIO:
+            return generated_files
+
+        for map_key, tif_list in list(generated_files.items()):
+            readable_tifs: List[Path] = []
+            for tif_path in tif_list:
+                try:
+                    with rasterio.open(tif_path) as src:
+                        if src.count < 1 or src.width < 1 or src.height < 1:
+                            raise ValueError("GeoTIFF has no readable raster band")
+                        src.read(1)
+                    readable_tifs.append(tif_path)
+                except Exception as exc:
+                    logger.warning(
+                        "Dropping unreadable stored-map TIFF %s: %s",
+                        tif_path,
+                        exc,
+                    )
+                    try:
+                        Path(tif_path).unlink(missing_ok=True)
+                    except OSError:
+                        logger.debug("Could not delete unreadable TIFF: %s", tif_path)
+            generated_files[map_key] = readable_tifs
+
+        return generated_files
 
     @staticmethod
     def _get_plan_short_id(hdf_path: Path) -> Optional[str]:
@@ -1258,7 +1489,7 @@ Step 5: Configure (optional — auto-detection usually works)
                     mode=render_mode,
                     ras_object=ras_obj,
                 )
-                logger.info(f"Set render mode to '{render_mode}' before StoreAllMaps")
+                logger.debug(f"Set render mode to '{render_mode}' before StoreAllMaps")
 
             # Clear existing stored maps if requested
             if clear_existing:
@@ -1312,12 +1543,22 @@ Step 5: Configure (optional — auto-detection usually works)
                     resolved_output_path = (ras_obj.project_folder / resolved_output_path).resolve()
                 resolved_output_path.mkdir(parents=True, exist_ok=True)
 
-            # Snapshot pre-existing files in output_dir so we only move newly
-            # generated files when output_path is specified (avoids destroying
-            # pre-existing rasters like manual benchmarks).
-            pre_existing_files = set()
+            # Snapshot pre-existing files in output_dir so we only move files
+            # that were created or changed by this StoreAllMaps call when
+            # output_path is specified. This preserves unrelated benchmark or
+            # manually curated files while still relocating regenerated rasters
+            # that overwrite the same filenames on reruns.
+            pre_existing_files = {}
             if output_dir.exists():
-                pre_existing_files = {f.name for f in output_dir.iterdir()}
+                for item in output_dir.iterdir():
+                    try:
+                        stat = item.stat()
+                    except FileNotFoundError:
+                        continue
+                    pre_existing_files[item.name] = (
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
 
             # Use RasStoreMapHelper.exe instead of RasProcess.exe.
             # RasStoreMapHelper sets SharedData render mode via .NET reflection
@@ -1362,11 +1603,15 @@ Step 5: Configure (optional — auto-detection usually works)
                     f"Moving generated files from {output_dir} to {resolved_output_path}"
                 )
                 moved_count = 0
-                # Only move files that were generated by this call (not pre-existing).
-                # Snapshot the directory contents before to identify new files.
+                # Move files that were created or modified by this call.
                 for item in output_dir.iterdir():
-                    # Only move files that were NOT in the pre-existing set
-                    if item.name not in pre_existing_files:
+                    try:
+                        stat = item.stat()
+                    except FileNotFoundError:
+                        continue
+                    previous_signature = pre_existing_files.get(item.name)
+                    current_signature = (stat.st_mtime_ns, stat.st_size)
+                    if previous_signature != current_signature:
                         dest = resolved_output_path / item.name
                         if dest.exists():
                             dest.unlink()
@@ -1433,6 +1678,7 @@ Step 5: Configure (optional — auto-detection usually works)
                             )
                 else:
                     logger.warning("Could not find terrain for georef fix")
+                RasProcess._drop_unreadable_tifs(generated_files)
 
             return generated_files
 
@@ -1441,6 +1687,132 @@ Step 5: Configure (optional — auto-detection usually works)
             if rasmap_backup.exists():
                 shutil.copy2(rasmap_backup, rasmap_path)
                 rasmap_backup.unlink()
+
+    @staticmethod
+    @log_call
+    def store_maps_at_timesteps(
+        plan_number: str,
+        output_path: Union[str, Path] = None,
+        timesteps: Optional[Union[int, str, datetime, List[Union[int, str, datetime]]]] = None,
+        max_timesteps: Optional[int] = None,
+        wse: bool = False,
+        depth: bool = True,
+        velocity: bool = False,
+        froude: bool = False,
+        shear_stress: bool = False,
+        depth_x_velocity: bool = False,
+        depth_x_velocity_sq: bool = False,
+        render_mode: str = None,
+        clear_existing: bool = True,
+        fix_georef: bool = True,
+        ras_object=None,
+        ras_version: str = None,
+        timeout: int = 600,
+    ) -> Dict[str, Dict[str, List[Path]]]:
+        """
+        Generate stored maps for one or more output timesteps.
+
+        This convenience wrapper routes each selected timestep through
+        ``store_maps(profile=<timestamp>)`` so callers can export a sequence of
+        rasters suitable for animation.
+
+        Args:
+            plan_number: Plan number (e.g., "02").
+            output_path: Optional directory for generated rasters.
+            timesteps: Optional timestep selector. Items may be zero-based
+                integer indices, exact RASMapper timestamp strings, or datetimes.
+                If omitted, all available output timesteps are used.
+            max_timesteps: Optional cap applied after timestep selection.
+            wse, depth, velocity, froude, shear_stress, depth_x_velocity,
+                depth_x_velocity_sq: Map types to export. Defaults to Depth only.
+            render_mode, clear_existing, fix_georef, ras_object, ras_version,
+                timeout: Passed through to ``store_maps``.
+
+        Returns:
+            Dict keyed by RASMapper timestamp string. Each value is the
+            ``store_maps`` result for that timestep.
+        """
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+
+        available = RasProcess.get_plan_timestamps(plan_number, ras_obj)
+        if not available:
+            raise ValueError(f"No output timesteps found for plan {plan_number}")
+
+        selected = RasProcess._select_store_map_timesteps(available, timesteps)
+        if max_timesteps is not None:
+            selected = selected[: int(max_timesteps)]
+        if not selected:
+            raise ValueError("No timesteps selected for stored map export")
+
+        results: Dict[str, Dict[str, List[Path]]] = {}
+        for timestamp in selected:
+            results[timestamp] = RasProcess.store_maps(
+                plan_number=plan_number,
+                output_path=output_path,
+                profile=timestamp,
+                render_mode=render_mode,
+                wse=wse,
+                depth=depth,
+                velocity=velocity,
+                froude=froude,
+                shear_stress=shear_stress,
+                depth_x_velocity=depth_x_velocity,
+                depth_x_velocity_sq=depth_x_velocity_sq,
+                clear_existing=clear_existing,
+                fix_georef=fix_georef,
+                ras_object=ras_obj,
+                ras_version=ras_version,
+                timeout=timeout,
+            )
+        return results
+
+    @staticmethod
+    def _select_store_map_timesteps(
+        available: List[str],
+        timesteps: Optional[Union[int, str, datetime, List[Union[int, str, datetime]]]],
+    ) -> List[str]:
+        if timesteps is None:
+            return list(available)
+        if isinstance(timesteps, (int, str, datetime, pd.Timestamp)):
+            requested = [timesteps]
+        else:
+            requested = list(timesteps)
+
+        selected: List[str] = []
+        for item in requested:
+            if isinstance(item, int):
+                try:
+                    selected.append(available[item])
+                except IndexError as exc:
+                    raise ValueError(
+                        f"Timestep index {item} out of range for {len(available)} timesteps"
+                    ) from exc
+                continue
+
+            if isinstance(item, (datetime, pd.Timestamp)):
+                item_text = pd.Timestamp(item).strftime("%d%b%Y %H:%M:%S").upper()
+            else:
+                item_text = str(item).strip()
+
+            if item_text in available:
+                selected.append(item_text)
+                continue
+
+            parsed_text = None
+            try:
+                parsed_text = pd.Timestamp(item_text).strftime("%d%b%Y %H:%M:%S").upper()
+            except Exception:
+                pass
+            if parsed_text in available:
+                selected.append(parsed_text)
+                continue
+
+            raise ValueError(
+                f"Timestep {item!r} not found. First available timesteps: {available[:5]}"
+            )
+
+        return selected
 
     @staticmethod
     @log_call
@@ -1733,7 +2105,7 @@ Step 5: Configure (optional — auto-detection usually works)
             with rasterio.open(output_path, 'w', **profile) as dst:
                 dst.write(data, 1)
 
-        logger.info(
+        logger.debug(
             f"Threshold applied: {cells_filtered}/{cells_total} cells filtered "
             f"(min_depth={min_depth}), output: {output_path.name}"
         )
@@ -2108,7 +2480,7 @@ Step 5: Configure (optional — auto-detection usually works)
                     # Use the most recently modified match
                     best = max(matches, key=lambda p: p.stat().st_mtime)
                     input_tiffs.append(best)
-                    logger.info(f"Plan {plan_num}: found {best.name}")
+                    logger.debug(f"Plan {plan_num}: found {best.name}")
                     found = True
                     break
 

@@ -91,6 +91,29 @@ Public API:
             - get_gauge_folder: Get path to gauge folder
             - update_gauge_catalog: Refresh existing catalog with new data
 
+    From study:
+        - UsgsObservations: Primitive-first gauge data helpers
+            - get_gauge_metadata: Retrieve one gauge's metadata
+            - get_dataset: Retrieve one normalized dataset by dataset id
+            - get_peak_flow_data: Retrieve peak-flow observations
+            - summarize_dataset: Build dataset summary metadata
+            - analyze_gaps: Build dataset gap analysis
+        - UsgsDrainageAreaComparison: Drainage-area comparison helper
+            - compare_areas: Compare gauge/basin/TauDEM/model areas
+
+    Workflow note:
+        Gauge-study packaging and model-prep readiness/report assembly are kept
+        in example notebooks rather than the main public package surface so the
+        library stays focused on composable primitives.
+
+    From initial_conditions:
+        - InitialConditions: Static class for IC management
+            - parse_initial_conditions: Read IC entries from unsteady file
+            - create_ic_line: Format IC line for file writing
+            - write_initial_conditions: Write IC entries to unsteady file
+            - get_ic_value_from_usgs: Retrieve IC value from single USGS gauge
+            - generate_ic_from_usgs: Auto-discover gauges, match to XS, generate IC table
+
     From rate_limiter:
         - test_api_key: Validate USGS API key functionality
         - UsgsRateLimiter: Token bucket rate limiter for API requests
@@ -213,6 +236,12 @@ from .catalog import (
     UsgsGaugeCatalog,
 )
 
+# Import basin-first study utilities
+from .study import (
+    UsgsObservations,
+    UsgsDrainageAreaComparison,
+)
+
 # Import rate limiting utilities
 from .rate_limiter import (
     UsgsRateLimiter,
@@ -255,12 +284,22 @@ align_timeseries = TimeSeriesProcessor.align_timeseries
 resample_to_hecras_interval = TimeSeriesProcessor.resample_to_hecras_interval
 check_data_gaps = TimeSeriesProcessor.check_data_gaps
 
+# From initial_conditions module
+generate_ic_from_usgs = InitialConditions.generate_ic_from_usgs
+
 # From catalog module
 generate_gauge_catalog = UsgsGaugeCatalog.generate_gauge_catalog
 load_gauge_catalog = UsgsGaugeCatalog.load_gauge_catalog
 load_gauge_data = UsgsGaugeCatalog.load_gauge_data
 get_gauge_folder = UsgsGaugeCatalog.get_gauge_folder
 update_gauge_catalog = UsgsGaugeCatalog.update_gauge_catalog
+
+# From study module
+retrieve_peak_flow_data = UsgsObservations.get_peak_flow_data
+retrieve_observed_dataset = UsgsObservations.get_dataset
+summarize_observed_dataset = UsgsObservations.summarize_dataset
+analyze_observation_gaps = UsgsObservations.analyze_gaps
+compare_drainage_areas = UsgsDrainageAreaComparison.compare_areas
 
 def check_dependencies():
     """
@@ -318,6 +357,8 @@ __all__ = [
     'GaugeMatcher',
     'RasUsgsRealTime',
     'UsgsGaugeCatalog',
+    'UsgsObservations',
+    'UsgsDrainageAreaComparison',
     # Core data retrieval functions
     'retrieve_flow_data',
     'retrieve_stage_data',
@@ -337,6 +378,8 @@ __all__ = [
     'match_gauge_to_cross_section',
     'match_gauge_to_2d_area',
     'auto_match_gauges',
+    # IC generation functions
+    'generate_ic_from_usgs',
     # Visualization class and functions
     'RasUsgsVisualization',
     'plot_timeseries_comparison',
@@ -395,6 +438,12 @@ __all__ = [
     'load_gauge_data',
     'get_gauge_folder',
     'update_gauge_catalog',
+    # Basin-first study functions
+    'retrieve_peak_flow_data',
+    'retrieve_observed_dataset',
+    'summarize_observed_dataset',
+    'analyze_observation_gaps',
+    'compare_drainage_areas',
     # Rate limiting utilities
     'UsgsRateLimiter',
     'retry_with_backoff',

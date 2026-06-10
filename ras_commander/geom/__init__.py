@@ -45,6 +45,15 @@ Example:
 from .GeomParser import GeomParser
 from .GeomPreprocessor import GeomPreprocessor
 from .GeomLandCover import GeomLandCover
+from .GeomCrossSection import (
+    CrossSectionBankStations,
+    CrossSectionBuildInput,
+    CrossSectionBuildResult,
+    CrossSectionManningsN,
+    CrossSectionReachLengths,
+    GeomCrossSection,
+)
+from .ManningsFromLandCover import ManningsFromLandCover
 from .GeomCrossSection import GeomCrossSection
 from .GeomStorage import GeomStorage
 from .GeomLateral import GeomLateral
@@ -54,12 +63,22 @@ from .GeomCulvert import GeomCulvert
 from .GeomHtabUtils import GeomHtabUtils
 from .GeomHtab import GeomHtab
 from .GeomMetadata import GeomMetadata
+from .GeomReferenceFeatures import GeomReferenceFeatures
+from .GeomBcLines import GeomBcLines
+from .GeomMesh import GeomMesh
+from .GeomMeshDataclasses import MeshResult, BCConflict, BCFixResult
 
 __all__ = [
     'GeomParser',
     'GeomPreprocessor',
     'GeomLandCover',
+    'ManningsFromLandCover',
     'GeomCrossSection',
+    'CrossSectionBankStations',
+    'CrossSectionBuildInput',
+    'CrossSectionBuildResult',
+    'CrossSectionManningsN',
+    'CrossSectionReachLengths',
     'GeomStorage',
     'GeomLateral',
     'GeomInlineWeir',
@@ -68,4 +87,10 @@ __all__ = [
     'GeomHtabUtils',
     'GeomHtab',
     'GeomMetadata',
+    'GeomReferenceFeatures',
+    'GeomBcLines',
+    'GeomMesh',
+    'MeshResult',
+    'BCConflict',
+    'BCFixResult',
 ]

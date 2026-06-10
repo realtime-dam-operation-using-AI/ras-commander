@@ -75,6 +75,10 @@ research/**/*.pyc
 research/**/__pycache__/
 /feature_dev_notes
 /research
+!/research/
+!/research/fixtures/
+!/research/fixtures/met_data/
+!/research/fixtures/met_data/**
 /docs_old
 /examples/working
 /examples/hyetographs
@@ -82,7 +86,12 @@ examples/flood_polygons.geojson
 ras-commander_logo.png
 # .claude/ framework - ignore user settings but track structure
 .claude/settings.local.json
-.claude/settings.json
+
+# Codex skill bridge - generated from .claude/skills and
+# .agents/native-skills by
+# scripts/agent_framework/sync_codex_skill_bridge.py.
+.agents/skills/*
+!.agents/skills/README.md
 nul
 examples/example_projects.csv
 
@@ -146,6 +155,8 @@ agent_tasks/ras-commander-api-research/
 # Archive directories (includes moved ras_agents/, ras_skills/, planning_docs/)
 # Note: agent_tasks/.old/ is handled separately above (keeps .gitkeep, ignores contents)
 /.old/
+examples/.old/
+.claude/plans/.old/
 .claude/outputs/
 
 # Temporary test scripts (task-specific)
@@ -181,7 +192,6 @@ test_notebook*.ipynb
 examples/test_*.ipynb
 
 # Work-in-progress example notebooks (hold until second example added)
-examples/313_hms_to_ras_boundary_matching.ipynb
 
 # Cleanup scripts (can be regenerated)
 cleanup_temp_files.sh
@@ -192,6 +202,13 @@ examples/cache/
 
 # Working directories (temporary computation folders)
 working/
+
+# Accidentally-committed temp/cache artifacts (win32com gen_py cache, uv caches)
+.tmp/
+.uv-cache/
+
+# Notebook download artifacts (e.g. 919 STOFS-3D); notebooks regenerate + clean these
+example_data/
 
 # Temporary example outputs and test data
 examples/gauge_data/
@@ -204,8 +221,12 @@ examples/explore_*.py
 examples/find_*.py
 examples/verify_*.py
 
-# Temporary source folders
-ras_commander/sources/
+# Temporary source folders (allow tracked subpackages and __init__)
+ras_commander/sources/*
+!ras_commander/sources/__init__.py
+!ras_commander/sources/base.py
+!ras_commander/sources/county/
+!ras_commander/sources/federal/
 
 # Claude Code workspace directories
 examples/.claude/
@@ -213,6 +234,13 @@ examples/.claude/
 # Claude Code session temp files
 tmpclaude-*-cwd
 **/tmpclaude-*-cwd
+
+# Symphony runner workspace artifacts (per-issue, not version-controlled)
+OUTPUT.md
+COMMIT_READY.md
+TASK.md
+VALIDATION_MATRIX.md
+terminal-logs/
 
 # Environment variables and API keys
 .env

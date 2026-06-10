@@ -51,7 +51,7 @@ class RasPreprocess:
 
     Example:
         >>> from ras_commander import RasPreprocess, init_ras_project
-        >>> init_ras_project("/path/to/project", "6.6")
+        >>> init_ras_project("/path/to/project", "7.0")
         >>> result = RasPreprocess.preprocess_plan("01")
         >>> if result:
         ...     print(f"Ready for Linux in {result.elapsed_seconds:.1f}s")
@@ -139,7 +139,7 @@ class RasPreprocess:
                     elapsed_seconds=time.time() - start_time,
                 )
 
-        logger.info(f"Plan {plan_num} uses geometry g{geometry_number}")
+        logger.debug(f"Plan {plan_num} uses geometry g{geometry_number}")
 
         # Build file paths
         tmp_hdf = project_folder / f"{project_name}.p{plan_num}.tmp.hdf"

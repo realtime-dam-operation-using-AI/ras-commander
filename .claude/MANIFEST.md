@@ -3,6 +3,13 @@
 Central registry mapping all skills, agents, rules, and commands by domain.
 Update this file when adding, removing, or renaming any `.claude/` component.
 
+This file is the Claude-side component registry only. Shared repository behavior lives in the `AGENTS.md` hierarchy, not in `.claude/`.
+
+Some provider-invocation entries still exist here during the migration. `dev_invoke_codex-cli`
+is the supported Claude-to-Codex handoff. Gemini, Kimi, and provider-mixed review entries
+are legacy Claude-only compatibility components, explicit-request-only, and not part of the
+long-term shared multi-harness contract.
+
 When looking for a component related to a domain, scan the relevant domain group below.
 When adding a new component, add it to the appropriate domain group AND the relationship map.
 
@@ -72,6 +79,7 @@ When adding a new component, add it to the appropriate domain group AND the rela
 | Component | Type | Path |
 |-----------|------|------|
 | `terrain.md` | rule | `.claude/rules/hec-ras/terrain.md` |
+| `terrain-modification.md` | rule | `.claude/rules/hec-ras/terrain-modification.md` |
 | `RasTerrainMod` | module | `ras_commander/terrain/RasTerrainMod.py` |
 | `HdfLandCover` | module | `ras_commander/hdf/HdfLandCover.py` |
 | `930_terrain_modification_analysis` | notebook | `examples/930_terrain_modification_analysis.ipynb` |
@@ -81,6 +89,7 @@ When adding a new component, add it to the appropriate domain group AND the rela
 
 | Component | Type | Path |
 |-----------|------|------|
+| `ebfe_crawl_s3-catalog` | skill | `.claude/skills/ebfe_crawl_s3-catalog/SKILL.md` |
 | `ebfe_organize_models` | skill | `.claude/skills/ebfe_organize_models/SKILL.md` |
 | `ebfe_validate_models` | skill | `.claude/skills/ebfe_validate_models/SKILL.md` |
 | `ebfe-organizer` | agent | `.claude/agents/ebfe-organizer/SUBAGENT.md` |
@@ -90,8 +99,10 @@ When adding a new component, add it to the appropriate domain group AND the rela
 | Component | Type | Path |
 |-----------|------|------|
 | `qa_repair_geometry` | skill | `.claude/skills/qa_repair_geometry/SKILL.md` |
+| `qa_rasmapper_spatial-review` | skill | `.claude/skills/qa_rasmapper_spatial-review/SKILL.md` |
 | `qa_review_triple-model` | skill | `.claude/skills/qa_review_triple-model/SKILL.md` |
 | `quality-assurance` | agent | `.claude/agents/quality-assurance/SUBAGENT.md` |
+| `rasmapper-spatial-reviewer` | agent | `.claude/agents/rasmapper-spatial-reviewer.md` |
 | `validation-patterns.md` | rule | `.claude/rules/validation/validation-patterns.md` |
 
 ### HEC-RAS GUI & COM Automation
@@ -99,6 +110,7 @@ When adding a new component, add it to the appropriate domain group AND the rela
 | Component | Type | Path |
 |-----------|------|------|
 | `hecras_explore_gui` | skill | `.claude/skills/hecras_explore_gui/SKILL.md` |
+| `hecras_screenshot` | skill | `.claude/skills/hecras_screenshot/SKILL.md` |
 | `hecras_export_cloud-native` | skill | `.claude/skills/hecras_export_cloud-native/SKILL.md` |
 | `win32com-automation-expert` | agent | `.claude/agents/win32com-automation-expert.md` |
 | `hecras-code-archaeologist` | agent | `.claude/agents/hecras-code-archaeologist.md` |
@@ -109,6 +121,14 @@ When adding a new component, add it to the appropriate domain group AND the rela
 |-----------|------|------|
 | `hecras-project-inspector` | agent | `.claude/agents/hecras-project-inspector.md` |
 | `hecras-notebook-qaqc` | agent | `.claude/agents/hecras-notebook-qaqc.md` |
+
+### Calibration
+
+| Component | Type | Path |
+|-----------|------|------|
+| `calibration.md` | rule | `.claude/rules/hec-ras/calibration.md` |
+| `RasCalibrate` | module | `ras_commander/RasCalibrate.py` |
+| `ras-commander-first.md` | rule | `.claude/rules/hec-ras/ras-commander-first.md` |
 
 ### Python Patterns
 
@@ -157,12 +177,18 @@ When adding a new component, add it to the appropriate domain group AND the rela
 
 ### Dev Tooling
 
+Note: `dev_invoke_codex-cli` is the supported Claude-to-Codex handoff. Gemini/Kimi
+provider invocations are legacy, explicit-request-only Claude helpers and are excluded from
+the shared multi-harness skill corpus.
+
 | Component | Type | Path |
 |-----------|------|------|
 | `dev_invoke_codex-cli` | skill | `.claude/skills/dev_invoke_codex-cli/SKILL.md` |
 | `dev_invoke_gemini-cli` | skill | `.claude/skills/dev_invoke_gemini-cli/SKILL.md` |
 | `dev_invoke_kimi-cli` | skill | `.claude/skills/dev_invoke_kimi-cli/SKILL.md` |
 | `dev_manage_git-worktrees` | skill | `.claude/skills/dev_manage_git-worktrees/SKILL.md` |
+| `dev_gate_merge-to-main` | skill | `.claude/skills/dev_gate_merge-to-main/SKILL.md` |
+| `dev_human-in-loop` | skill | `.claude/skills/dev_human-in-loop/SKILL.md` |
 | `code-oracle-codex` | agent | `.claude/agents/code-oracle-codex.md` |
 | `code-oracle-gemini` | agent | `.claude/agents/code-oracle-gemini.md` |
 | `git-operations` | agent | `.claude/agents/git-operations/SUBAGENT.md` |
@@ -175,6 +201,7 @@ When adding a new component, add it to the appropriate domain group AND the rela
 | `subagent-output-pattern.md` | rule | `.claude/rules/subagent-output-pattern.md` |
 | `primitive-extraction-workflow.md` | rule | `.claude/rules/workflow/primitive-extraction-workflow.md` |
 | `clb-engineering-recommendation.md` | rule | `.claude/rules/clb-engineering-recommendation.md` |
+| `agents-md-bridge.md` | rule | `.claude/rules/agents-md-bridge.md` |
 | `hec-hms-documentation-scout` | agent | `.claude/agents/hec-hms-documentation-scout.md` |
 | `claude-code-guide` | agent | `.claude/agents/claude-code-guide.md` |
 
@@ -200,6 +227,19 @@ When adding a new component, add it to the appropriate domain group AND the rela
 | `agent-crossrepo` | command | `.claude/commands/agent-crossrepo.md` |
 | `agents-start-gitworktree` | command | `.claude/commands/agents-start-gitworktree.md` |
 | `agents-close-gitworktree` | command | `.claude/commands/agents-close-gitworktree.md` |
+
+### Cross-Validation & QAQC
+
+Note: `qa_review_triple-model` and `code-oracle-gemini` are legacy provider-mixed
+Claude-only compatibility components. Generic QAQC should use Claude/Codex production paths;
+use these only when the user explicitly requests the legacy provider-mixed workflow or Gemini.
+
+| Component | Type | Path |
+|-----------|------|------|
+| `dual-qaqc` | command | `.claude/commands/dual-qaqc.md` |
+| `qa_review_triple-model` | skill | `.claude/skills/qa_review_triple-model/SKILL.md` |
+| `code-oracle-codex` | agent | `.claude/agents/code-oracle-codex.md` |
+| `code-oracle-gemini` | agent | `.claude/agents/code-oracle-gemini.md` |
 
 ---
 
@@ -286,7 +326,12 @@ When adding a new component, add it to the appropriate domain group AND the rela
 
 ### eBFE/BLE Domain
 
+**`ebfe_crawl_s3-catalog`** (skill) -- public BLE/eBFE catalog discovery
+- Downstream: `ebfe_organize_models` skill
+- Agents: `ebfe-organizer`
+
 **`ebfe_organize_models`** (skill) -- model organization
+- Upstream: `ebfe_crawl_s3-catalog` skill
 - Downstream: `ebfe_validate_models` skill
 - Agents: `ebfe-organizer`
 
@@ -299,25 +344,50 @@ When adding a new component, add it to the appropriate domain group AND the rela
 **`qa_repair_geometry`** (skill) -- geometry repair
 - Agents: `quality-assurance`
 - Rules: `validation-patterns.md`, `geometry.md`
-- Related skills: `hecras_parse_geometry`
+- Related skills: `hecras_parse_geometry`, `qa_rasmapper_spatial-review`
 
-**`qa_review_triple-model`** (skill) -- multi-LLM review
+**`qa_rasmapper_spatial-review`** (skill) -- RASMapper spatial QA snapshots
+- Agents: `rasmapper-spatial-reviewer`
+- Rules: `validation-patterns.md`, `hdf-files.md`
+- Related skills: `hecras_screenshot`, `hecras_extract_results`, `hecras_parse_geometry`, `qa_repair_geometry`
+
+**`rasmapper-spatial-reviewer`** (agent) -- terrain-backed RASMapper review
+- Uses skills: `qa_rasmapper_spatial-review`
+- Related agents: `quality-assurance`, `hdf-analyst`, `hecras-project-inspector`, `hecras-results-analyst`
+
+**`qa_review_triple-model`** (skill) -- legacy explicit-request-only provider-mixed review
 - Agents: `code-oracle-codex`, `code-oracle-gemini`
 - Related skills: `dev_invoke_codex-cli`, `dev_invoke_gemini-cli`, `dev_invoke_kimi-cli`
 
 ### Dev Tooling Domain
 
+**`dev_gate_merge-to-main`** (skill) -- feature-branch guardrail
+- Agents: `git-operations`
+- Commands: `agent-taskupdate`, `agent-engagesubagents`
+
+**`dev_human-in-loop`** (skill) -- human approval gate for high-risk agent actions
+
 **`dev_invoke_codex-cli`** (skill) -- Codex CLI delegation
 - Agents: `code-oracle-codex`
 
-**`dev_invoke_gemini-cli`** (skill) -- Gemini CLI delegation
+**`dev_invoke_gemini-cli`** (skill) -- legacy explicit-request-only Gemini CLI delegation
 - Agents: `code-oracle-gemini`
 
-**`dev_invoke_kimi-cli`** (skill) -- Kimi CLI delegation
+**`dev_invoke_kimi-cli`** (skill) -- legacy explicit-request-only Kimi CLI delegation
 
 **`dev_manage_git-worktrees`** (skill) -- worktree management
 - Agents: `git-operations`
 - Commands: `agents-start-gitworktree`, `agents-close-gitworktree`
+
+### HEC-RAS GUI & Documentation Domain
+
+**`hecras_explore_gui`** (skill) -- GUI exploration
+- Agents: `win32com-automation-expert`, `hecras-code-archaeologist`
+- Related skills: `hecras_screenshot`
+
+**`hecras_screenshot`** (skill) -- GUI screenshot capture
+- Agents: `win32com-automation-expert`, `hecras-code-archaeologist`
+- Related skills: `hecras_explore_gui`, `qa_rasmapper_spatial-review`
 
 ### Notebook Operations Domain
 

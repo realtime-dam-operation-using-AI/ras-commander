@@ -1,15 +1,57 @@
-## hdf Compatibility Wrapper
+# HDF Subpackage Contract
 
-This `AGENTS.md` exists for agents that automatically discover that filename.
-The canonical instructions for this directory live in `CLAUDE.md`.
+This file is the canonical local instruction file for `ras_commander/hdf/`.
 
-Read in this order:
-- `./CLAUDE.md` - Canonical HDF guidance
-- `../CLAUDE.md` - Canonical core library guidance
-- `../../CLAUDE.md` - Canonical root guidance
-- `../../.claude/MANIFEST.md` - Canonical index for shared framework content
+## Scope
 
-Notes:
-- Treat `CLAUDE.md` as the source of truth when both files exist.
-- Treat `.claude/` as the canonical repository location for shared agent
-  framework materials.
+- Parent guidance from `ras_commander/AGENTS.md` and the repo root still applies.
+- This directory handles HEC-RAS geometry and results HDF access.
+
+## Module Families
+
+- Core helpers: `HdfBase`, `HdfUtils`, `HdfPlan`
+- Geometry readers: `HdfMesh`, `HdfXsec`, `HdfBndry`, `HdfStruc`, `HdfHydraulicTables`
+- Results readers: `HdfResultsPlan`, `HdfResultsMesh`, `HdfResultsXsec`, `HdfResultsBreach`, `HdfResultsSediment`
+- Infrastructure and land surface: `HdfPipe`, `HdfPump`, `HdfInfiltration`, `HdfLandCover`
+- Plotting and analysis: `HdfPlot`, `HdfResultsPlot`, `HdfBenefitAreas`, `HdfChannelCapacity`, `HdfFluvialPluvial`
+
+## Implementation Rules
+
+- Follow the existing static-class pattern.
+- Public methods should use `@staticmethod`, `@log_call`, and `@standardize_input(...)` when the surrounding module already does.
+- Keep heavy dependencies lazy-loaded inside methods when practical:
+  - `geopandas`
+  - `shapely`
+  - `xarray`
+  - `matplotlib`
+  - `scipy`
+- Use `h5py.File(..., "r")` context managers for direct file access.
+- Distinguish clearly between `plan_hdf` inputs and `geom_hdf` inputs when adding or modifying decorators.
+
+## Input And Output Rules
+
+- Accept the flexible HDF-facing input forms already used in this package: plan numbers, prefixed plan numbers, paths, and open HDF handles where the decorator pattern already allows them.
+- Return pandas or GeoPandas objects in the shapes established by nearby code. Do not invent a new container style for one method unless the surrounding API also changes.
+- Log read failures with enough file context to debug the issue.
+
+## Common Entry Points
+
+- Plan metadata and compute messages: `HdfResultsPlan`
+- Simulation start time: `HdfBase.get_simulation_start_time()` resolves across versions — 6.x
+  `Plan Information/Simulation Start Time` attr, then 5.0.x `Time Window` ("<start> to <end>"),
+  then the first `Unsteady Time Series/Time Date Stamp`. Required by all 2D summary reads
+  (`HdfResultsMesh.get_mesh_max_ws`/`get_mesh_summary_output`); 5.0.x plan HDFs omit the 6.x attr.
+- 2D cell geometry and face geometry: `HdfMesh`
+- 2D face property table write (Manning's n vs Elevation): `HdfMesh.set_mesh_face_property_tables()`, `extend_face_property_tables()`, `set_face_mannings_n_values()`, `pin_property_tables()`
+- 2D face spatial filtering (polygon mask): `HdfMesh.get_face_ids_in_polygon()`, `get_face_ids_in_calibration_region()`
+- Both `extend_face_property_tables()` and `set_face_mannings_n_values()` accept optional `polygon` and `region_name` parameters for selective face application (precedence: `face_ids` > `region_name` > `polygon` > all faces)
+- 2D results extraction: `HdfResultsMesh`
+- 2D mobile-bed (sediment) results: `HdfResultsSediment` (`is_sediment_plan()`, `get_sediment_mesh_areas()`, `get_cell_bed_change()`/`get_cell_bed_elevation()`/`get_active_layer_grain_class()` -> GeoDataFrame, `get_bed_change_volumes()` -> erosion/deposition/net volume per area, `get_cell_bed_change_timeseries()` -> xr.DataArray). Reads the `Sediment Bed` output block; per-cell arrays align with computed `Cells Surface Area` (zero-area ghost cells drop out of volume integrals). Covered by `examples/230_mesh_sensitivity_analysis.ipynb`.
+- 1D cross section geometry and results: `HdfXsec`, `HdfResultsXsec`
+- Land cover and infiltration preprocessing: `HdfLandCover`, `HdfInfiltration`
+- Infiltration group authoring: `HdfInfiltration.create_infiltration_group()`, `HdfInfiltration.set_infiltration_baseoverrides()`
+
+## Testing
+
+- Use real example HDF files when validating behavior.
+- Prefer targeted tests over synthetic HDF fixtures unless a regression cannot be reproduced against real examples.

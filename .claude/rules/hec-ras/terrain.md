@@ -13,7 +13,7 @@ paths: ras_commander/**
 
 **See**: `ras_commander/terrain/RasTerrain.py` for complete terrain API.
 
-**Future**: `ras_commander/terrain/CLAUDE.md` will provide workflow documentation (to be created).
+**Future**: `ras_commander/terrain/AGENTS.md` should provide shared terrain package rules when that subpackage gets local agent guidance.
 
 ## Overview
 
@@ -111,7 +111,7 @@ terrain = RasTerrain.create_terrain_hdf(
     output_hdf=Path("Terrain/Terrain.hdf"),
     projection_prj=Path("Terrain/Projection.prj"),
     units="Feet",
-    hecras_version="6.6"
+    hecras_version="7.0"
 )
 
 # Convert VRT to TIFF (preprocessing)

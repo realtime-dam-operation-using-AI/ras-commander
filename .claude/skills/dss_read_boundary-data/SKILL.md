@@ -1,5 +1,9 @@
 ---
 name: dss_read_boundary-data
+shared_corpus: true
+harness_scope: shared
+source_owner: gpt-cmdr
+security_review: internal
 description: |
   Reads HEC-DSS files (V6 and V7) for boundary condition extraction using
   RasDss class. Handles JVM configuration, HEC Monolith download, catalog
@@ -22,7 +26,7 @@ description: |
 from ras_commander import init_ras_project, RasDss
 
 # Initialize project
-ras = init_ras_project("path/to/project", "6.6")
+ras = init_ras_project("path/to/project", "7.0")
 
 # Read DSS catalog
 catalog = RasDss.get_catalog("file.dss")
@@ -189,7 +193,7 @@ print(f"Points: {len(df)}")
 from ras_commander import init_ras_project, RasDss
 
 # Initialize project
-ras = init_ras_project("project_path", "6.6")
+ras = init_ras_project("project_path", "7.0")
 
 # Extract all DSS boundary data
 enhanced = RasDss.extract_boundary_timeseries(

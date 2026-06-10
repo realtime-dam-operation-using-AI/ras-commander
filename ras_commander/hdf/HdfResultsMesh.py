@@ -105,6 +105,22 @@ class HdfResultsMesh:
 
     Works with HEC-RAS 6.0+ plan HDF files.
     """
+    MESH_CELL_TIME_SERIES_OUTPUT_VARS = [
+        "Water Surface", "Depth", "Velocity", "Velocity X", "Velocity Y",
+        "Froude Number", "Courant Number", "Shear Stress", "Bed Elevation",
+        "Precipitation Rate", "Infiltration Rate", "Evaporation Rate",
+        "Percolation Rate", "Groundwater Elevation", "Groundwater Depth",
+        "Groundwater Flow", "Groundwater Velocity", "Groundwater Velocity X",
+        "Groundwater Velocity Y"
+    ]
+
+    MESH_FACE_TIME_SERIES_OUTPUT_VARS = [
+        "Face Flow", "Face Velocity", "Face Water Surface", "Face Area",
+        "Face Manning's n", "Face Courant", "Face Cumulative Volume",
+        "Face Eddy Viscosity", "Face Flow Period Average",
+        "Face Friction Term", "Face Pressure Gradient Term",
+        "Face Shear Stress", "Face Tangential Velocity"
+    ]
 
     @staticmethod
     @log_call
@@ -175,24 +191,951 @@ class HdfResultsMesh:
             return HdfResultsMesh._get_mesh_timeseries_output(hdf_path, mesh_name, var, truncate)
 
     @staticmethod
+    def _truncate_profile_line_flow_dataframe(
+        flow_df: pd.DataFrame,
+        truncate: bool,
+    ) -> pd.DataFrame:
+        """Trim leading/trailing zero or NaN flow rows while preserving attrs."""
+        if not truncate or flow_df.empty or "flow" not in flow_df.columns:
+            return flow_df
+
+        flow = pd.to_numeric(flow_df["flow"], errors="coerce").to_numpy(dtype=float)
+        nonzero = np.flatnonzero(np.isfinite(flow) & (flow != 0.0))
+        if len(nonzero) == 0:
+            trimmed = flow_df.iloc[:0].copy()
+        else:
+            start, end = int(nonzero[0]), int(nonzero[-1]) + 1
+            trimmed = flow_df.iloc[start:end].reset_index(drop=True)
+        trimmed.attrs.update(flow_df.attrs)
+        return trimmed
+
+    @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_faces_timeseries(hdf_path: Path, mesh_name: str) -> xr.Dataset:
+    def get_profile_line_flow_timeseries(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: Optional[str] = None,
+        profile_lines_path: Optional[Union[str, Path]] = None,
+        direction: str = "absolute",
+        truncate: bool = False,
+        ras_object: Optional[Any] = None,
+    ) -> pd.DataFrame:
+        """
+        Return a flow time series across a RAS Mapper profile/reference line.
+
+        This canonical entry point uses RasMapperLib through pythonnet. Native
+        reference lines first use ``ObservedDataLayer.TryReadRefLineFlow()``
+        when RAS Mapper exposes a precomputed hydrograph; otherwise native
+        reference-line faces and ad-hoc profile lines are read through
+        ``RASResults.ReadUnsteadyTimeSeries()`` after selecting ad-hoc faces
+        with ``MeshFV2D.PerimeterFacesAlongPolyline()``.
+        """
+        direction = HdfResultsMesh._normalize_profile_line_direction(direction)
+        native_faces = HdfResultsMesh._get_native_profile_line_faces(
+            hdf_path=hdf_path,
+            line_name=line_name,
+            mesh_name=mesh_name,
+            ras_object=ras_object,
+        )
+        if not native_faces.empty:
+            refline_flow = HdfResultsMesh._try_read_ref_line_flow_rasmapper(
+                hdf_path=hdf_path,
+                line_name=line_name,
+                mesh_name=mesh_name,
+                direction=direction,
+            )
+            if refline_flow is not None:
+                return HdfResultsMesh._truncate_profile_line_flow_dataframe(
+                    refline_flow,
+                    truncate,
+                )
+
+            resolved_mesh_name = HdfResultsMesh._resolve_single_mesh_name(
+                native_faces,
+                mesh_name,
+                line_name,
+            )
+            selected_faces = native_faces[native_faces["mesh_name"] == resolved_mesh_name]
+            flow_df = HdfResultsMesh._read_rasmapper_face_flow_timeseries(
+                hdf_path=hdf_path,
+                line_name=line_name,
+                mesh_name=resolved_mesh_name,
+                face_ids=HdfResultsMesh._unique_int_values(selected_faces["face_id"]),
+                direction=direction,
+                selection_source="reference_line_internal_faces",
+            )
+            return HdfResultsMesh._truncate_profile_line_flow_dataframe(
+                flow_df,
+                truncate,
+            )
+
+        resolved_profile_lines_path = HdfResultsMesh._resolve_profile_lines_path(
+            profile_lines_path=profile_lines_path,
+            ras_object=ras_object,
+        )
+        if resolved_profile_lines_path is None:
+            raise ValueError(
+                f"Profile/reference line '{line_name}' was not found in native HDF "
+                "reference lines, and no RAS Mapper profile-lines feature path could "
+                "be resolved. Pass profile_lines_path or initialize a ras_object with "
+                "rasmap_df."
+            )
+
+        reference_hdf_path = HdfResultsMesh._resolve_reference_line_hdf_path(
+            hdf_path,
+            ras_object=ras_object,
+        )
+        profile_line = HdfResultsMesh._read_profile_line_geometry(
+            profile_lines_path=resolved_profile_lines_path,
+            line_name=line_name,
+        )
+        selected_faces = HdfResultsMesh._get_rasmapper_perimeter_faces(
+            geometry_hdf_path=reference_hdf_path,
+            profile_line=profile_line,
+            mesh_name=mesh_name,
+            line_name=line_name,
+        )
+        resolved_mesh_name = HdfResultsMesh._resolve_single_mesh_name(
+            selected_faces,
+            mesh_name,
+            line_name,
+        )
+        selected_faces = selected_faces[selected_faces["mesh_name"] == resolved_mesh_name]
+        flow_df = HdfResultsMesh._read_rasmapper_face_flow_timeseries(
+            hdf_path=hdf_path,
+            line_name=line_name,
+            mesh_name=resolved_mesh_name,
+            face_ids=HdfResultsMesh._unique_int_values(selected_faces["face_id"]),
+            direction=direction,
+            selection_source="rasmapper_perimeter_faces",
+        )
+        return HdfResultsMesh._truncate_profile_line_flow_dataframe(
+            flow_df,
+            truncate,
+        )
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_profile_line_flow_timeseries_legacy(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: Optional[str] = None,
+        profile_lines_path: Optional[Union[str, Path]] = None,
+        direction: str = "absolute",
+        truncate: bool = False,
+        ras_object: Optional[Any] = None,
+    ) -> pd.DataFrame:
+        """
+        Return a legacy pure-Python profile/reference-line flow time series.
+
+        This method predates the pythonnet/RasMapperLib profile API. It selects
+        native reference-line internal faces when available, otherwise reads a
+        RAS Mapper Profile Lines feature file and uses
+        ``HdfMesh.get_faces_along_profile_line()`` plus direct HDF ``Face Flow``
+        time series. Keep using it for offline analysis without a HEC-RAS
+        install or to reproduce pre-CLB-852 results; it is retained for
+        backward compatibility.
+
+        Parameters
+        ----------
+        hdf_path : Path
+            Plan HDF path, plan number, or other input accepted by
+            ``@standardize_input(file_type='plan_hdf')``.
+        line_name : str
+            Profile/reference line name to extract.
+        mesh_name : Optional[str], optional
+            2D flow area name. Required when the line resolves to more than one
+            mesh area.
+        profile_lines_path : Optional[Union[str, Path]], optional
+            Explicit RAS Mapper Profile Lines feature path. If omitted, the
+            method attempts to use ``ras_object.rasmap_df.profile_lines_path``.
+        direction : str, default "absolute"
+            ``"absolute"`` sums absolute face flows to avoid face-normal sign
+            cancellation. ``"signed"`` preserves native HEC-RAS face-flow signs;
+            orientation is controlled by the underlying face normals.
+        truncate : bool, default False
+            Passed to ``get_mesh_timeseries()``.
+        ras_object : Optional[Any], optional
+            RAS project object used for plan-number and rasmap path resolution.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: ``time``, ``flow``, ``line_name``, ``mesh_name``,
+            ``direction``, ``face_count``, and ``selection_source``.
+        """
+        direction = HdfResultsMesh._normalize_profile_line_direction(direction)
+        selected_faces, resolved_mesh_name, selection_source = (
+            HdfResultsMesh._resolve_profile_line_faces(
+                hdf_path=hdf_path,
+                line_name=line_name,
+                mesh_name=mesh_name,
+                profile_lines_path=profile_lines_path,
+                ras_object=ras_object,
+            )
+        )
+
+        face_ids = HdfResultsMesh._unique_int_values(selected_faces['face_id'])
+        if not face_ids:
+            raise ValueError(f"No valid face IDs resolved for profile line '{line_name}'.")
+
+        face_flow = HdfResultsMesh.get_mesh_timeseries(
+            hdf_path,
+            resolved_mesh_name,
+            "Face Flow",
+            truncate=truncate,
+        )
+        if "face_id" not in face_flow.coords:
+            raise ValueError(
+                f"Face Flow output for mesh '{resolved_mesh_name}' does not include face_id coordinates."
+            )
+
+        available_face_ids = {
+            int(face_id) for face_id in face_flow.coords["face_id"].values.tolist()
+        }
+        missing_face_ids = [
+            face_id for face_id in face_ids if face_id not in available_face_ids
+        ]
+        if missing_face_ids:
+            preview = missing_face_ids[:10]
+            more = "" if len(missing_face_ids) <= len(preview) else (
+                f" and {len(missing_face_ids) - len(preview)} more"
+            )
+            raise ValueError(
+                f"Face Flow output for mesh '{resolved_mesh_name}' is missing selected "
+                f"face IDs: {preview}{more}"
+            )
+
+        selected_flow = face_flow.sel(face_id=face_ids)
+        values = np.asarray(selected_flow.values, dtype=float)
+        if values.ndim == 1:
+            values = values.reshape((-1, 1))
+
+        if direction == "absolute":
+            flow = np.abs(values).sum(axis=1)
+        else:
+            flow = values.sum(axis=1)
+
+        result = pd.DataFrame({
+            "time": pd.to_datetime(face_flow.coords["time"].values),
+            "flow": flow,
+            "line_name": str(line_name),
+            "mesh_name": resolved_mesh_name,
+            "direction": direction,
+            "face_count": len(face_ids),
+            "selection_source": selection_source,
+        })
+        result.attrs["face_ids"] = face_ids
+        result.attrs["units"] = face_flow.attrs.get("units", "")
+        result.attrs["variable"] = "Face Flow"
+        return result
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_profile_line_peak_flow(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: Optional[str] = None,
+        profile_lines_path: Optional[Union[str, Path]] = None,
+        direction: str = "absolute",
+        ras_object: Optional[Any] = None,
+    ) -> pd.DataFrame:
+        """
+        Return peak flow across a RAS Mapper profile/reference line.
+
+        For ``direction="absolute"``, the peak is the maximum absolute-flow
+        sum. For ``direction="signed"``, the peak timestep is selected by
+        maximum signed-flow magnitude and the returned ``peak_flow`` preserves
+        the native sign at that timestep.
+        """
+        flow_df = HdfResultsMesh.get_profile_line_flow_timeseries(
+            hdf_path=hdf_path,
+            line_name=line_name,
+            mesh_name=mesh_name,
+            profile_lines_path=profile_lines_path,
+            direction=direction,
+            truncate=False,
+            ras_object=ras_object,
+        )
+        if flow_df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "line_name",
+                    "mesh_name",
+                    "peak_time",
+                    "peak_flow",
+                    "direction",
+                    "face_count",
+                    "selection_source",
+                ]
+            )
+
+        peak_index = flow_df["flow"].abs().idxmax()
+        peak_row = flow_df.loc[peak_index]
+        return pd.DataFrame([{
+            "line_name": peak_row["line_name"],
+            "mesh_name": peak_row["mesh_name"],
+            "peak_time": peak_row["time"],
+            "peak_flow": peak_row["flow"],
+            "direction": peak_row["direction"],
+            "face_count": peak_row["face_count"],
+            "selection_source": peak_row["selection_source"],
+        }])
+
+    @staticmethod
+    def _normalize_profile_line_direction(direction: str) -> str:
+        normalized = str(direction).strip().lower()
+        if normalized not in {"absolute", "signed"}:
+            raise ValueError("direction must be either 'absolute' or 'signed'")
+        return normalized
+
+    @staticmethod
+    def _resolve_profile_line_faces(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: Optional[str],
+        profile_lines_path: Optional[Union[str, Path]],
+        ras_object: Optional[Any],
+    ) -> Tuple[pd.DataFrame, str, str]:
+        native_faces = HdfResultsMesh._get_native_profile_line_faces(
+            hdf_path=hdf_path,
+            line_name=line_name,
+            mesh_name=mesh_name,
+            ras_object=ras_object,
+        )
+        if not native_faces.empty:
+            resolved_mesh_name = HdfResultsMesh._resolve_single_mesh_name(
+                native_faces,
+                mesh_name,
+                line_name,
+            )
+            return native_faces, resolved_mesh_name, "reference_line_internal_faces"
+
+        resolved_profile_lines_path = HdfResultsMesh._resolve_profile_lines_path(
+            profile_lines_path=profile_lines_path,
+            ras_object=ras_object,
+        )
+        if resolved_profile_lines_path is None:
+            raise ValueError(
+                f"Profile/reference line '{line_name}' was not found in native HDF "
+                "reference-line internal faces, and no RAS Mapper profile-lines "
+                "feature path could be resolved. Pass profile_lines_path or initialize "
+                "a ras_object with rasmap_df."
+            )
+
+        cell_faces = HdfMesh.get_mesh_cell_faces(hdf_path)
+        if cell_faces is None or cell_faces.empty:
+            raise ValueError(f"No mesh cell faces found in HDF file: {hdf_path}")
+
+        profile_line = HdfResultsMesh._read_profile_line_geometry(
+            profile_lines_path=resolved_profile_lines_path,
+            line_name=line_name,
+            target_crs=getattr(cell_faces, "crs", None),
+        )
+        selected_faces = HdfMesh.get_faces_along_profile_line(
+            profile_line=profile_line,
+            cell_faces_gdf=cell_faces,
+            mesh_name=mesh_name,
+        )
+        if selected_faces is None or selected_faces.empty:
+            raise ValueError(
+                f"No mesh faces found along profile line '{line_name}'. "
+                "Check that the line crosses the target mesh and that the HDF "
+                "and feature file use compatible coordinates."
+            )
+
+        resolved_mesh_name = HdfResultsMesh._resolve_single_mesh_name(
+            selected_faces,
+            mesh_name,
+            line_name,
+        )
+        selected_faces = selected_faces[selected_faces["mesh_name"] == resolved_mesh_name]
+        return selected_faces, resolved_mesh_name, "profile_lines_geometry"
+
+    @staticmethod
+    def _try_read_ref_line_flow_rasmapper(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: Optional[str],
+        direction: str,
+    ) -> Optional[pd.DataFrame]:
+        """Read a native RAS Mapper reference-line flow hydrograph if present."""
+        try:
+            from ..dotnet.clr_bootstrap import load_clr
+
+            load_clr()
+            from RasMapperLib import (  # type: ignore
+                ObservedDataLayer,
+                RASEventConditions,
+                RASResults,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "pythonnet/RasMapperLib is required for canonical profile-line "
+                "flow time-series extraction. Use "
+                "get_profile_line_flow_timeseries_legacy() for offline analysis."
+            ) from exc
+
+        results = RASResults(str(Path(hdf_path)))
+        if not bool(results.LoadedSuccessfully):
+            raise RuntimeError(f"RASResults could not load {hdf_path}")
+
+        observed = ObservedDataLayer(RASEventConditions(results))
+        met_ts = observed.TryReadRefLineFlow(str(line_name))
+        if met_ts is None:
+            return None
+
+        values = np.asarray([float(value) for value in met_ts.AllValues], dtype=float)
+        if direction == "absolute":
+            values = np.abs(values)
+
+        dates = [pd.Timestamp(str(value)) for value in met_ts.AllDates]
+        if len(dates) != len(values):
+            dates = HdfResultsMesh._profile_times_from_hdf(hdf_path, results)
+        dates = dates[: len(values)]
+
+        result = pd.DataFrame({
+            "time": pd.to_datetime(dates),
+            "flow": values,
+            "line_name": str(line_name),
+            "mesh_name": "" if mesh_name is None else str(mesh_name),
+            "direction": direction,
+            "face_count": 0,
+            "selection_source": "try_read_ref_line_flow",
+        })
+        result.attrs["face_ids"] = []
+        result.attrs["units"] = str(getattr(met_ts, "UnitString", "") or "")
+        result.attrs["variable"] = "Reference Line Flow"
+        return result
+
+    @staticmethod
+    def _get_rasmapper_perimeter_faces(
+        geometry_hdf_path: Path,
+        profile_line: Any,
+        mesh_name: Optional[str],
+        line_name: str,
+    ) -> pd.DataFrame:
+        """Select profile-line faces with MeshFV2D.PerimeterFacesAlongPolyline."""
+        try:
+            from ..dotnet.clr_bootstrap import load_clr
+
+            load_clr()
+            from RasMapperLib import MeshFV2D, PointMs, Polyline  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "pythonnet/RasMapperLib is required for canonical profile-line "
+                "flow time-series extraction. Use "
+                "get_profile_line_flow_timeseries_legacy() for offline analysis."
+            ) from exc
+
+        geometry_hdf_path = Path(geometry_hdf_path)
+        mesh_names = [str(mesh_name)] if mesh_name is not None else (
+            HdfMesh.get_mesh_area_names(geometry_hdf_path) or []
+        )
+        if not mesh_names:
+            raise ValueError(
+                f"No 2D flow-area meshes were found in {geometry_hdf_path}"
+            )
+
+        coords = list(profile_line.coords)
+        points = PointMs(len(coords))
+        for coord in coords:
+            points.Add(float(coord[0]), float(coord[1]))
+        polyline = Polyline(points)
+
+        rows: List[Dict[str, Any]] = []
+        for candidate_mesh in mesh_names:
+            try:
+                mesh = MeshFV2D(str(geometry_hdf_path), candidate_mesh, None)
+                computed = mesh.PerimeterFacesAlongPolyline(polyline, None)
+            except Exception as exc:
+                logger.debug(
+                    "RasMapperLib perimeter-face selection failed for mesh %s: %s",
+                    candidate_mesh,
+                    exc,
+                )
+                continue
+
+            face_ranges = computed[0] if isinstance(computed, tuple) else computed
+            for face_range in face_ranges:
+                rows.append({
+                    "mesh_name": str(candidate_mesh),
+                    "face_id": int(face_range.Face),
+                    "fp_start_idx": int(face_range.FPStartIdx),
+                    "fp_end_idx": int(face_range.FPEndIdx),
+                    "station_start": float(face_range.StationStart),
+                    "station_end": float(face_range.StationEnd),
+                })
+
+        if not rows:
+            raise ValueError(
+                f"No RAS Mapper perimeter faces found along profile line '{line_name}'. "
+                "Check that the line crosses the target mesh and that the HDF and "
+                "feature file use compatible coordinates."
+            )
+
+        selected = pd.DataFrame(rows)
+        selected = selected.drop_duplicates(["mesh_name", "face_id"], keep="first")
+        return selected.sort_values(
+            ["mesh_name", "station_start", "station_end", "face_id"],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    @staticmethod
+    def _read_rasmapper_face_flow_timeseries(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: str,
+        face_ids: List[int],
+        direction: str,
+        selection_source: str,
+    ) -> pd.DataFrame:
+        """Read selected Face Flow columns through RasMapperLib's HDF reader."""
+        if not face_ids:
+            raise ValueError(f"No valid face IDs resolved for profile line '{line_name}'.")
+
+        try:
+            from ..dotnet.clr_bootstrap import load_clr
+
+            load_clr()
+            from RasMapperLib import RASResults  # type: ignore
+            from System import Int32  # type: ignore
+            from System.Collections.Generic import List as DotNetList  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "pythonnet/RasMapperLib is required for canonical profile-line "
+                "flow time-series extraction. Use "
+                "get_profile_line_flow_timeseries_legacy() for offline analysis."
+            ) from exc
+
+        dataset_path = HdfResultsMesh._get_mesh_timeseries_output_path(
+            mesh_name,
+            "Face Flow",
+        )
+        results = RASResults(str(Path(hdf_path)))
+        if not bool(results.LoadedSuccessfully):
+            raise RuntimeError(f"RASResults could not load {hdf_path}")
+        if not bool(results.CheckDatasetExists(dataset_path)):
+            raise ValueError(f"Dataset not found in plan HDF: {dataset_path}")
+
+        columns = DotNetList[Int32]()
+        for face_id in face_ids:
+            columns.Add(int(face_id))
+        raw_values = results.ReadUnsteadyTimeSeries(dataset_path, columns, None)
+        n_times = int(raw_values.GetLength(0))
+        n_faces = int(raw_values.GetLength(1))
+        values = np.empty((n_times, n_faces), dtype=float)
+        for time_idx in range(n_times):
+            for face_pos in range(n_faces):
+                values[time_idx, face_pos] = float(raw_values[time_idx, face_pos])
+
+        if direction == "absolute":
+            flow = np.abs(values).sum(axis=1)
+        else:
+            flow = values.sum(axis=1)
+
+        times = HdfResultsMesh._profile_times_from_hdf(hdf_path, results)[:n_times]
+        units = ""
+        try:
+            with h5py.File(hdf_path, "r") as hdf_file:
+                if dataset_path in hdf_file:
+                    units = HdfResultsMesh._decode_hdf_attr(
+                        hdf_file[dataset_path].attrs.get("Units", "")
+                    )
+        except Exception:
+            units = ""
+
+        result = pd.DataFrame({
+            "time": pd.to_datetime(times),
+            "flow": flow,
+            "line_name": str(line_name),
+            "mesh_name": str(mesh_name),
+            "direction": direction,
+            "face_count": len(face_ids),
+            "selection_source": selection_source,
+        })
+        result.attrs["face_ids"] = face_ids
+        result.attrs["units"] = units
+        result.attrs["variable"] = "Face Flow"
+        return result
+
+    @staticmethod
+    def _profile_times_from_hdf(hdf_path: Path, results: Optional[Any] = None) -> List[pd.Timestamp]:
+        """Return unsteady profile timestamps using ras-commander's HDF time helpers."""
+        try:
+            with h5py.File(hdf_path, "r") as hdf_file:
+                start_time = HdfBase.get_simulation_start_time(hdf_file)
+                time_path = (
+                    "Results/Unsteady/Output/Output Blocks/Base Output/"
+                    "Unsteady Time Series/Time"
+                )
+                if time_path in hdf_file:
+                    return list(pd.to_datetime(
+                        HdfUtils.convert_timesteps_to_datetimes(
+                            np.asarray(hdf_file[time_path][:]),
+                            start_time,
+                        )
+                    ))
+        except Exception:
+            pass
+
+        if results is not None:
+            try:
+                return [pd.Timestamp(str(value)) for value in results.ProfileDateTimes]
+            except Exception:
+                pass
+            try:
+                return [
+                    pd.Timestamp(str(results.ProfileName(idx)))
+                    for idx in range(int(results.ProfileCount))
+                ]
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def _get_native_profile_line_faces(
+        hdf_path: Path,
+        line_name: str,
+        mesh_name: Optional[str],
+        ras_object: Optional[Any],
+    ) -> pd.DataFrame:
+        reference_hdf_path = HdfResultsMesh._resolve_reference_line_hdf_path(
+            hdf_path,
+            ras_object=ras_object,
+        )
+        reference_faces = HdfMesh.get_reference_line_internal_faces(
+            reference_hdf_path,
+            mesh_name=mesh_name,
+        )
+        if reference_faces.empty or "profile_name" not in reference_faces.columns:
+            return reference_faces.iloc[0:0].copy()
+
+        target_name = str(line_name).strip()
+        profile_names = reference_faces["profile_name"].fillna("").astype(str).str.strip()
+        selected = reference_faces.loc[profile_names == target_name].copy()
+        if selected.empty:
+            selected = reference_faces.loc[
+                profile_names.str.lower() == target_name.lower()
+            ].copy()
+
+        if selected.empty:
+            return selected
+
+        selected["face_id"] = pd.to_numeric(selected["face_id"], errors="coerce")
+        selected = selected.dropna(subset=["face_id"]).copy()
+        selected["face_id"] = selected["face_id"].astype(int)
+        if "station_start" in selected.columns:
+            selected = selected.sort_values(
+                ["mesh_name", "station_start", "station_end", "face_id"],
+                na_position="last",
+            )
+        return selected.reset_index(drop=True)
+
+    @staticmethod
+    def _resolve_reference_line_hdf_path(
+        hdf_path: Path,
+        ras_object: Optional[Any],
+    ) -> Path:
+        hdf_path = Path(hdf_path)
+        reference_faces_path = "Geometry/Reference Lines/Internal Faces"
+        if HdfResultsMesh._hdf_contains_path(hdf_path, reference_faces_path):
+            return hdf_path
+
+        geom_hdf_path = (
+            HdfResultsMesh._geometry_hdf_from_ras_object(hdf_path, ras_object)
+            or HdfResultsMesh._geometry_hdf_from_plan_hdf_path(hdf_path)
+        )
+        if geom_hdf_path is not None and geom_hdf_path.exists():
+            return geom_hdf_path
+        return hdf_path
+
+    @staticmethod
+    def _hdf_contains_path(hdf_path: Path, hdf_internal_path: str) -> bool:
+        try:
+            with h5py.File(hdf_path, "r") as hdf_file:
+                return hdf_internal_path in hdf_file
+        except Exception:
+            return False
+
+    @staticmethod
+    def _geometry_hdf_from_ras_object(
+        hdf_path: Path,
+        ras_object: Optional[Any],
+    ) -> Optional[Path]:
+        if ras_object is None:
+            return None
+
+        plan_df = getattr(ras_object, "plan_df", None)
+        if plan_df is None or plan_df.empty:
+            return None
+
+        target = HdfResultsMesh._normalized_path_string(hdf_path)
+        for _, row in plan_df.iterrows():
+            result_paths = []
+            for column in ("HDF_Results_Path", "hdf_path", "results_path"):
+                if column in row and pd.notna(row[column]):
+                    result_paths.append(row[column])
+
+            if not any(
+                HdfResultsMesh._normalized_path_string(path_value) == target
+                for path_value in result_paths
+            ):
+                continue
+
+            plan_number = row.get("plan_number")
+            if pd.notna(plan_number) and hasattr(ras_object, "get_hdf_paths"):
+                try:
+                    paths = ras_object.get_hdf_paths(str(plan_number))
+                    geom_hdf_path = paths.get("geometry")
+                    if geom_hdf_path is not None and Path(geom_hdf_path).exists():
+                        return Path(geom_hdf_path)
+                except Exception:
+                    pass
+
+            geom_path = row.get("Geom Path")
+            if pd.notna(geom_path):
+                geom_hdf_path = Path(str(geom_path) + ".hdf")
+                if geom_hdf_path.exists():
+                    return geom_hdf_path
+
+        return None
+
+    @staticmethod
+    def _geometry_hdf_from_plan_hdf_path(hdf_path: Path) -> Optional[Path]:
+        if hdf_path.suffix.lower() != ".hdf":
+            return None
+
+        plan_path = Path(str(hdf_path)[:-4])
+        if not plan_path.exists():
+            return None
+
+        geom_file = None
+        try:
+            with open(plan_path, "r", encoding="utf-8", errors="ignore") as plan_file:
+                for line in plan_file:
+                    if line.startswith("Geom File="):
+                        geom_file = line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            return None
+
+        if not geom_file:
+            return None
+
+        plan_name = plan_path.name
+        if "." not in plan_name:
+            return None
+        project_name = plan_name.rsplit(".", 1)[0]
+        geom_hdf_path = hdf_path.parent / f"{project_name}.{geom_file}.hdf"
+        return geom_hdf_path if geom_hdf_path.exists() else None
+
+    @staticmethod
+    def _normalized_path_string(path_value) -> str:
+        try:
+            return str(Path(str(path_value)).resolve()).lower()
+        except Exception:
+            return str(path_value).lower()
+
+    @staticmethod
+    def _resolve_single_mesh_name(
+        selected_faces: pd.DataFrame,
+        mesh_name: Optional[str],
+        line_name: str,
+    ) -> str:
+        if mesh_name is not None:
+            return str(mesh_name)
+
+        mesh_names = [
+            str(value)
+            for value in selected_faces.get("mesh_name", pd.Series(dtype=object)).dropna().unique()
+        ]
+        if len(mesh_names) == 1:
+            return mesh_names[0]
+        if not mesh_names:
+            raise ValueError(
+                f"Profile line '{line_name}' did not resolve a mesh name. "
+                "Specify mesh_name explicitly."
+            )
+        raise ValueError(
+            f"Profile line '{line_name}' intersects multiple mesh areas: {mesh_names}. "
+            "Specify mesh_name explicitly."
+        )
+
+    @staticmethod
+    def _resolve_profile_lines_path(
+        profile_lines_path: Optional[Union[str, Path]],
+        ras_object: Optional[Any],
+    ) -> Optional[Path]:
+        candidate_paths = []
+        ras_obj = ras_object
+        if profile_lines_path is not None:
+            candidate_paths.append(profile_lines_path)
+        else:
+            if ras_obj is None:
+                try:
+                    from ..RasPrj import ras as ras_obj
+                except Exception:
+                    ras_obj = None
+
+            rasmap_df = getattr(ras_obj, "rasmap_df", None)
+            if rasmap_df is not None and not rasmap_df.empty and "profile_lines_path" in rasmap_df.columns:
+                for value in rasmap_df["profile_lines_path"].tolist():
+                    if isinstance(value, (list, tuple, set)):
+                        candidate_paths.extend(value)
+                    elif pd.notna(value):
+                        candidate_paths.append(value)
+
+        project_folder = getattr(ras_obj, "project_folder", None)
+        for candidate in candidate_paths:
+            if candidate is None or (not isinstance(candidate, (list, tuple, set)) and pd.isna(candidate)):
+                continue
+            path = Path(candidate)
+            if not path.is_absolute() and project_folder is not None:
+                path = Path(project_folder) / path
+
+            resolved = HdfResultsMesh._resolve_profile_lines_file(path)
+            if resolved is not None:
+                return resolved
+        return None
+
+    @staticmethod
+    def _resolve_profile_lines_file(path: Path) -> Optional[Path]:
+        if path.is_file():
+            return path
+        if path.is_dir():
+            for pattern in ("*.shp", "*.geojson", "*.json", "*.gpkg"):
+                matches = sorted(path.glob(pattern))
+                if matches:
+                    return matches[0]
+        return None
+
+    @staticmethod
+    def _read_profile_line_geometry(
+        profile_lines_path: Path,
+        line_name: str,
+        target_crs: Optional[Any] = None,
+    ):
+        from shapely.geometry import LineString
+        from shapely.ops import linemerge, unary_union
+
+        profile_lines_gdf = gpd.read_file(profile_lines_path)
+        if profile_lines_gdf.empty:
+            raise ValueError(f"No profile-line features found in {profile_lines_path}")
+
+        name_column = HdfResultsMesh._profile_line_name_column(profile_lines_gdf)
+        target_name = str(line_name).strip()
+        names = profile_lines_gdf[name_column].fillna("").astype(str).str.strip()
+        selected = profile_lines_gdf.loc[names == target_name].copy()
+        if selected.empty:
+            selected = profile_lines_gdf.loc[names.str.lower() == target_name.lower()].copy()
+
+        if selected.empty:
+            available_names = sorted(names[names != ""].unique().tolist())
+            raise ValueError(
+                f"Profile line '{line_name}' not found in {profile_lines_path}. "
+                f"Available profile lines: {available_names}"
+            )
+
+        if (
+            target_crs is not None
+            and selected.crs is not None
+            and selected.crs != target_crs
+        ):
+            selected = selected.to_crs(target_crs)
+
+        geometries = [geom for geom in selected.geometry if geom is not None and not geom.is_empty]
+        if not geometries:
+            raise ValueError(f"Profile line '{line_name}' has no valid geometry.")
+
+        if len(geometries) == 1:
+            profile_line = geometries[0]
+        else:
+            merged_geometry = unary_union(geometries)
+            if merged_geometry.geom_type in {"LineString", "LinearRing"}:
+                profile_line = merged_geometry
+            else:
+                profile_line = linemerge(merged_geometry)
+        if profile_line.geom_type == "MultiLineString":
+            profile_line = max(profile_line.geoms, key=lambda geom: geom.length)
+
+        if profile_line.geom_type == "LinearRing":
+            profile_line = LineString(profile_line)
+        if profile_line.geom_type != "LineString":
+            raise ValueError(
+                f"Profile line '{line_name}' geometry must be a LineString; "
+                f"got {profile_line.geom_type}."
+            )
+        return profile_line
+
+    @staticmethod
+    def _profile_line_name_column(profile_lines_gdf: gpd.GeoDataFrame) -> str:
+        for candidate in (
+            "Name",
+            "name",
+            "Profile",
+            "ProfileName",
+            "profile_name",
+            "LineName",
+            "line_name",
+        ):
+            if candidate in profile_lines_gdf.columns:
+                return candidate
+
+        non_geometry_columns = [
+            column
+            for column in profile_lines_gdf.columns
+            if column != profile_lines_gdf.geometry.name
+        ]
+        if len(non_geometry_columns) == 1:
+            return non_geometry_columns[0]
+        raise ValueError(
+            "Could not identify a profile-line name column. Expected one of "
+            "Name, name, Profile, ProfileName, profile_name, LineName, or line_name."
+        )
+
+    @staticmethod
+    def _unique_int_values(values) -> List[int]:
+        result = []
+        seen = set()
+        for value in pd.to_numeric(pd.Series(values), errors="coerce").dropna():
+            int_value = int(value)
+            if int_value not in seen:
+                seen.add(int_value)
+                result.append(int_value)
+        return result
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_mesh_faces_timeseries(
+        hdf_path: Path,
+        mesh_name: str,
+        truncate: bool = True
+    ) -> xr.Dataset:
         """
         Get timeseries output for all face-based variables of a specific mesh.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             mesh_name (str): Name of the mesh.
+            truncate (bool): Whether to truncate leading/trailing zero-only
+                timesteps for each variable. Defaults to True for backward
+                compatibility with the previous behavior.
 
         Returns:
             xr.Dataset: **Multiple variables for ONE mesh**.
                 Use Dataset when extracting MULTIPLE variables for a SINGLE mesh area.
 
                 Data variables:
-                    - face_velocity: Face velocity time series
-                    - face_flow: Face flow time series
-                    (Each variable shares common dimensions)
+                    Any available face-based HDF time-series outputs listed in
+                    MESH_FACE_TIME_SERIES_OUTPUT_VARS, normalized to lowercase
+                    names such as face_velocity, face_flow,
+                    face_water_surface, face_area, and face_mannings_n.
+                    Each variable shares common dimensions.
 
                 Dimensions:
                     - time: Timestamps
@@ -202,17 +1145,27 @@ class HdfResultsMesh:
                 For single variable, use get_mesh_timeseries() → DataArray.
                 For multiple meshes, use get_mesh_cells_timeseries() → Dict[str, Dataset].
         """
-        face_vars = ["Face Velocity", "Face Flow"]
         datasets = []
-        
-        for var in face_vars:
-            try:
-                da = HdfResultsMesh.get_mesh_timeseries(hdf_path, mesh_name, var)
-                # Assign the variable name as the DataArray name
-                da.name = var.lower().replace(' ', '_')
-                datasets.append(da)
-            except Exception as e:
-                logger.warning(f"Failed to process {var} for mesh {mesh_name}: {str(e)}")
+
+        with h5py.File(hdf_path, 'r') as hdf_file:
+            for var in HdfResultsMesh.MESH_FACE_TIME_SERIES_OUTPUT_VARS:
+                path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, var)
+                if path not in hdf_file:
+                    logger.debug(f"Variable '{var}' not found for mesh '{mesh_name}'. Skipping.")
+                    continue
+
+                try:
+                    da = HdfResultsMesh._get_mesh_timeseries_output(
+                        hdf_file,
+                        mesh_name,
+                        var,
+                        truncate=truncate,
+                    )
+                    # Assign the variable name as the DataArray name
+                    da.name = HdfResultsMesh._mesh_data_var_name(var)
+                    datasets.append(da)
+                except Exception as e:
+                    logger.warning(f"Failed to process {var} for mesh {mesh_name}: {str(e)}")
         
         if not datasets:
             logger.error(f"No valid data found for mesh {mesh_name}")
@@ -458,7 +1411,7 @@ class HdfResultsMesh:
             with h5py.File(hdf_path, 'r') as hdf_file:
                 d2_flow_areas = hdf_file.get("Geometry/2D Flow Areas/Attributes")
                 if d2_flow_areas is None:
-                    logger.info("No 2D Flow Areas found in HDF file")
+                    logger.debug("No 2D Flow Areas found in HDF file")
                     return gpd.GeoDataFrame()
 
                 for d2_flow_area in d2_flow_areas[:]:
@@ -605,6 +1558,292 @@ class HdfResultsMesh:
 
     @staticmethod
     @log_call
+    @standardize_input(file_type='plan_hdf')
+    def export_depth_rasters_at_times(
+        hdf_path: Path,
+        timestamps: Union[str, pd.Timestamp, List[Union[str, pd.Timestamp]]],
+        output_dir: Union[str, Path],
+        mesh_name: Optional[str] = None,
+        geom_hdf_path: Optional[Union[str, Path]] = None,
+        resolution: Optional[float] = None,
+        max_dimension: int = 600,
+        method: str = "nearest",
+        nodata: float = -9999.0,
+    ) -> Dict[str, Path]:
+        """
+        Export per-timestep 2D depth rasters from a computed plan HDF.
+
+        The method reads cell-centered HEC-RAS results through the plan HDF.
+        If the Depth dataset is not present, it computes depth as Water
+        Surface minus Cells Minimum Elevation and clips negative values to
+        zero. This is useful when RAS Mapper stored-map export cannot create
+        GeoTIFFs for every requested timestep but the plan HDF contains the
+        needed hydraulic results.
+
+        Args:
+            hdf_path: Plan HDF path.
+            timestamps: One or more simulation timestamps. Strings may use
+                RAS format such as ``10Apr2024 12:00:00``.
+            output_dir: Folder where GeoTIFFs will be written.
+            mesh_name: 2D flow area name. Required when the plan has multiple
+                2D flow areas.
+            geom_hdf_path: Optional geometry HDF path. Defaults to ``hdf_path``
+                because plan HDFs normally contain embedded geometry.
+            resolution: Optional output cell size in the model CRS units. If
+                omitted, a resolution is chosen so the longest raster dimension
+                is approximately ``max_dimension`` pixels.
+            max_dimension: Target maximum raster width/height when
+                ``resolution`` is omitted.
+            method: Rasterization method. ``nearest`` uses a precomputed cell
+                center nearest-neighbor lookup. ``linear`` and ``cubic`` use
+                scipy grid interpolation.
+            nodata: GeoTIFF nodata value.
+
+        Returns:
+            Dict[str, Path]: Mapping from the original timestamp label to the
+            exported GeoTIFF path.
+        """
+        from datetime import datetime
+
+        import rasterio
+        from rasterio.features import geometry_mask
+        from rasterio.transform import from_bounds
+
+        if isinstance(timestamps, (str, pd.Timestamp, datetime)):
+            timestamp_values = [timestamps]
+        else:
+            timestamp_values = list(timestamps)
+        if not timestamp_values:
+            raise ValueError("timestamps must contain at least one value")
+
+        method = method.lower()
+        if method not in {"nearest", "linear", "cubic"}:
+            raise ValueError("method must be one of: nearest, linear, cubic")
+
+        if max_dimension <= 1:
+            raise ValueError("max_dimension must be greater than 1")
+
+        hdf_path = Path(hdf_path)
+        geom_source = Path(geom_hdf_path) if geom_hdf_path is not None else hdf_path
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        def _parse_timestamp(value: Union[str, pd.Timestamp, datetime]) -> pd.Timestamp:
+            if isinstance(value, pd.Timestamp):
+                return value.round("s")
+            if isinstance(value, datetime):
+                return pd.Timestamp(value).round("s")
+
+            text = str(value).strip()
+            formats = [
+                "%d%b%Y %H:%M:%S",
+                "%d%b%Y %H:%M:%S:%f",
+                "%d%b%Y %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+            ]
+            for fmt in formats:
+                try:
+                    return pd.Timestamp(datetime.strptime(text.upper(), fmt)).round("s")
+                except ValueError:
+                    continue
+            return pd.Timestamp(text).round("s")
+
+        def _safe_timestamp_label(value: object, parsed: pd.Timestamp) -> str:
+            if isinstance(value, str):
+                label = value
+            else:
+                label = parsed.strftime("%d%b%Y %H:%M:%S")
+            return (
+                label.replace(":", " ")
+                .replace("/", "_")
+                .replace("\\", "_")
+                .replace(".", "_")
+            )
+
+        mesh_names = HdfMesh.get_mesh_area_names(geom_source)
+        if mesh_name is None:
+            if len(mesh_names) != 1:
+                raise ValueError(
+                    "mesh_name is required when the HDF contains "
+                    f"{len(mesh_names)} 2D flow areas: {mesh_names}"
+                )
+            mesh_name = mesh_names[0]
+        elif mesh_name not in mesh_names:
+            raise ValueError(f"Mesh '{mesh_name}' not found. Available meshes: {mesh_names}")
+
+        cell_points = HdfMesh.get_mesh_cell_points(geom_source)
+        if cell_points.empty:
+            raise ValueError(f"No 2D mesh cell centers found in {geom_source}")
+        cell_points = cell_points[cell_points["mesh_name"] == mesh_name].copy()
+        if cell_points.empty:
+            raise ValueError(f"No 2D mesh cell centers found for mesh '{mesh_name}'")
+
+        x = cell_points.geometry.x.to_numpy(dtype=float)
+        y = cell_points.geometry.y.to_numpy(dtype=float)
+        x_min, y_min, x_max, y_max = cell_points.total_bounds
+        if resolution is None:
+            longest_side = max(float(x_max - x_min), float(y_max - y_min))
+            resolution = longest_side / float(max_dimension)
+        if resolution <= 0:
+            raise ValueError("resolution must be positive")
+
+        cols = max(2, int(np.ceil((x_max - x_min) / resolution)))
+        rows = max(2, int(np.ceil((y_max - y_min) / resolution)))
+        transform = from_bounds(x_min, y_min, x_max, y_max, cols, rows)
+
+        x_res = (x_max - x_min) / cols
+        y_res = (y_max - y_min) / rows
+        grid_x = np.linspace(x_min + x_res / 2.0, x_max - x_res / 2.0, cols)
+        grid_y = np.linspace(y_max - y_res / 2.0, y_min + y_res / 2.0, rows)
+        gx, gy = np.meshgrid(grid_x, grid_y)
+        grid_points = np.column_stack([gx.ravel(), gy.ravel()])
+
+        if method == "nearest":
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(np.column_stack([x, y]))
+            _, nearest_indices = tree.query(grid_points)
+        else:
+            from scipy.interpolate import griddata as scipy_griddata
+
+            nearest_indices = None
+
+        mesh_areas = HdfMesh.get_mesh_areas(geom_source)
+        mesh_areas = mesh_areas[mesh_areas["mesh_name"] == mesh_name] if not mesh_areas.empty else mesh_areas
+        if mesh_areas.empty:
+            mesh_mask = np.ones((rows, cols), dtype=bool)
+        else:
+            mesh_mask = geometry_mask(
+                list(mesh_areas.geometry),
+                out_shape=(rows, cols),
+                transform=transform,
+                invert=True,
+            )
+
+        target_times = [_parse_timestamp(value) for value in timestamp_values]
+        output_paths: Dict[str, Path] = {}
+
+        time_stamp_path = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/"
+            "Unsteady Time Series/Time Date Stamp (ms)"
+        )
+        time_path = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/"
+            "Unsteady Time Series/Time"
+        )
+        depth_path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, "Depth")
+        wse_path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, "Water Surface")
+        min_elev_path = f"Geometry/2D Flow Areas/{mesh_name}/Cells Minimum Elevation"
+
+        with h5py.File(hdf_path, "r") as result_hdf, h5py.File(geom_source, "r") as geom_hdf:
+            if time_stamp_path in result_hdf:
+                raw_times = result_hdf[time_stamp_path][()]
+                hdf_times = pd.DatetimeIndex(
+                    [_parse_timestamp(value.decode("utf-8")) for value in raw_times]
+                ).round("s")
+            elif time_path in result_hdf:
+                start_time = HdfBase.get_simulation_start_time(result_hdf)
+                hdf_times = HdfUtils.convert_timesteps_to_datetimes(
+                    np.asarray(result_hdf[time_path][()]),
+                    start_time,
+                    round_to="s",
+                )
+            else:
+                raise ValueError(f"No unsteady timestep dataset found in {hdf_path}")
+
+            if depth_path not in result_hdf and wse_path not in result_hdf:
+                raise ValueError(
+                    f"Neither Depth nor Water Surface time series exists for mesh '{mesh_name}'"
+                )
+            if depth_path not in result_hdf and min_elev_path not in geom_hdf:
+                raise ValueError(
+                    f"Depth is absent and Cells Minimum Elevation is missing from {geom_source}"
+                )
+
+            min_elev = (
+                np.asarray(geom_hdf[min_elev_path][()], dtype=np.float32)
+                if depth_path not in result_hdf
+                else None
+            )
+
+            for original_value, target_time in zip(timestamp_values, target_times):
+                exact_matches = np.flatnonzero(hdf_times == target_time)
+                if len(exact_matches):
+                    time_index = int(exact_matches[0])
+                else:
+                    deltas = np.abs(hdf_times - target_time)
+                    nearest_position = int(np.argmin(deltas))
+                    if deltas[nearest_position] > pd.Timedelta(seconds=30):
+                        raise ValueError(
+                            f"Timestamp {target_time} not found in {hdf_path}; "
+                            f"nearest is {hdf_times[nearest_position]}"
+                        )
+                    time_index = nearest_position
+
+                if depth_path in result_hdf:
+                    values = np.asarray(result_hdf[depth_path][time_index], dtype=np.float32)
+                else:
+                    wse = np.asarray(result_hdf[wse_path][time_index], dtype=np.float32)
+                    values = np.maximum(wse - min_elev, 0.0).astype(np.float32)
+                values = np.where(np.isfinite(values), values, 0.0).astype(np.float32)
+
+                if len(values) != len(cell_points):
+                    raise ValueError(
+                        f"Depth value count ({len(values)}) does not match cell count "
+                        f"({len(cell_points)}) for mesh '{mesh_name}'"
+                    )
+
+                if method == "nearest":
+                    grid_values = values[nearest_indices].reshape(rows, cols)
+                else:
+                    grid_values = scipy_griddata(
+                        points=np.column_stack([x, y]),
+                        values=values.astype(np.float64),
+                        xi=(gx, gy),
+                        method=method,
+                        fill_value=nodata,
+                    ).astype(np.float32)
+                    grid_values = np.where(np.isnan(grid_values), nodata, grid_values)
+
+                grid_values = np.where(mesh_mask, grid_values, nodata).astype(np.float32)
+                safe_label = _safe_timestamp_label(original_value, target_time)
+                raster_path = output_dir / f"Depth ({safe_label}).hdf.tif"
+
+                with rasterio.open(
+                    raster_path,
+                    "w",
+                    driver="GTiff",
+                    height=rows,
+                    width=cols,
+                    count=1,
+                    dtype=np.float32,
+                    crs=cell_points.crs,
+                    transform=transform,
+                    nodata=nodata,
+                    compress="lzw",
+                    BIGTIFF="IF_SAFER",
+                ) as dst:
+                    dst.write(grid_values, 1)
+                    dst.update_tags(
+                        mesh_name=mesh_name,
+                        timestamp=target_time.strftime("%d%b%Y %H:%M:%S"),
+                        source="HEC-RAS plan HDF",
+                        units="ft",
+                    )
+
+                output_paths[str(original_value)] = raster_path
+
+        logger.info(
+            "Wrote %s depth raster(s) for mesh '%s' to %s",
+            len(output_paths),
+            mesh_name,
+            output_dir,
+        )
+        return output_paths
+
+    @staticmethod
+    @log_call
     def get_flood_extent_polygon(
         plan_number: str,
         profile: str = "Max",
@@ -640,7 +1879,7 @@ class HdfResultsMesh:
         Example:
             >>> from ras_commander import init_ras_project
             >>> from ras_commander.hdf import HdfResultsMesh
-            >>> init_ras_project("/path/to/project", "6.6")
+            >>> init_ras_project("/path/to/project", "7.0")
             >>> flood_gdf = HdfResultsMesh.get_flood_extent_polygon("01")
         """
         from ..RasProcess import RasProcess
@@ -720,20 +1959,8 @@ class HdfResultsMesh:
             ValueError: If there's an error processing the timeseries output data.
         """
         TIME_SERIES_OUTPUT_VARS = {
-            "cell": [
-                "Water Surface", "Depth", "Velocity", "Velocity X", "Velocity Y",
-                "Froude Number", "Courant Number", "Shear Stress", "Bed Elevation",
-                "Precipitation Rate", "Infiltration Rate", "Evaporation Rate",
-                "Percolation Rate", "Groundwater Elevation", "Groundwater Depth",
-                "Groundwater Flow", "Groundwater Velocity", "Groundwater Velocity X",
-                "Groundwater Velocity Y"
-            ],
-            "face": [
-                "Face Velocity", "Face Flow", "Face Water Surface", "Face Courant",
-                "Face Cumulative Volume", "Face Eddy Viscosity", "Face Flow Period Average",
-                "Face Friction Term", "Face Pressure Gradient Term", "Face Shear Stress",
-                "Face Tangential Velocity"
-            ]
+            "cell": HdfResultsMesh.MESH_CELL_TIME_SERIES_OUTPUT_VARS,
+            "face": HdfResultsMesh.MESH_FACE_TIME_SERIES_OUTPUT_VARS
         }
 
         try:
@@ -758,12 +1985,23 @@ class HdfResultsMesh:
                         path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, variable)
                         dataset = hdf_path[path]
                         values = dataset[:]
-                        units = dataset.attrs.get("Units", "").decode("utf-8")
+                        units = HdfResultsMesh._decode_hdf_attr(
+                            dataset.attrs.get("Units", "")
+                        )
 
                         if truncate:
-                            last_nonzero = np.max(np.nonzero(values)[1]) + 1 if values.size > 0 else 0
-                            values = values[:, :last_nonzero]
-                            truncated_time_stamps = time_stamps[:last_nonzero]
+                            if values.ndim == 2:
+                                non_zero_time = np.where(np.any(values != 0, axis=1))[0]
+                            else:
+                                non_zero_time = np.nonzero(values)[0]
+
+                            if len(non_zero_time) > 0:
+                                start, end = non_zero_time[0], non_zero_time[-1] + 1
+                                values = values[start:end]
+                                truncated_time_stamps = time_stamps[start:end]
+                            else:
+                                values = values[:0]
+                                truncated_time_stamps = time_stamps[:0]
                         else:
                             truncated_time_stamps = time_stamps
 
@@ -772,7 +2010,7 @@ class HdfResultsMesh:
                             continue
 
                         # Determine if this is a face-based or cell-based variable
-                        id_dim = "face_id" if any(face_var in variable for face_var in TIME_SERIES_OUTPUT_VARS["face"]) else "cell_id"
+                        id_dim = "face_id" if variable in TIME_SERIES_OUTPUT_VARS["face"] else "cell_id"
 
                         data_vars[variable] = xr.DataArray(
                             data=values,
@@ -836,7 +2074,9 @@ class HdfResultsMesh:
 
             dataset = hdf_path[path]
             values = dataset[:]
-            units = dataset.attrs.get("Units", "").decode("utf-8")
+            units = HdfResultsMesh._decode_hdf_attr(
+                dataset.attrs.get("Units", "")
+            )
             
             # Get start time and timesteps
             start_time = HdfBase.get_simulation_start_time(hdf_path)
@@ -887,10 +2127,32 @@ class HdfResultsMesh:
         path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, var)
         group = hdf_path[path]
         values = group[:]
-        units = group.attrs.get("Units")
-        if units is not None:
-            units = units.decode("utf-8")
+        units = HdfResultsMesh._decode_hdf_attr(group.attrs.get("Units"))
         return values, units
+
+    @staticmethod
+    def _decode_hdf_attr(value: object) -> str:
+        """Decode optional HDF string attributes to plain strings."""
+        if value is None:
+            return ""
+        if isinstance(value, (bytes, np.bytes_)):
+            return value.decode("utf-8")
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return ""
+            return HdfResultsMesh._decode_hdf_attr(value.flat[0])
+        return str(value)
+
+    @staticmethod
+    def _mesh_data_var_name(variable: str) -> str:
+        """Normalize HDF output variable names for xarray Dataset keys."""
+        return (
+            variable.lower()
+            .replace("'", "")
+            .replace("/", "_")
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
 
 
     @staticmethod
@@ -933,21 +2195,21 @@ class HdfResultsMesh:
             dfs = []
             start_time = HdfBase.get_simulation_start_time(hdf_file)
             
-            logger.info(f"Processing summary output for variable: {var}")
+            logger.debug(f"Processing summary output for variable: {var}")
             d2_flow_areas = hdf_file.get("Geometry/2D Flow Areas/Attributes")
             if d2_flow_areas is None:
-                logger.info("No 2D Flow Areas found in HDF file")
+                logger.debug("No 2D Flow Areas found in HDF file")
                 return gpd.GeoDataFrame()
 
             for d2_flow_area in d2_flow_areas[:]:
                 mesh_name = HdfUtils.convert_ras_string(d2_flow_area[0])
                 cell_count = d2_flow_area[-1]
                 logger.debug(f"Processing mesh: {mesh_name} with {cell_count} cells")
-                
+
                 try:
                     group = HdfResultsMesh.get_mesh_summary_output_group(hdf_file, mesh_name, var)
                 except ValueError:
-                    logger.info(f"Variable '{var}' not present in output file for mesh '{mesh_name}', skipping")
+                    logger.debug(f"Variable '{var}' not present in output file for mesh '{mesh_name}', skipping")
                     continue
                 
                 data = group[:]

@@ -38,6 +38,8 @@ List of Functions in RasCmdr:
 import os
 import subprocess
 import shutil
+import shlex
+from collections import defaultdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .RasPrj import ras, RasPrj, init_ras_project, get_ras_exe
@@ -48,7 +50,7 @@ import logging
 import time
 import queue
 from threading import Thread, Lock
-from typing import Union, List, Optional, Dict
+from typing import Union, List, Optional, Dict, Any
 from pathlib import Path
 import shutil
 import logging
@@ -59,7 +61,7 @@ from ras_commander.RasPrj import RasPrj  # Ensure RasPrj is imported
 from threading import Lock, Thread, current_thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import cycle
-from typing import Union, List, Optional, Dict
+from typing import Union, List, Optional, Dict, Any
 from numbers import Number
 from .LoggingConfig import get_logger
 from .Decorators import log_call
@@ -98,13 +100,107 @@ class RasCmdr:
         Returns:
             Path to the expected HDF file
         """
-        # Normalize plan number to 2-digit string
-        if isinstance(plan_number, Number):
-            plan_num_str = f"{int(plan_number):02d}"
-        else:
-            plan_num_str = str(plan_number).zfill(2)
+        plan_num_str = RasUtils.normalize_ras_number(plan_number)
 
         return Path(ras_object.project_folder) / f"{ras_object.project_name}.p{plan_num_str}.hdf"
+
+    @staticmethod
+    def _plan_entries_with_expected_hdf_paths(
+        plan_entries: Optional[pd.DataFrame],
+        project_folder: Union[str, Path],
+        project_name: str,
+        plan_numbers: List[Union[str, Number]],
+    ) -> pd.DataFrame:
+        """
+        Return plan metadata with expected HDF paths without rereading the .prj.
+        """
+        normalized_plan_numbers = [
+            RasUtils.normalize_ras_number(plan_number)
+            for plan_number in plan_numbers
+        ]
+        project_folder = Path(project_folder)
+
+        if plan_entries is None or plan_entries.empty:
+            cached_plan_entries = pd.DataFrame(
+                {"plan_number": normalized_plan_numbers}
+            )
+        else:
+            cached_plan_entries = plan_entries.copy()
+
+        if "plan_number" not in cached_plan_entries.columns:
+            cached_plan_entries["plan_number"] = normalized_plan_numbers[:len(
+                cached_plan_entries
+            )]
+
+        cached_plan_entries["plan_number"] = cached_plan_entries[
+            "plan_number"
+        ].map(RasUtils.normalize_ras_number)
+
+        for column_name in ("HDF_Results_Path", "full_path"):
+            if column_name not in cached_plan_entries.columns:
+                cached_plan_entries[column_name] = None
+
+        missing_plan_numbers = [
+            plan_number
+            for plan_number in normalized_plan_numbers
+            if plan_number not in set(cached_plan_entries["plan_number"])
+        ]
+        if missing_plan_numbers:
+            cached_plan_entries = pd.concat(
+                [
+                    cached_plan_entries,
+                    pd.DataFrame(
+                        {"plan_number": missing_plan_numbers}
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+        for plan_number in normalized_plan_numbers:
+            plan_mask = cached_plan_entries["plan_number"] == plan_number
+            expected_plan_path = project_folder / f"{project_name}.p{plan_number}"
+            expected_hdf_path = Path(f"{expected_plan_path}.hdf")
+            cached_plan_entries.loc[
+                plan_mask, "full_path"
+            ] = str(expected_plan_path)
+            cached_plan_entries.loc[
+                plan_mask, "HDF_Results_Path"
+            ] = str(expected_hdf_path)
+
+        return cached_plan_entries
+
+    @staticmethod
+    def _update_results_from_cached_plan_entries(
+        ras_object: 'RasPrj',
+        plan_numbers: List[Union[str, Number]],
+        project_folder: Union[str, Path, None] = None,
+        project_name: Optional[str] = None,
+        plan_entries: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """
+        Update results_df using cached plan metadata when the .prj is unavailable.
+        """
+        normalized_plan_numbers = [
+            RasUtils.normalize_ras_number(plan_number)
+            for plan_number in plan_numbers
+        ]
+        project_folder = Path(project_folder or ras_object.project_folder)
+        project_name = project_name or ras_object.project_name
+        cached_plan_entries = (
+            plan_entries
+            if plan_entries is not None
+            else getattr(ras_object, "plan_df", None)
+        )
+
+        ras_object.plan_df = RasCmdr._plan_entries_with_expected_hdf_paths(
+            cached_plan_entries,
+            project_folder,
+            project_name,
+            normalized_plan_numbers,
+        )
+        return ras_object.update_results_df(
+            plan_numbers=normalized_plan_numbers
+        )
 
     @staticmethod
     def _normalize_requested_plan_numbers(
@@ -134,7 +230,7 @@ class RasCmdr:
         """
         Filter plan entries using normalized two-digit plan numbers.
         """
-        if not plan_number:
+        if plan_number is None:
             return plan_entries
 
         requested_plan_numbers = RasCmdr._normalize_requested_plan_numbers(
@@ -163,14 +259,110 @@ class RasCmdr:
         return filtered_plan_entries
 
     @staticmethod
-    def _verify_completion(hdf_path: Path, check_errors: bool = False) -> bool:
+    def _get_plan_geometry_number(
+        plan_entries: pd.DataFrame,
+        plan_number: Union[str, Number]
+    ) -> Optional[str]:
+        """
+        Resolve the geometry number associated with a plan entry.
+        """
+        normalized_plan_number = RasUtils.normalize_ras_number(plan_number)
+        matching_rows = plan_entries[
+            plan_entries["plan_number"] == normalized_plan_number
+        ]
+        if matching_rows.empty:
+            return None
+
+        plan_row = matching_rows.iloc[0]
+        for column_name in ("geometry_number", "Geom File"):
+            value = plan_row.get(column_name)
+            if pd.isna(value):
+                continue
+
+            digits = "".join(ch for ch in str(value) if ch.isdigit())
+            if digits:
+                return digits.zfill(2)
+
+        return None
+
+    @staticmethod
+    def _get_worker_plan_artifacts(
+        worker_folder: Path,
+        project_name: str,
+        plan_number: str,
+        geometry_number: Optional[str] = None
+    ) -> List[Path]:
+        """
+        Collect plan-owned worker artifacts that are safe to consolidate.
+        """
+        artifact_patterns = [
+            f"{project_name}.p{plan_number}",
+            f"{project_name}.p{plan_number}.*",
+            f"{project_name}.bco{plan_number}",
+            f"{project_name}.O{plan_number}",
+            f"{project_name}.c{plan_number}",
+        ]
+        if geometry_number:
+            artifact_patterns.append(f"{project_name}.g{geometry_number}.hdf")
+
+        artifact_paths = {}
+        for pattern in artifact_patterns:
+            for artifact_path in worker_folder.glob(pattern):
+                if artifact_path.is_file():
+                    artifact_paths[artifact_path.name] = artifact_path
+
+        return [artifact_paths[name] for name in sorted(artifact_paths)]
+
+    @staticmethod
+    def _copy_worker_artifact(source_path: Path, dest_path: Path) -> bool:
+        """
+        Copy a worker artifact unless the destination is already newer.
+        """
+        if not source_path.exists() or not source_path.is_file():
+            return False
+
+        if dest_path.exists():
+            source_stat = source_path.stat()
+            dest_stat = dest_path.stat()
+
+            if dest_stat.st_mtime > source_stat.st_mtime:
+                logger.debug(
+                    "Skipping older worker artifact %s because destination %s is newer",
+                    source_path,
+                    dest_path,
+                )
+                return False
+
+            if (
+                dest_stat.st_mtime == source_stat.st_mtime
+                and dest_stat.st_size == source_stat.st_size
+            ):
+                logger.debug(
+                    "Skipping unchanged worker artifact %s",
+                    source_path,
+                )
+                return False
+
+            dest_path.unlink()
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, dest_path)
+        return True
+
+    @staticmethod
+    def _verify_completion(hdf_path: Path, check_errors: bool = True) -> bool:
         """
         Verify that a HEC-RAS computation completed successfully (HDF-only).
+
+        Checks three conditions:
+        1. 'Complete Process' present in compute messages
+        2. '/Plan Data/Plan Information' HDF group exists (structural integrity)
+        3. No error patterns in compute messages (when check_errors=True)
 
         Args:
             hdf_path: Path to plan HDF file
             check_errors: If True, also fail verification if errors detected
-                         in compute messages (default: False for backward compatibility)
+                         in compute messages (default: True)
 
         Returns:
             bool: True if verification passed
@@ -180,25 +372,30 @@ class RasCmdr:
             return False
 
         try:
-            # Late import to avoid circular dependency
+            import h5py
             from .hdf.HdfResultsPlan import HdfResultsPlan
 
             compute_msgs = HdfResultsPlan.get_compute_messages_hdf_only(hdf_path)
 
-            if compute_msgs and 'Complete Process' in compute_msgs:
-                # Optionally check for errors
-                if check_errors:
-                    from .results.ResultsParser import ResultsParser
-                    parsed = ResultsParser.parse_compute_messages(compute_msgs)
-                    if parsed['has_errors']:
-                        logger.debug(f"Verification failed: {parsed['error_count']} errors found in {hdf_path.name}")
-                        return False
-
-                logger.debug(f"Verification passed: 'Complete Process' found in {hdf_path.name}")
-                return True
-            else:
+            if not compute_msgs or 'Complete Process' not in compute_msgs:
                 logger.debug(f"Verification failed: 'Complete Process' not found in {hdf_path.name}")
                 return False
+
+            # Structural check: /Plan Data/Plan Information must exist
+            with h5py.File(str(hdf_path), 'r') as hdf:
+                if hdf.get('Plan Data/Plan Information') is None:
+                    logger.warning(f"Verification failed: '/Plan Data/Plan Information' missing in {hdf_path.name} (partial HDF)")
+                    return False
+
+            if check_errors:
+                from .results.ResultsParser import ResultsParser
+                parsed = ResultsParser.parse_compute_messages(compute_msgs)
+                if parsed['has_errors']:
+                    logger.warning(f"Verification failed: {parsed['error_count']} errors found in {hdf_path.name}")
+                    return False
+
+            logger.debug(f"Verification passed for {hdf_path.name}")
+            return True
         except Exception as e:
             logger.warning(f"Error verifying completion for {hdf_path}: {e}")
             return False
@@ -216,7 +413,14 @@ class RasCmdr:
         overwrite_dest=False,
         skip_existing: bool = False,
         verify: bool = False,
-        stream_callback: Optional[Callable] = None
+        stream_callback: Optional[Callable] = None,
+        use_optimal_hdf_settings: bool = False,
+        hdf_settings_profile: str = "balanced",
+        hdf_additional_variables: Optional[List[str]] = None,
+        hdf_output_variables: Optional[List[str]] = None,
+        hdf_output_options: Optional[Dict[str, Any]] = None,
+        hdf_output_profile: Optional[str] = None,
+        dialog_watchdog: bool = True,
     ) -> 'ComputeResult':
         """
         Execute a single HEC-RAS plan in a specified location.
@@ -261,6 +465,20 @@ class RasCmdr:
                 - on_verify_result(plan_number, verified): Called after verification (if verify=True)
                 IMPORTANT: Must be thread-safe when used with compute_parallel().
                 See ras_commander.callbacks for example implementations.
+            use_optimal_hdf_settings (bool, optional): If True, apply ras-commander's
+                recommended HDF write settings to the plan before currency checks and execution.
+                Defaults to False.
+            hdf_settings_profile (str, optional): HDF settings profile to apply when
+                use_optimal_hdf_settings=True. Options are "balanced", "speed", "size",
+                and "nas". Defaults to "balanced".
+            hdf_additional_variables (List[str], optional): Additional HDF output variables
+                to enable when use_optimal_hdf_settings=True.
+            hdf_output_variables (List[str], optional): Additional HDF output variables
+                to enable before execution.
+            hdf_output_options (Dict[str, Any], optional): Explicit HDF output options
+                passed to ``RasPlan.set_hdf_output_options()`` before execution.
+            hdf_output_profile (str, optional): Named HDF output profile to apply before
+                execution. Equivalent to ``use_optimal_hdf_settings=True`` with a profile.
 
         Returns:
             ComputeResult: Result object with ``success`` bool and ``results_df_row`` (pd.Series or None).
@@ -299,6 +517,9 @@ class RasCmdr:
             callback = ConsoleCallback()
             RasCmdr.compute_plan("01", stream_callback=callback)
 
+            # Run with recommended HDF write parameters
+            RasCmdr.compute_plan("01", use_optimal_hdf_settings=True)
+
             # Run a plan in a specific folder with multiple options
             RasCmdr.compute_plan(
                 "01",
@@ -323,6 +544,7 @@ class RasCmdr:
         _results_df_row = None
         _ras_obj = None
         _did_execute = False  # Track if we actually ran HEC-RAS (vs skip/early exit)
+        _watchdog = None
         try:
             ras_obj = ras_object if ras_object is not None else ras
             _ras_obj = ras_obj
@@ -360,10 +582,47 @@ class RasCmdr:
                 _success = False
                 return ComputeResult(success=False, results_df_row=None)
 
+            if use_optimal_hdf_settings or hdf_output_profile:
+                profile_to_apply = hdf_output_profile or hdf_settings_profile
+                variables_to_apply = hdf_additional_variables or hdf_output_variables
+                hdf_settings_success = RasPlan.use_optimal_hdf_settings(
+                    compute_plan_path,
+                    profile=profile_to_apply,
+                    additional_variables=variables_to_apply,
+                    ras_object=compute_ras
+                )
+                if hdf_settings_success:
+                    logger.info(
+                        f"Applied '{profile_to_apply}' HDF settings profile "
+                        f"to plan: {compute_plan_path.name}"
+                    )
+                else:
+                    logger.warning(
+                        f"Could not apply '{profile_to_apply}' HDF settings profile "
+                        f"to plan: {compute_plan_path.name}"
+                    )
+
+            if hdf_output_options:
+                hdf_options_success = RasPlan.set_hdf_output_options(
+                    compute_plan_path,
+                    ras_object=compute_ras,
+                    **hdf_output_options
+                )
+                if not hdf_options_success:
+                    logger.warning(f"Could not apply explicit HDF output options to {compute_plan_path.name}")
+
+            if hdf_output_variables and not (use_optimal_hdf_settings or hdf_output_profile):
+                RasPlan.set_hdf_output_variables(
+                    compute_plan_path,
+                    hdf_output_variables,
+                    enabled=True,
+                    ras_object=compute_ras
+                )
+
             # Skip existing check - runs regardless of force_rerun (for resume capability)
             if skip_existing:
                 hdf_path = RasCmdr._get_hdf_path(plan_number, compute_ras)
-                if RasCmdr._verify_completion(hdf_path):
+                if RasCmdr._verify_completion(hdf_path, check_errors=False):
                     logger.info(f"Skipping plan {plan_number}: HDF results already exist with 'Complete Process'")
                     _success = True
                     return ComputeResult(success=True, results_df_row=None)
@@ -391,7 +650,7 @@ class RasCmdr:
                 # Create monitor with callback wrapper
                 bco_monitor = BcoMonitor(
                     project_path=Path(compute_ras.project_folder),
-                    plan_number=str(plan_number).zfill(2) if isinstance(plan_number, (int, Number)) else str(plan_number),
+                    plan_number=RasUtils.normalize_ras_number(plan_number),
                     project_name=compute_ras.project_name,
                     message_callback=lambda msg: (
                         stream_callback.on_exec_message(str(plan_number), msg)
@@ -439,6 +698,21 @@ class RasCmdr:
             logger.info("Running HEC-RAS from the Command Line:")
             logger.info(f"Running command: {cmd}")
 
+            # Per-plan stdio log. HEC-RAS stdout/stderr are redirected to this file
+            # rather than a PIPE to avoid an inherited-pipe deadlock (CLB-880): with
+            # shell=True the pipe's write handle is inherited by the whole
+            # cmd.exe -> Ras.exe -> RasUnsteady.exe tree, and the parent blocks on
+            # pipe EOF until EVERY descendant closes it. If a solver grandchild
+            # lingers past compute completion (intermittent, and far more likely
+            # under CPU contention) the read end never reaches EOF and the call
+            # hangs forever. HEC-RAS emits no compute messages to stdio -- they go
+            # to .bco##/.computeMsgs.txt, which the library already parses -- so a
+            # file loses no diagnostics while removing the EOF dependency entirely.
+            _run_log_path = (
+                Path(compute_ras.project_folder)
+                / f"_compute_p{RasUtils.normalize_ras_number(plan_number)}.log"
+            )
+
             # Callback: execution start
             if stream_callback and hasattr(stream_callback, 'on_exec_start'):
                 stream_callback.on_exec_start(str(plan_number), cmd)
@@ -447,31 +721,56 @@ class RasCmdr:
             _did_execute = True
             start_time = time.time()
             try:
+                if dialog_watchdog:
+                    from .RasDialogWatchdog import DialogWatchdog
+                    _watchdog = DialogWatchdog()
+                    _watchdog.start()
+
                 # Choose execution method based on whether callback is provided
                 if stream_callback and bco_monitor:
-                    # Use Popen for real-time monitoring
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        cwd=str(compute_ras.project_folder),
-                        shell=True
-                    )
+                    # Use Popen for real-time monitoring. Redirect stdio to the
+                    # per-plan log file (not PIPE) to avoid the inherited-pipe
+                    # deadlock (CLB-880). monitor_until_signal() polls the .bco
+                    # file and process.poll(); it never reads process.stdout, so
+                    # nothing here depends on a pipe.
+                    with open(_run_log_path, "w", encoding="utf-8", errors="ignore") as _run_log_fh:
+                        process = subprocess.Popen(
+                            cmd,
+                            stdout=_run_log_fh,
+                            stderr=subprocess.STDOUT,
+                            cwd=str(compute_ras.project_folder),
+                            shell=True
+                        )
+                        if _watchdog:
+                            _watchdog.add_pid(process.pid)
 
-                    # Monitor .bco file until process completes
-                    # (BcoMonitor will call on_exec_message callback as messages appear)
-                    bco_monitor.monitor_until_signal(process)
+                        # Monitor .bco file until process completes
+                        # (BcoMonitor will call on_exec_message callback as messages appear)
+                        bco_monitor.monitor_until_signal(process)
 
-                    # Wait for process to complete
-                    return_code = process.wait()
+                        # Wait for process to complete
+                        return_code = process.wait()
 
                     # Check if subprocess succeeded
                     if return_code != 0:
                         raise subprocess.CalledProcessError(return_code, cmd)
 
                 else:
-                    # Original behavior when no callback
-                    subprocess.run(cmd, check=True, shell=True, capture_output=True, text=True)
+                    # Original behavior when no callback. Redirect stdio to the
+                    # per-plan log file instead of capture_output/PIPE: with
+                    # shell=True the PIPE write handle is inherited by the
+                    # cmd.exe -> Ras.exe -> RasUnsteady.exe tree, and
+                    # subprocess.run() blocks on pipe EOF until every grandchild
+                    # exits -- the intermittent CLB-880 hang. A file handle has no
+                    # EOF wait, so run() returns as soon as the process exits.
+                    with open(_run_log_path, "w", encoding="utf-8", errors="ignore") as _run_log_fh:
+                        subprocess.run(
+                            cmd,
+                            check=True,
+                            shell=True,
+                            stdout=_run_log_fh,
+                            stderr=subprocess.STDOUT,
+                        )
 
                 end_time = time.time()
                 run_time = end_time - start_time
@@ -506,9 +805,43 @@ class RasCmdr:
             except subprocess.CalledProcessError as e:
                 end_time = time.time()
                 run_time = end_time - start_time
-                logger.error(f"Error running plan: {plan_number}")
-                logger.error(f"Error message: {e.output}")
+                logger.error(f"Error running plan: {plan_number} (exit code {e.returncode})")
                 logger.info(f"Total run time for plan {plan_number}: {run_time:.2f} seconds")
+
+                # stdout/stderr were redirected to a file (no PIPE), so e.output is
+                # None; surface the tail of the run log for context. The substantive
+                # compute messages are read from the .bco/.computeMsgs files below.
+                try:
+                    if _run_log_path.exists():
+                        _log_text = _run_log_path.read_text(encoding="utf-8", errors="ignore").strip()
+                        if _log_text:
+                            logger.error(f"HEC-RAS console output ({_run_log_path.name}):\n{_log_text[-2000:]}")
+                except Exception as _log_err:
+                    logger.debug(f"Could not read run log {_run_log_path}: {_log_err}")
+
+                # Read compute message files (.bco## for 5.x, .computeMsgs.txt/.comp_msgs.txt for 6.x+)
+                plan_num_str = RasUtils.normalize_ras_number(plan_number)
+                try:
+                    bco_path = Path(compute_ras.project_folder) / f"{compute_ras.project_name}.bco{plan_num_str}"
+                    if bco_path.exists():
+                        bco_content = bco_path.read_text(encoding='utf-8', errors='ignore')
+                        if bco_content.strip():
+                            logger.error(f"Compute messages from {bco_path.name}:\n{bco_content}")
+                        else:
+                            logger.debug(f"BCO file {bco_path.name} exists but is empty")
+                except Exception as bco_err:
+                    logger.debug(f"Could not read .bco file: {bco_err}")
+
+                try:
+                    for suffix in [f".p{plan_num_str}.computeMsgs.txt", f".p{plan_num_str}.comp_msgs.txt"]:
+                        msg_path = Path(compute_ras.project_folder) / f"{compute_ras.project_name}{suffix}"
+                        if msg_path.exists():
+                            msg_content = msg_path.read_text(encoding='utf-8', errors='ignore')
+                            if msg_content.strip():
+                                logger.error(f"Compute messages from {msg_path.name}:\n{msg_content}")
+                            break
+                except Exception as msg_err:
+                    logger.debug(f"Could not read compute messages file: {msg_err}")
 
                 # Callback: execution complete (failure case)
                 if stream_callback and hasattr(stream_callback, 'on_exec_complete'):
@@ -519,6 +852,9 @@ class RasCmdr:
             logger.critical(f"Error in compute_plan: {str(e)}")
             _success = False
         finally:
+            if _watchdog:
+                _watchdog.stop()
+
             # Update the RAS object's dataframes ONLY if executing in original folder
             # When dest_folder is used, the original project is unchanged
             if _ras_obj and dest_folder is None:
@@ -528,10 +864,15 @@ class RasCmdr:
                     _ras_obj.flow_df = _ras_obj.get_flow_entries()
                     _ras_obj.unsteady_df = _ras_obj.get_unsteady_entries()
                     if _did_execute:
-                        _ras_obj.update_results_df(plan_numbers=[plan_number])
+                        normalized_plan_number = RasUtils.normalize_ras_number(
+                            plan_number
+                        )
+                        _ras_obj.update_results_df(
+                            plan_numbers=[normalized_plan_number]
+                        )
                         # Capture results_df row for the executed plan
                         try:
-                            plan_num_str = str(plan_number).zfill(2)
+                            plan_num_str = normalized_plan_number
                             mask = _ras_obj.results_df['plan_number'] == plan_num_str
                             if mask.any():
                                 _results_df_row = _ras_obj.results_df[mask].iloc[0].copy()
@@ -539,6 +880,30 @@ class RasCmdr:
                             logger.debug(f"Could not extract results_df_row: {e}")
                 except Exception as e_refresh:
                     logger.warning(f"Error refreshing DataFrames after compute_plan: {e_refresh}")
+                    if _did_execute:
+                        try:
+                            normalized_plan_number = RasUtils.normalize_ras_number(
+                                plan_number
+                            )
+                            RasCmdr._update_results_from_cached_plan_entries(
+                                _ras_obj,
+                                [normalized_plan_number],
+                            )
+                            mask = (
+                                _ras_obj.results_df["plan_number"]
+                                == normalized_plan_number
+                            )
+                            if mask.any():
+                                _results_df_row = (
+                                    _ras_obj.results_df[mask].iloc[0].copy()
+                                )
+                        except Exception as e_results:
+                            logger.warning(
+                                "Could not summarize plan %s after refresh "
+                                "failure: %s",
+                                plan_number,
+                                e_results,
+                            )
 
         return ComputeResult(success=_success, results_df_row=_results_df_row)
 
@@ -663,6 +1028,9 @@ class RasCmdr:
 
             - verify is passed through to compute_plan() for each worker execution.
         """
+        execution_results: Dict[str, bool] = {}
+        filtered_plan_numbers: List[str] = []
+
         try:
             ras_obj = ras_object or ras
             ras_obj.check_initialized()
@@ -673,7 +1041,8 @@ class RasCmdr:
                 dest_folder_path = Path(dest_folder)
                 if dest_folder_path.exists():
                     if overwrite_dest:
-                        shutil.rmtree(dest_folder_path)
+                        if not RasUtils.remove_with_retry(dest_folder_path, ras_object=None):
+                            raise PermissionError(f"Unable to remove destination folder: {dest_folder_path}")
                         logger.info(f"Destination folder '{dest_folder_path}' exists. Overwriting as per overwrite_dest=True.")
                     elif any(dest_folder_path.iterdir()):
                         error_msg = f"Destination folder '{dest_folder_path}' exists and is not empty. Use overwrite_dest=True to overwrite."
@@ -691,16 +1060,13 @@ class RasCmdr:
             )
             filtered_plan_numbers = list(filtered_plan_entries["plan_number"])
 
-            # Initialize execution_results dict
-            execution_results: Dict[str, bool] = {}
-
             # Filter out plans with existing results if skip_existing is True
             if skip_existing:
                 plans_to_skip = []
                 plans_to_compute = []
                 for plan_num in filtered_plan_numbers:
                     hdf_path = RasCmdr._get_hdf_path(plan_num, ras_obj)
-                    if RasCmdr._verify_completion(hdf_path):
+                    if RasCmdr._verify_completion(hdf_path, check_errors=False):
                         plans_to_skip.append(plan_num)
                         execution_results[plan_num] = True  # Mark as successful (results exist)
                     else:
@@ -732,10 +1098,12 @@ class RasCmdr:
             logger.info(f"Adjusted max_workers to {max_workers} based on the number of plans to compute: {num_plans}")
 
             worker_ras_objects = {}
+            worker_plan_numbers: Dict[int, List[str]] = defaultdict(list)
             for worker_id in range(1, max_workers + 1):
                 worker_folder = project_folder.parent / f"{project_folder.name} [Worker {worker_id}]"
                 if worker_folder.exists():
-                    shutil.rmtree(worker_folder)
+                    if not RasUtils.remove_with_retry(worker_folder, ras_object=None):
+                        raise PermissionError(f"Unable to remove existing worker folder: {worker_folder}")
                     logger.info(f"Removed existing worker folder: {worker_folder}")
                 shutil.copytree(project_folder, worker_folder, ignore=RasUtils.ignore_windows_reserved)
                 logger.info(f"Created worker folder: {worker_folder}")
@@ -755,6 +1123,8 @@ class RasCmdr:
             # Explicitly use the filtered plan numbers for assignments
             worker_cycle = cycle(range(1, max_workers + 1))
             plan_assignments = [(next(worker_cycle), plan_num) for plan_num in filtered_plan_numbers]
+            for worker_id, plan_num in plan_assignments:
+                worker_plan_numbers[worker_id].append(plan_num)
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit futures and track which plan each future represents
@@ -794,10 +1164,12 @@ class RasCmdr:
                 final_dest_folder = project_folder
                 logger.info(f"Consolidating results back to original project folder: {final_dest_folder}")
 
-            for worker_ras in worker_ras_objects.values():
+            consolidated_artifact_count = 0
+            for worker_id, worker_ras in worker_ras_objects.items():
                 if worker_ras is None:
                     continue
                 worker_folder = Path(worker_ras.project_folder)
+                assigned_plan_numbers = worker_plan_numbers.get(worker_id, [])
                 try:
                     # First, close any open resources in the worker RAS object
                     worker_ras.close() if hasattr(worker_ras, 'close') else None
@@ -809,27 +1181,32 @@ class RasCmdr:
                     max_retries = 3
                     for retry in range(max_retries):
                         try:
-                            for item in worker_folder.iterdir():
-                                if RasUtils.is_windows_reserved_name(item.name):
-                                    continue
-                                dest_path = final_dest_folder / item.name
-                                if dest_path.exists():
-                                    if dest_path.is_dir():
-                                        shutil.rmtree(dest_path)
-                                    else:
-                                        dest_path.unlink()
-                                # Use copy instead of move for more reliability
-                                if item.is_dir():
-                                    shutil.copytree(item, dest_path, ignore=RasUtils.ignore_windows_reserved)
-                                else:
-                                    shutil.copy2(item, dest_path)
-                            
+                            for plan_num in assigned_plan_numbers:
+                                geometry_number = RasCmdr._get_plan_geometry_number(
+                                    filtered_plan_entries,
+                                    plan_num
+                                )
+                                plan_artifacts = RasCmdr._get_worker_plan_artifacts(
+                                    worker_folder=worker_folder,
+                                    project_name=worker_ras.project_name,
+                                    plan_number=plan_num,
+                                    geometry_number=geometry_number
+                                )
+                                for artifact_path in plan_artifacts:
+                                    dest_path = final_dest_folder / artifact_path.name
+                                    if RasCmdr._copy_worker_artifact(
+                                        artifact_path,
+                                        dest_path
+                                    ):
+                                        consolidated_artifact_count += 1
+                             
                             # Add another small delay before removal
                             time.sleep(1)
                             
                             # Try to remove the worker folder
                             if worker_folder.exists():
-                                shutil.rmtree(worker_folder)
+                                if not RasUtils.remove_with_retry(worker_folder, ras_object=None):
+                                    raise PermissionError(f"Unable to remove worker folder: {worker_folder}")
                             break  # If successful, break the retry loop
                             
                         except PermissionError as pe:
@@ -841,6 +1218,12 @@ class RasCmdr:
                             
                 except Exception as e:
                     logger.error(f"Error moving results from {worker_folder} to {final_dest_folder}: {str(e)}")
+
+            logger.info(
+                "Consolidated %s worker artifact(s) to %s",
+                consolidated_artifact_count,
+                final_dest_folder
+            )
 
             # When dest_folder is used, re-initialize ras_obj from dest_folder
             # This ensures results_df reflects results in the destination folder
@@ -857,11 +1240,32 @@ class RasCmdr:
                 logger.info(f"Plan {plan_num}: {status}")
 
             ras_obj = ras_object or ras
-            ras_obj.plan_df = ras_obj.get_plan_entries()
-            ras_obj.geom_df = ras_obj.get_geom_entries()
-            ras_obj.flow_df = ras_obj.get_flow_entries()
-            ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
-            ras_obj.update_results_df(plan_numbers=list(execution_results.keys()))
+            try:
+                ras_obj.plan_df = ras_obj.get_plan_entries()
+                ras_obj.geom_df = ras_obj.get_geom_entries()
+                ras_obj.flow_df = ras_obj.get_flow_entries()
+                ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
+                ras_obj.update_results_df(plan_numbers=list(execution_results.keys()))
+            except Exception as e_refresh:
+                logger.warning(
+                    "Error refreshing DataFrames after compute_parallel: %s. "
+                    "Using cached plan metadata and expected result paths.",
+                    e_refresh,
+                )
+                try:
+                    RasCmdr._update_results_from_cached_plan_entries(
+                        ras_obj,
+                        list(execution_results.keys()),
+                        project_folder=final_dest_folder,
+                        project_name=ras_obj.project_name,
+                        plan_entries=filtered_plan_entries,
+                    )
+                except Exception as e_results:
+                    logger.error(
+                        "Could not summarize parallel results after refresh "
+                        "failure: %s",
+                        e_results,
+                    )
 
             # Extract results_df rows for executed plans
             _results_df = pd.DataFrame()
@@ -878,7 +1282,9 @@ class RasCmdr:
 
         except Exception as e:
             logger.critical(f"Error in compute_parallel: {str(e)}")
-            return ComputeParallelResult()
+            for plan_num in filtered_plan_numbers:
+                execution_results.setdefault(plan_num, False)
+            return ComputeParallelResult(execution_results=execution_results)
 
     @staticmethod
     @log_call
@@ -1183,9 +1589,21 @@ class RasCmdr:
             - {project}.p{plan_num}.tmp.hdf — preprocessed plan HDF
             - {project}.b{plan_num} — boundary conditions file
             - {project}.x{geom_num} — cross-section preprocessor file
+            - {project}.c{geom_num} — computed-geometry file (5.0.7 layout only)
 
-        Compatible with HEC-RAS Linux versions 6.3.1, 6.4, 6.5, 6.6, 6.7.
-        Auto-detects library subdirectory layout (libs/, libs/mkl/, libs/rhel_8/).
+        Supported native Linux install layouts (auto-detected from ``ras_exe_dir``):
+
+        * **canonical (6.3.1-7.0)** — ``RasUnsteady`` at the install root with a
+          sibling ``libs/`` tree (``libs/``, ``libs/mkl/``, ``libs/rhel_8/``).
+          Invoked as ``RasUnsteady {proj}.p{plan}.tmp.hdf x{geom}``.
+        * **bin_ras (5.0.7)** — ``bin_ras/rasUnsteady64`` with libraries colocated
+          in ``bin_ras/`` (no ``libs/`` tree). Invoked as
+          ``rasUnsteady64 {proj}.c{geom} b{plan}`` and additionally requires the
+          ``.c{geom}`` computed-geometry file. (CLB-886)
+
+        Detection and binary resolution mirror
+        :meth:`RasUtils._scan_native_linux_ras` (root ``RasUnsteady`` →
+        ``bin_ras/{rasUnsteady64,RasUnsteady,rasUnsteady}``).
 
         The Linux RasUnsteady binary uses Fortran I/O conventions that require
         files to be accessible with a base name of "io" (e.g., io.b, io.X).
@@ -1193,8 +1611,9 @@ class RasCmdr:
 
         Args:
             plan_number (Union[str, Number]): Plan number to execute (e.g., "01").
-            ras_exe_dir (Union[str, Path]): Directory containing the RasUnsteady
-                binary and sibling libs/ directory.
+            ras_exe_dir (Union[str, Path]): HEC-RAS Linux install directory. For the
+                canonical layout this holds ``RasUnsteady`` + ``libs/``; for the
+                5.0.7 layout it holds ``bin_ras/rasUnsteady64`` + its libraries.
             ras_object: Optional RAS project object. If None, uses global ras.
             timeout_sec (int): Maximum execution time in seconds (default 14400 = 4 hours).
             dos2unix (bool): Convert CRLF→LF in text files before execution (default True).
@@ -1220,22 +1639,44 @@ class RasCmdr:
         ras_obj = ras_object if ras_object is not None else ras
         ras_obj.check_initialized()
 
-        plan_num_str = str(plan_number).zfill(2) if isinstance(plan_number, Number) else str(plan_number).zfill(2)
+        plan_num_str = RasUtils.normalize_ras_number(plan_number)
 
-        ras_exe_dir = Path(ras_exe_dir)
-        ras_exe = ras_exe_dir / "RasUnsteady"
-        if not ras_exe.exists():
-            raise FileNotFoundError(
-                f"RasUnsteady binary not found at {ras_exe}. "
-                "Ensure HEC-RAS Linux binaries are installed."
+        ras_exe_dir_raw = str(ras_exe_dir)
+        ras_exe_dir_posix = ras_exe_dir_raw.replace("\\", "/").rstrip("/")
+        run_via_wsl = os.name == "nt" and ras_exe_dir_posix.startswith("/mnt/")
+
+        if run_via_wsl:
+            ras_exe = f"{ras_exe_dir_posix}/RasUnsteady"
+            probe = subprocess.run(
+                ["wsl", "test", "-x", ras_exe],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
             )
+            if probe.returncode != 0:
+                raise FileNotFoundError(
+                    f"RasUnsteady binary not found or not executable in WSL at {ras_exe}. "
+                    "Ensure HEC-RAS Linux binaries are installed and WSL can access them."
+                )
+        else:
+            ras_exe_dir = Path(ras_exe_dir)
+            layout = RasCmdr._resolve_linux_layout(ras_exe_dir)
+            ras_exe = layout["ras_exe"]
+            if not ras_exe.exists():
+                raise FileNotFoundError(
+                    f"Linux RasUnsteady binary not found under {ras_exe_dir} "
+                    f"(looked for {ras_exe}). Ensure HEC-RAS Linux binaries are installed."
+                )
 
         project_dir = Path(ras_obj.project_folder)
         project_name = ras_obj.project_name
 
         # Determine geometry number from plan file
         plan_path = RasPlan.get_plan_path(plan_num_str, ras_obj)
-        geom_num = "01"  # default
+        # Resolve the geometry number from the plan file. Fail fast rather than
+        # silently defaulting to "01" — running an unknown/wrong geometry would
+        # produce results for the wrong model (CLB-884).
+        geom_num = None
         try:
             plan_text = Path(plan_path).read_text(errors='replace')
             for line in plan_text.splitlines():
@@ -1248,12 +1689,25 @@ class RasCmdr:
                         geom_num = m.group(1)
                     break
         except Exception as e:
-            logger.warning(f"Could not read geom number from plan file: {e}")
+            raise RuntimeError(
+                f"Could not read the geometry reference from plan file {plan_path}: {e}. "
+                f"Refusing to run Linux compute without a resolved geometry."
+            )
+        if geom_num is None:
+            raise RuntimeError(
+                f"Could not resolve a geometry number from plan file {plan_path} "
+                f"(no parseable 'Geom File=' entry). Refusing to fall back to a default "
+                f"geometry for Linux compute — that could silently run the wrong geometry."
+            )
 
         # Verify prerequisite files exist
         tmp_hdf = project_dir / f"{project_name}.p{plan_num_str}.tmp.hdf"
         b_file = project_dir / f"{project_name}.b{plan_num_str}"
         x_file = project_dir / f"{project_name}.x{geom_num}"
+        # 5.0.7 (bin_ras/rasUnsteady64) additionally consumes the computed-geometry
+        # ".c{geom}" binary file and is invoked as `rasUnsteady64 {proj}.c{geom} b{plan}`
+        # rather than the 6.x/7.0 `RasUnsteady {tmp.hdf} x{geom}` convention (CLB-886).
+        c_file = project_dir / f"{project_name}.c{geom_num}"
 
         missing = []
         if not tmp_hdf.exists():
@@ -1262,10 +1716,13 @@ class RasCmdr:
             missing.append(f".b{plan_num_str}")
         if not x_file.exists():
             missing.append(f".x{geom_num}")
+        if layout["needs_c_file"] and not c_file.exists():
+            missing.append(f".c{geom_num}")
 
         if missing:
             raise FileNotFoundError(
-                f"Missing prerequisite files for Linux execution: {', '.join(missing)}. "
+                f"Missing prerequisite files for Linux execution ({layout['label']} layout): "
+                f"{', '.join(missing)}. "
                 f"Run RasPreprocess.preprocess_plan() on Windows first (Phase 1). "
                 f"See examples/510_linux_execution.ipynb for the complete workflow."
             )
@@ -1278,24 +1735,27 @@ class RasCmdr:
             except Exception as e:
                 logger.error(f"Error setting number of cores: {e}")
 
-        # Build LD_LIBRARY_PATH — auto-detect library subdirectories
-        # HEC-RAS Linux versions have varying layouts:
+        if run_via_wsl:
+            return RasCmdr._compute_plan_linux_via_wsl(
+                ras_exe=str(ras_exe),
+                ras_exe_dir=ras_exe_dir_posix,
+                plan_number=plan_num_str,
+                geom_num=geom_num,
+                project_dir=project_dir,
+                project_name=project_name,
+                tmp_hdf=tmp_hdf,
+                timeout_sec=timeout_sec,
+                dos2unix=dos2unix,
+                retry=retry,
+                retry_delay_sec=retry_delay_sec,
+                ras_obj=ras_obj,
+            )
+
+        # Build LD_LIBRARY_PATH — auto-detect library locations per layout:
+        #   5.0.7:     libs live alongside the binary in bin_ras/
         #   6.3.1-6.5: libs/, libs/mkl/
         #   6.6-6.7:   libs/, libs/mkl/, libs/rhel_8/
-        lib_base = ras_exe_dir / "libs"
-        if not lib_base.exists():
-            lib_base = ras_exe_dir.parent / "libs"
-        ld_path_parts = []
-        if lib_base.exists():
-            ld_path_parts.append(str(lib_base))
-            for subdir in sorted(lib_base.iterdir()):
-                if subdir.is_dir():
-                    ld_path_parts.append(str(subdir))
-                    logger.debug(f"Added library path: {subdir}")
-        else:
-            logger.warning(f"No libs/ directory found near {ras_exe_dir}")
-            ld_path_parts.append(str(ras_exe_dir))
-        ld_path = ":".join(ld_path_parts)
+        ld_path = RasCmdr._build_linux_ld_path(ras_exe_dir, layout)
         logger.info(f"LD_LIBRARY_PATH: {ld_path}")
 
         # dos2unix text files
@@ -1352,9 +1812,16 @@ class RasCmdr:
 
             try:
                 start_time = time.time()
+                # Argument convention differs by layout (CLB-886):
+                #   5.0.7:    rasUnsteady64 {proj}.c{geom} b{plan}   (cwd-relative basenames)
+                #   6.x/7.0:  RasUnsteady   {proj}.p{plan}.tmp.hdf x{geom}
+                if layout["needs_c_file"]:
+                    ras_args = [c_file.name, f"b{plan_num_str}"]
+                else:
+                    ras_args = [str(tmp_hdf), f"x{geom_num}"]
                 with open(log_path, "w") as log_fh:
                     proc = subprocess.Popen(
-                        [str(ras_exe), str(tmp_hdf), f"x{geom_num}"],
+                        [str(ras_exe), *ras_args],
                         stdout=log_fh,
                         stderr=subprocess.STDOUT,
                         env=env,
@@ -1365,11 +1832,26 @@ class RasCmdr:
                     end_time = time.time()
                     run_time = end_time - start_time
                     if rc == 0:
-                        success = True
-                        logger.info(
-                            f"RasUnsteady completed for plan {plan_num_str} "
-                            f"in {run_time:.1f}s (exit code 0)"
+                        # RasUnsteady can exit 0 even when the solve failed in-band
+                        # (e.g. "Unsteady flow encountered an error"). Validate the
+                        # solver log and result HDF before declaring success so a bad
+                        # result HDF is never promoted .tmp.hdf -> .hdf (CLB-882).
+                        ok, reason = RasCmdr._validate_linux_solve(
+                            log_path, tmp_hdf, plan_num_str
                         )
+                        if ok:
+                            success = True
+                            logger.info(
+                                f"RasUnsteady completed for plan {plan_num_str} "
+                                f"in {run_time:.1f}s (exit code 0, validated)"
+                            )
+                        else:
+                            success = False
+                            err_msg = (
+                                f"RasUnsteady exited 0 but the solve did not produce a "
+                                f"valid result: {reason}"
+                            )
+                            logger.error(f"Plan {plan_num_str}: {err_msg}")
                     else:
                         try:
                             tail = log_path.read_text(errors='replace')[-500:]
@@ -1428,3 +1910,494 @@ class RasCmdr:
                         pass
 
                 return ComputeResult(success=False, results_df_row=None)
+
+    @staticmethod
+    def _resolve_linux_layout(ras_exe_dir: Path) -> dict:
+        """Detect the HEC-RAS Linux install layout and return its execution adapter (CLB-886).
+
+        Two native layouts are supported:
+
+        * **canonical (6.3.1-7.0)** — ``RasUnsteady`` at the install root, with a
+          sibling ``libs/`` (plus ``libs/mkl/``, ``libs/rhel_8/``). Invoked as
+          ``RasUnsteady {proj}.p{plan}.tmp.hdf x{geom}``.
+        * **bin_ras (5.0.7)** — ``bin_ras/rasUnsteady64`` with the shared libraries
+          alongside the binary in ``bin_ras/`` (no ``libs/`` tree). Invoked as
+          ``rasUnsteady64 {proj}.c{geom} b{plan}`` and additionally requires the
+          computed-geometry ``.c{geom}`` file.
+
+        Resolution prefers a root ``RasUnsteady`` (canonical) and otherwise falls
+        back to ``bin_ras/rasUnsteady64`` / ``bin_ras/RasUnsteady`` — mirroring the
+        binary names :meth:`RasUtils._scan_native_linux_ras` recognizes.
+
+        Returns:
+            dict: ``ras_exe`` (Path), ``needs_c_file`` (bool), ``lib_dirs``
+            (list[Path] explicit lib dirs, or ``[]`` to auto-detect ``libs/``),
+            and ``label`` (str).
+        """
+        ras_exe_dir = Path(ras_exe_dir)
+        # Canonical layout: RasUnsteady at the install root.
+        root_exe = ras_exe_dir / "RasUnsteady"
+        if root_exe.exists():
+            return {
+                "ras_exe": root_exe,
+                "needs_c_file": False,
+                "lib_dirs": [],          # auto-detect libs/ tree
+                "label": "canonical",
+            }
+        # bin_ras layout (5.0.7): rasUnsteady64 (or RasUnsteady) under bin_ras/,
+        # libraries colocated in the same bin_ras/ directory.
+        bin_ras = ras_exe_dir / "bin_ras"
+        for binname in ("rasUnsteady64", "RasUnsteady", "rasUnsteady"):
+            cand = bin_ras / binname
+            if cand.exists():
+                return {
+                    "ras_exe": cand,
+                    "needs_c_file": True,
+                    "lib_dirs": [bin_ras],
+                    "label": "bin_ras (5.0.7)",
+                }
+        # Nothing matched — return the canonical guess so the caller raises a
+        # clear FileNotFoundError pointing at the expected location.
+        return {
+            "ras_exe": root_exe,
+            "needs_c_file": False,
+            "lib_dirs": [],
+            "label": "canonical",
+        }
+
+    @staticmethod
+    def _build_linux_ld_path(ras_exe_dir: Path, layout: dict) -> str:
+        """Build LD_LIBRARY_PATH for a Linux RasUnsteady run, per layout (CLB-886)."""
+        ras_exe_dir = Path(ras_exe_dir)
+        ld_path_parts = []
+        # Explicit lib dirs (e.g. 5.0.7 bin_ras/) take precedence.
+        for d in layout.get("lib_dirs") or []:
+            if Path(d).exists():
+                ld_path_parts.append(str(d))
+        if ld_path_parts:
+            return ":".join(ld_path_parts)
+        # Canonical: auto-detect a libs/ tree next to the binary.
+        lib_base = ras_exe_dir / "libs"
+        if not lib_base.exists():
+            lib_base = ras_exe_dir.parent / "libs"
+        if lib_base.exists():
+            ld_path_parts.append(str(lib_base))
+            for subdir in sorted(lib_base.iterdir()):
+                if subdir.is_dir():
+                    ld_path_parts.append(str(subdir))
+                    logger.debug(f"Added library path: {subdir}")
+        else:
+            logger.warning(f"No libs/ directory found near {ras_exe_dir}")
+            ld_path_parts.append(str(ras_exe_dir))
+        return ":".join(ld_path_parts)
+
+    @staticmethod
+    def _validate_linux_solve(log_path, result_hdf, plan_num_str: str):
+        """Validate a Linux RasUnsteady solve beyond exit-code 0 (CLB-882).
+
+        RasUnsteady can exit 0 even when the unsteady solve failed in-band
+        (convergence failure, "encountered an error", etc.), leaving an
+        unpopulated result HDF. This scans the solver log for error markers and
+        confirms the result HDF actually contains an Unsteady results group
+        (not just the skeleton groups carried over from Phase-1 preprocessing).
+
+        Returns:
+            tuple[bool, str]: ``(ok, reason)`` — ``ok`` is False with a
+            human-readable reason when the solve did not produce a valid result.
+        """
+        error_markers = [
+            "encountered an error",
+            "did not complete",
+            "failed to converge",
+            "computations were stopped",
+            "fatal error",
+        ]
+        try:
+            log_text = Path(log_path).read_text(errors="replace")
+        except OSError:
+            return False, "solver log unreadable"
+        low = log_text.lower()
+        for marker in error_markers:
+            if marker in low:
+                return False, f"solver log reports failure ('{marker}')"
+        try:
+            import h5py
+            with h5py.File(str(result_hdf), "r") as hf:
+                results = hf.get("Results")
+                if results is None:
+                    return False, "result HDF missing /Results group"
+                if results.get("Unsteady") is None:
+                    return False, "result HDF missing /Results/Unsteady group"
+        except Exception as e:
+            return False, f"result HDF unreadable or invalid: {e}"
+        return True, "ok"
+
+    @staticmethod
+    @log_call
+    def preprocess_geometry_linux(
+        plan_number: Union[str, Number],
+        ras_exe_dir: Union[str, Path],
+        ras_object=None,
+        timeout_sec: int = 7200,
+        dos2unix: bool = True,
+    ) -> 'ComputeResult':
+        """Run the native Linux ``RasGeomPreprocess`` geometry preprocessor (CLB-885).
+
+        This regenerates the geometry preprocessor tables (1D cross-section
+        property tables and 2D cell/face HTab property tables) inside an
+        existing ``{project}.p{plan}.tmp.hdf``, headlessly on Linux — mirroring
+        :meth:`compute_plan_linux` (LD_LIBRARY_PATH auto-detect, dos2unix,
+        output validation).
+
+        **Scope / honest limitation:** the native ``RasGeomPreprocess`` binary
+        operates *in place* on an existing ``.tmp.hdf`` that already contains the
+        raw ``/Geometry`` group. It does **not** build the ``.tmp.hdf`` skeleton
+        (nor the ``.b##``/``.x##`` files) from raw ``.prj``/``.g##``/``.u##``
+        text — that initial assembly is still the Windows Phase-1 step. Use this
+        to (re)compute geometry HTab tables on Linux after a geometry-only change,
+        or to refresh ``/Geometry/GeomPreprocess`` before
+        :meth:`compute_plan_linux` without round-tripping to Windows.
+
+        Args:
+            plan_number: Plan number whose ``.tmp.hdf`` to preprocess (e.g. "04").
+            ras_exe_dir: Directory containing the ``RasGeomPreprocess`` binary and
+                sibling ``libs/`` directory (e.g. ``/opt/hecras/6.6``).
+            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            timeout_sec: Maximum preprocessing time in seconds (default 7200).
+            dos2unix: Convert CRLF->LF in text files first (default True).
+
+        Returns:
+            ComputeResult: ``success`` True when the preprocessor finished and the
+            ``.tmp.hdf`` contains a populated ``/Geometry/GeomPreprocess`` group.
+
+        Raises:
+            FileNotFoundError: If the ``RasGeomPreprocess`` binary or the
+                ``.tmp.hdf``/``.x##`` prerequisites are missing.
+        """
+        ras_obj = ras_object if ras_object is not None else ras
+        ras_obj.check_initialized()
+
+        plan_num_str = RasUtils.normalize_ras_number(plan_number)
+
+        ras_exe_dir = Path(str(ras_exe_dir).replace("\\", "/").rstrip("/"))
+        geom_exe = ras_exe_dir / "RasGeomPreprocess"
+        if not geom_exe.exists():
+            raise FileNotFoundError(
+                f"RasGeomPreprocess binary not found at {geom_exe}. "
+                "Native Linux geometry preprocessing requires HEC-RAS 6.x Linux "
+                "binaries (RasGeomPreprocess is bundled alongside RasUnsteady)."
+            )
+
+        project_dir = Path(ras_obj.project_folder)
+        project_name = ras_obj.project_name
+
+        # Resolve geometry number from the plan file (mirror compute_plan_linux).
+        geom_num = "01"
+        try:
+            plan_path = RasPlan.get_plan_path(plan_num_str, ras_obj)
+            if plan_path is None:
+                raise ValueError(
+                    f"Could not resolve plan path for plan {plan_num_str}; "
+                    "ensure the project is initialized and the plan exists."
+                )
+            plan_text = Path(plan_path).read_text(errors="replace")
+            for line in plan_text.splitlines():
+                if line.startswith("Geom File="):
+                    import re as _re
+                    m = _re.search(r"(\d+)", line.split("=", 1)[1])
+                    if m:
+                        geom_num = m.group(1)
+                    break
+        except Exception as e:
+            logger.warning(f"Could not read geom number from plan file: {e}")
+
+        tmp_hdf = project_dir / f"{project_name}.p{plan_num_str}.tmp.hdf"
+        x_file = project_dir / f"{project_name}.x{geom_num}"
+        missing = []
+        if not tmp_hdf.exists():
+            missing.append(f".p{plan_num_str}.tmp.hdf")
+        if not x_file.exists():
+            missing.append(f".x{geom_num}")
+        if missing:
+            raise FileNotFoundError(
+                f"Missing prerequisites for Linux geometry preprocessing: "
+                f"{', '.join(missing)}. The .tmp.hdf (with raw /Geometry) and .x## "
+                f"must already exist (Windows Phase-1 builds these). "
+                f"See examples/510_linux_execution.ipynb."
+            )
+
+        # Build LD_LIBRARY_PATH — auto-detect library subdirectories (mirror compute_plan_linux).
+        lib_base = ras_exe_dir / "libs"
+        if not lib_base.exists():
+            lib_base = ras_exe_dir.parent / "libs"
+        ld_path_parts = []
+        if lib_base.exists():
+            ld_path_parts.append(str(lib_base))
+            for subdir in sorted(lib_base.iterdir()):
+                if subdir.is_dir():
+                    ld_path_parts.append(str(subdir))
+        else:
+            logger.warning(f"No libs/ directory found near {ras_exe_dir}")
+            ld_path_parts.append(str(ras_exe_dir))
+        ld_path = ":".join(ld_path_parts)
+        logger.info(f"LD_LIBRARY_PATH: {ld_path}")
+
+        if dos2unix:
+            try:
+                RasUtils.dos2unix(project_dir)
+            except Exception as e:
+                logger.warning(f"dos2unix failed: {e}")
+
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = ld_path
+
+        log_path = project_dir / f"geompre_linux_{plan_num_str}.log"
+        try:
+            start_time = time.time()
+            with open(log_path, "w") as log_fh:
+                proc = subprocess.Popen(
+                    [str(geom_exe), str(tmp_hdf), f"x{geom_num}"],
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=str(project_dir),
+                )
+            try:
+                rc = proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                logger.error(f"Plan {plan_num_str}: geometry preprocessing timed out after {timeout_sec}s")
+                return ComputeResult(success=False, results_df_row=None)
+            run_time = time.time() - start_time
+        except FileNotFoundError:
+            raise RuntimeError(f"RasGeomPreprocess binary not found at {geom_exe}.")
+
+        if rc != 0:
+            try:
+                tail = log_path.read_text(errors="replace")[-500:]
+            except OSError:
+                tail = "(log unreadable)"
+            logger.error(
+                f"Plan {plan_num_str}: RasGeomPreprocess exited with code {rc}. Log tail: {tail}"
+            )
+            return ComputeResult(success=False, results_df_row=None)
+
+        ok, reason = RasCmdr._validate_geom_preprocess(log_path, tmp_hdf)
+        if ok:
+            logger.info(
+                f"RasGeomPreprocess completed for plan {plan_num_str} "
+                f"in {run_time:.1f}s (exit code 0, validated)"
+            )
+            return ComputeResult(success=True, results_df_row=None)
+        logger.error(
+            f"Plan {plan_num_str}: RasGeomPreprocess exited 0 but did not produce "
+            f"a valid geometry preprocess result: {reason}"
+        )
+        return ComputeResult(success=False, results_df_row=None)
+
+    @staticmethod
+    def _validate_geom_preprocess(log_path, tmp_hdf):
+        """Validate a Linux RasGeomPreprocess run beyond exit-code 0 (CLB-885).
+
+        RasGeomPreprocess can exit 0 even when it failed in-band. This scans the
+        log for error markers and confirms the .tmp.hdf gained a populated
+        ``/Geometry/GeomPreprocess`` group (the 1D/2D hydraulic property tables
+        the unsteady solver consumes).
+
+        Returns:
+            tuple[bool, str]: ``(ok, reason)``.
+        """
+        error_markers = [
+            "encountered an error",
+            "fatal error",
+            "must be closed if it is being used",
+            "hdf_error",
+        ]
+        try:
+            log_low = Path(log_path).read_text(errors="replace").lower()
+        except OSError:
+            return False, "geompre log unreadable"
+        for marker in error_markers:
+            if marker in log_low:
+                return False, f"geompre log reports failure ('{marker}')"
+        # The "Finished Processing Geometry" banner is the success signal.
+        if "finished processing geometry" not in log_low:
+            return False, "geompre log missing 'Finished Processing Geometry' banner"
+        try:
+            import h5py
+            with h5py.File(str(tmp_hdf), "r") as hf:
+                geom = hf.get("Geometry")
+                if geom is None:
+                    return False, "tmp.hdf missing /Geometry group"
+                gp = geom.get("GeomPreprocess")
+                if gp is None or len(list(gp.keys())) == 0:
+                    return False, "tmp.hdf missing/empty /Geometry/GeomPreprocess group"
+        except Exception as e:
+            return False, f"tmp.hdf unreadable or invalid: {e}"
+        return True, "ok"
+
+    @staticmethod
+    def _windows_path_to_wsl(path: Union[str, Path]) -> str:
+        """Translate a Windows path to its WSL path using the active distro."""
+        path_arg = str(path).replace("\\", "/")
+        proc = subprocess.run(
+            ["wsl", "wslpath", "-a", path_arg],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"wslpath failed for {path}: {proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return proc.stdout.strip()
+
+    @staticmethod
+    def _compute_plan_linux_via_wsl(
+        ras_exe: str,
+        ras_exe_dir: str,
+        plan_number: str,
+        geom_num: str,
+        project_dir: Path,
+        project_name: str,
+        tmp_hdf: Path,
+        timeout_sec: int,
+        dos2unix: bool,
+        retry: bool,
+        retry_delay_sec: int,
+        ras_obj,
+    ) -> 'ComputeResult':
+        """Run native Linux RasUnsteady from a Windows Python session via WSL."""
+        project_dir_wsl = RasCmdr._windows_path_to_wsl(project_dir)
+        tmp_hdf_wsl = RasCmdr._windows_path_to_wsl(tmp_hdf)
+        log_path = project_dir / f"compute_linux_{plan_number}.log"
+        log_path_wsl = RasCmdr._windows_path_to_wsl(log_path)
+
+        if dos2unix:
+            try:
+                count = RasUtils.dos2unix(project_dir)
+                logger.debug(f"dos2unix converted {count} files")
+            except Exception as e:
+                logger.warning(f"dos2unix failed before WSL execution: {e}")
+
+        project_q = shlex.quote(project_dir_wsl)
+        project_name_q = shlex.quote(project_name)
+        ras_exe_q = shlex.quote(ras_exe)
+        ras_exe_dir_q = shlex.quote(ras_exe_dir)
+        tmp_hdf_q = shlex.quote(tmp_hdf_wsl)
+        log_path_q = shlex.quote(log_path_wsl)
+        geom_arg_q = shlex.quote(f"x{geom_num}")
+
+        cleanup_script = (
+            f"cd {project_q} && "
+            "find . -maxdepth 1 -type l -name 'io.*' -delete"
+        )
+
+        script = fr"""
+set -e
+cd {project_q}
+find . -maxdepth 1 -type l -name 'io.*' -delete
+link_or_copy() {{
+    ln -sfn "\$1" "\$2" 2>/dev/null || cp -f "\$1" "\$2"
+}}
+prefix={project_name_q}.
+link_or_copy {shlex.quote(f'{project_name}.b{plan_number}')} io.b
+link_or_copy {shlex.quote(f'{project_name}.x{geom_num}')} io.X
+link_or_copy {shlex.quote(f'{project_name}.x{geom_num}')} io.x
+for f in {project_name_q}.*; do
+    [ -e "\$f" ] || continue
+    suffix="\${{f#\$prefix}}"
+    [ -e "io.\$suffix" ] || link_or_copy "\$f" "io.\$suffix"
+done
+lib_base=""
+if [ -d {ras_exe_dir_q}/libs ]; then
+    lib_base={ras_exe_dir_q}/libs
+elif [ -d "\$(dirname {ras_exe_dir_q})/libs" ]; then
+    lib_base="\$(dirname {ras_exe_dir_q})/libs"
+fi
+if [ -n "\$lib_base" ]; then
+    ld_path="\$lib_base"
+    for d in "\$lib_base"/*; do
+        if [ -d "\$d" ]; then
+            ld_path="\$ld_path:\$d"
+        fi
+    done
+else
+    ld_path={ras_exe_dir_q}
+fi
+LD_LIBRARY_PATH="\$ld_path" {ras_exe_q} {tmp_hdf_q} {geom_arg_q} > {log_path_q} 2>&1
+"""
+
+        max_attempts = 2 if retry else 1
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                f"WSL Linux execution attempt {attempt}/{max_attempts} for plan {plan_number}"
+            )
+
+            # Remove any leftover io.tmp.hdf from previous run
+            io_tmp_hdf = project_dir / "io.tmp.hdf"
+            if io_tmp_hdf.exists():
+                io_tmp_hdf.unlink()
+
+            proc = subprocess.Popen(
+                ["wsl", "bash", "-lc", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                logger.error(f"Plan {plan_number}: WSL RasUnsteady timeout after {timeout_sec}s")
+                stdout, stderr = "", f"Timeout after {timeout_sec}s"
+                rc = -1
+            else:
+                rc = proc.returncode
+
+            if rc == 0:
+                subprocess.run(
+                    ["wsl", "bash", "-lc", cleanup_script],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                if tmp_hdf.exists():
+                    plan_hdf = RasCmdr._get_hdf_path(plan_number, ras_obj)
+                    shutil.move(str(tmp_hdf), str(plan_hdf))
+                    logger.debug(f"Renamed {tmp_hdf.name} -> {plan_hdf.name}")
+
+                try:
+                    ras_obj.plan_df = ras_obj.get_plan_entries()
+                    ras_obj.update_results_df(plan_numbers=[plan_number])
+                    mask = ras_obj.results_df['plan_number'] == plan_number
+                    results_row = ras_obj.results_df[mask].iloc[0].copy() if mask.any() else None
+                except Exception as e:
+                    logger.debug(f"Could not extract results_df_row: {e}")
+                    results_row = None
+
+                return ComputeResult(success=True, results_df_row=results_row)
+
+            try:
+                tail = log_path.read_text(errors='replace')[-800:] if log_path.exists() else ""
+            except OSError:
+                tail = "(log unreadable)"
+            logger.error(
+                f"Plan {plan_number}: WSL RasUnsteady exited with code {rc}. "
+                f"stdout={stdout.strip()} stderr={stderr.strip()} log tail={tail}"
+            )
+
+            if attempt < max_attempts:
+                logger.info(f"Retrying in {retry_delay_sec}s...")
+                time.sleep(retry_delay_sec)
+
+        subprocess.run(
+            ["wsl", "bash", "-lc", cleanup_script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        return ComputeResult(success=False, results_df_row=None)

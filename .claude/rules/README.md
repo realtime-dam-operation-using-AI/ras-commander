@@ -15,18 +15,22 @@ Language-specific patterns for ras-commander development:
 
 ### hec-ras/
 Domain-specific knowledge:
+- `calibration.md` - RasCalibrate workflows, CalibrationPoint setup, metric selection
 - `execution.md` - compute_plan(), parallel modes, stream_callback
 - `geometry.md` - Fixed-width parsing, bank station interpolation, 450-point limit
 - `hdf-files.md` - Result extraction, steady vs unsteady detection
 - `dss-files.md` - Boundary conditions, Java bridge, lazy loading
 - `remote.md` - Worker patterns, Session ID=2, Group Policy requirements
+- `ras-commander-first.md` - Check existing ras-commander APIs before reimplementing logic
+- `terrain-modification.md` - RasTerrainMod Windows/pythonnet workflow rules
+- `terrain.md` - Terrain creation and terrain-file guidance
 - `usgs.md` - Gauge workflows, NWIS access, validation metrics
 - `precipitation.md` - AORC workflows, Atlas 14 integration
+- `land-cover-mannings-n.md` - Layered override architecture, sidecar HDF, calibration NaN semantics
 
 ### testing/
 Testing approaches:
 - `tdd-approach.md` - Test with real HEC-RAS examples, not mocks
-- `example-projects.md` - RasExamples.extract_project() workflows
 - `environment-management.md` - Virtual environment setup: uv for agents, Anaconda for notebooks (rascmdr_local/RasCommander)
 
 ### documentation/
@@ -34,6 +38,10 @@ Documentation standards:
 - `hierarchical-knowledge-best-practices.md` - Subagent/skill patterns, avoiding duplication
 - `mkdocs-config.md` - Notebook integration, symlink handling
 - `notebook-standards.md` - Title requirements, execution policy
+
+### bridge rules
+Repository bridge rules:
+- `agents-md-bridge.md` - Standard thin-wrapper pattern for `AGENTS.md` compatibility files
 
 ## How Rules Work
 
@@ -61,9 +69,14 @@ These files have **no** `paths:` frontmatter and load in all sessions:
 | Rule File | Loads When Working In |
 |-----------|----------------------|
 | `python/*.md` (14 files) | `ras_commander/**` |
+| `agents-md-bridge.md` | `AGENTS.md`, `**/AGENTS.md` |
+| `hec-ras/calibration.md` | `ras_commander/RasCalibrate.py`, `ras_commander/usgs/metrics.py` |
 | `hec-ras/execution.md` | `ras_commander/**` |
 | `hec-ras/precipitation.md` | `ras_commander/**` |
+| `hec-ras/ras-commander-first.md` | `**/*.py`, `**/*.ipynb` |
 | `hec-ras/terrain.md` | `ras_commander/**` |
+| `hec-ras/terrain-modification.md` | `ras_commander/terrain/RasTerrainMod.py`, `examples/930_terrain_modification_analysis.ipynb` |
+| `hec-ras/land-cover-mannings-n.md` | `ras_commander/geom/GeomLandCover.py`, `ras_commander/_land_classification_helper.py`, `examples/212_landcover_mannings_n_write.ipynb` |
 | `hec-ras/remote.md` | `ras_commander/remote/**` |
 | `validation/validation-patterns.md` | `ras_commander/**` |
 | `testing/tdd-approach.md` | `tests/**` |
@@ -108,4 +121,5 @@ paths: ras_commander/**
 
 **Governance**:
 - `.claude/rules/documentation/hierarchical-knowledge-best-practices.md` -- Lightweight navigator pattern
-- Root CLAUDE.md -- Strategic vision
+- Root `AGENTS.md` -- Shared repository contract
+- Root `CLAUDE.md` -- Claude loader for that shared contract

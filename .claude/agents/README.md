@@ -5,7 +5,7 @@ This directory contains definitions for specialist agents that handle specific d
 ## What are Subagents?
 
 **Subagents** are AI assistants spawned by the main agent (Opus orchestrator) to handle specialized tasks. They:
-- **Inherit context automatically** via hierarchical CLAUDE.md files
+- **Inherit context automatically** through Claude loader files that import the shared `AGENTS.md` hierarchy
 - **Use specific models** optimized for their role (Sonnet for specialists, Haiku for quick tasks)
 - **Access skills** just like the main agent
 - **Work in focused directories** to get relevant context
@@ -15,12 +15,12 @@ This directory contains definitions for specialist agents that handle specific d
 ```
 Main Agent (Opus)
 ├─ High-level planning and delegation
-├─ Loads: Root CLAUDE.md + .claude/rules/**
+├─ Loads: Root CLAUDE.md loader -> AGENTS.md + .claude/rules/**
 └─ Spawns specialist agents when needed
 
 Specialist Subagents (Sonnet)
 ├─ Domain expertise (HDF, geometry, remote, USGS)
-├─ Inherit: Hierarchical CLAUDE.md chain
+├─ Inherit: Claude loader chain for the shared AGENTS.md contract
 ├─ Use: Library skills + domain skills
 └─ Spawn task agents (Haiku) for quick ops
 
@@ -39,6 +39,7 @@ Task Subagents (Haiku)
 - **remote-executor** - Distributed HEC-RAS execution
 - **precipitation-specialist** - AORC and Atlas 14 workflows
 - **quality-assurance** - RasFixit geometry repair
+- **rasmapper-spatial-reviewer** - RASMapper spatial QA screenshots and contextual review
 - **win32com-automation-expert** - COM automation, GUI interaction
 - **ras-commander-api-expert** - API integration, dataframe structures, spawns explore subagents
 - **api-consistency-auditor** - Enforces API conventions, detects pattern violations
@@ -154,9 +155,9 @@ You are an expert in HEC-RAS HDF file operations.
 ## Automatic Context Inheritance
 
 When working in `ras_commander/hdf/`, you automatically inherit:
-1. Root CLAUDE.md (strategic vision)
-2. ras_commander/CLAUDE.md (library patterns)
-3. ras_commander/hdf/CLAUDE.md (HDF implementation details)
+1. Root `CLAUDE.md` loader, which imports root `AGENTS.md`
+2. `ras_commander/CLAUDE.md` loader, which imports `ras_commander/AGENTS.md`
+3. `ras_commander/hdf/CLAUDE.md` loader, which imports `ras_commander/hdf/AGENTS.md`
 4. .claude/rules/hec-ras/hdf-files.md (detailed HDF guidance)
 
 ## Your Expertise
@@ -185,13 +186,13 @@ When `geometry-parser` subagent works in `ras_commander/geom/`:
 
 ```
 Automatic Context Loading:
-1. /CLAUDE.md (root)
+1. /CLAUDE.md -> /AGENTS.md (root)
    → "Use static classes, test with HEC-RAS examples"
 
-2. /ras_commander/CLAUDE.md (library)
+2. /ras_commander/CLAUDE.md -> /ras_commander/AGENTS.md (library)
    → "Module organization, common patterns"
 
-3. /ras_commander/geom/CLAUDE.md (geometry)
+3. /ras_commander/geom/CLAUDE.md -> /ras_commander/geom/AGENTS.md (geometry)
    → "Fixed-width parsing, bank station interpolation, 450-point limit"
 
 Result: Subagent has full context WITHOUT manual passing!
@@ -212,7 +213,7 @@ Result: Subagent has full context WITHOUT manual passing!
 - **Specify default model**: See Model Selection Framework below
 - **Minimal tool sets**: Only grant necessary permissions
 - **Clear triggers**: Help main agent know when to delegate
-- **Trust context inheritance**: Don't duplicate CLAUDE.md content
+- **Trust context inheritance**: Don't duplicate `AGENTS.md` or source-code contracts
 
 ## Model Selection Framework
 
@@ -256,6 +257,7 @@ Result: Subagent has full context WITHOUT manual passing!
 | **usgs-integrator** | Sonnet | Domain specialist, multi-step workflows |
 | **remote-executor** | Sonnet | Domain specialist, complex configuration |
 | **quality-assurance** | Sonnet | Domain specialist, RasFixit patterns |
+| **rasmapper-spatial-reviewer** | Sonnet | Domain specialist, RASMapper spatial QA/QC |
 | **precipitation-specialist** | Sonnet | Domain specialist, AORC/Atlas 14 workflows |
 | **hecras-project-inspector** | Sonnet | Project analysis, DataFrame inspection |
 | **hecras-results-analyst** | Sonnet | Results interpretation, quality assessment |

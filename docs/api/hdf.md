@@ -21,6 +21,7 @@ Plan-level information from HDF files.
 - `get_plan_info(hdf_path)` - Get plan metadata
 - `get_simulation_times(hdf_path)` - Get start/end times
 - `get_plan_parameters(hdf_path)` - Get computation parameters
+- `get_2d_flow_options(hdf_path)` - Get 2D equation set, initial condition time, tolerances, and solver options from computed HDF output
 
 ## Mesh Operations
 
@@ -48,6 +49,8 @@ Mesh geometry data.
 - `get_mesh_timeseries(hdf_path, mesh, var)` - Time series for mesh
 - `get_mesh_cells_timeseries(hdf_path, mesh, cell_ids, var)` - Cell time series
 - `get_mesh_faces_timeseries(hdf_path, mesh, face_ids, var)` - Face time series
+- `get_profile_line_flow_timeseries(hdf_path, line_name, mesh_name=None, profile_lines_path=None, direction="absolute")` - Flow time series across a RAS Mapper profile/reference line
+- `get_profile_line_peak_flow(hdf_path, line_name, mesh_name=None, profile_lines_path=None, direction="absolute")` - Peak Q and peak time for a profile/reference line
 
 ## Plan Results
 
@@ -103,6 +106,27 @@ Dam breach results.
 - `get_breaching_variables(hdf_path, structure)` - Breach geometry evolution
 - `get_structure_variables(hdf_path, structure)` - Structure flow variables
 
+### HdfStorageArea
+
+Storage area volume-elevation curve extraction from HDF.
+
+- `get_volume_elevation_curve(hdf_path, sa_name)` - Get volume-elevation curve for a storage area
+- `get_storage_area_names(hdf_path)` - List storage areas in HDF
+
+### HdfChannelCapacity
+
+1D channel capacity analysis (multi-AEP).
+
+- `get_channel_capacity(hdf_path, river=None, reach=None)` - Compute channel capacity from cross-section geometry and results
+- `get_multi_aep_capacity(hdf_paths, aep_labels)` - Compare capacity across multiple AEP simulations
+
+### HdfStruc1D
+
+1D inline structure data extraction from HDF.
+
+- `get_inline_structure_data(hdf_path)` - Extract inline structure geometry and results
+- `get_structure_flow_timeseries(hdf_path, structure_name)` - Get flow time series through a structure
+
 ### HdfHydraulicTables
 
 Cross section property tables (HTAB).
@@ -151,6 +175,7 @@ Infiltration parameter management from HDF geometry files.
 **Raster and Layer Operations:**
 
 - `get_infiltration_layer_data(hdf_path)` - Get infiltration layer data from HDF
+- `get_classification_polygons(hdf_path)` - Read infiltration sidecar classification polygon overrides
 - `get_infiltration_map(hdf_path)` - Read infiltration raster map
 - `calculate_soil_statistics(hdf_path)` - Process zonal statistics for soil analysis
 
@@ -164,6 +189,14 @@ Infiltration parameter management from HDF geometry files.
 **Data Export:**
 
 - `save_statistics(data, path)` - Export soil statistics to CSV
+
+### HdfLandCover
+
+Land-cover sidecar and final Manning's n extraction.
+
+- `get_landcover_raster_map(hdf_path)` - Read land-cover class IDs, names, and Manning's n values
+- `get_classification_polygons(hdf_path)` - Read land-cover sidecar classification polygon overrides
+- `get_preprocessed_mannings_n(hdf_path)` - Read preprocessed cell-center Manning's n values from geometry HDF
 
 ### HdfBndry
 

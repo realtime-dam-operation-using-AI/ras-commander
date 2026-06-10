@@ -1,5 +1,9 @@
 ---
 name: hecras_explore_gui
+shared_corpus: true
+harness_scope: shared
+source_owner: gpt-cmdr
+security_review: internal
 description: |
   Explores the HEC-RAS GUI to document menus, dialogs, controls, and workflows
   using win32com automation with screenshot capture. Use when needing to discover
@@ -250,7 +254,7 @@ import subprocess
 
 # 1. Extract and open a test project
 project_folder = RasExamples.extract_project("Muncie", suffix="gui_explore")
-init_ras_project(project_folder, "6.6")
+init_ras_project(project_folder, "7.0")
 
 # Get project file path
 from ras_commander import ras

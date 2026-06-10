@@ -10,7 +10,11 @@ DEPRECATION NOTICE:
     - GeomCrossSection.get_station_elevation() - replaces RasGeometry.get_station_elevation()
     - GeomCrossSection.set_station_elevation() - replaces RasGeometry.set_station_elevation()
     - GeomCrossSection.get_bank_stations() - replaces RasGeometry.get_bank_stations()
+    - GeomCrossSection.set_bank_stations() - replaces RasGeometry.set_bank_stations()
     - GeomCrossSection.get_expansion_contraction() - replaces RasGeometry.get_expansion_contraction()
+    - GeomCrossSection.set_expansion_contraction() - replaces RasGeometry.set_expansion_contraction()
+    - GeomCrossSection.interpolate_station_elevation() - replaces RasGeometry.interpolate_station_elevation()
+    - GeomCrossSection.interpolate_cross_section() - replaces RasGeometry.interpolate_cross_section()
     - GeomCrossSection.get_mannings_n() - replaces RasGeometry.get_mannings_n()
 
     Storage Area Operations:
@@ -24,6 +28,7 @@ DEPRECATION NOTICE:
     SA/2D Connection Operations:
     - GeomLateral.get_connections() - replaces RasGeometry.get_connections()
     - GeomLateral.get_connection_profile() - replaces RasGeometry.get_connection_weir_profile()
+    - GeomLateral.set_connection_profile() - replaces RasGeometry.set_connection_weir_profile()
     - GeomLateral.get_connection_gates() - replaces RasGeometry.get_connection_gates()
 
 This module is part of the ras-commander library and uses a centralized logging configuration.
@@ -35,7 +40,11 @@ List of Functions in RasGeometry (all DEPRECATED):
 - get_station_elevation() - Read station/elevation pairs for a cross section [DEPRECATED]
 - set_station_elevation() - Write station/elevation with automatic bank interpolation [DEPRECATED]
 - get_bank_stations() - Read left and right bank station locations [DEPRECATED]
+- set_bank_stations() - Write left and right bank station locations [DEPRECATED]
 - get_expansion_contraction() - Read expansion and contraction coefficients [DEPRECATED]
+- set_expansion_contraction() - Write expansion and contraction coefficients [DEPRECATED]
+- interpolate_station_elevation() - Interpolate station/elevation profiles [DEPRECATED]
+- interpolate_cross_section() - Read and interpolate two cross sections [DEPRECATED]
 - get_mannings_n() - Read Manning's roughness values with LOB/Channel/ROB classification [DEPRECATED]
 - get_storage_areas() - List all storage area names (excluding 2D flow areas) [DEPRECATED]
 - get_storage_elevation_volume() - Read elevation-volume curve for a storage area [DEPRECATED]
@@ -43,6 +52,7 @@ List of Functions in RasGeometry (all DEPRECATED):
 - get_lateral_weir_profile() - Read station-elevation profile for lateral weir [DEPRECATED]
 - get_connections() - List all SA/2D area connections [DEPRECATED]
 - get_connection_weir_profile() - Read dam/weir crest station-elevation profile [DEPRECATED]
+- set_connection_weir_profile() - Write dam/weir crest station-elevation profile [DEPRECATED]
 - get_connection_gates() - Read gate definitions (CSV format, 23+ parameters) [DEPRECATED]
 """
 
@@ -119,7 +129,8 @@ class RasGeometry:
                              rs: str,
                              sta_elev_df: pd.DataFrame,
                              bank_left: Optional[float] = None,
-                             bank_right: Optional[float] = None):
+                             bank_right: Optional[float] = None,
+                             create_backup: bool = True):
         """
         Write station/elevation pairs to a cross section with automatic bank interpolation.
 
@@ -133,7 +144,14 @@ class RasGeometry:
         )
         from .geom import GeomCrossSection
         return GeomCrossSection.set_station_elevation(
-            geom_file, river, reach, rs, sta_elev_df, bank_left, bank_right
+            geom_file,
+            river,
+            reach,
+            rs,
+            sta_elev_df,
+            bank_left=bank_left,
+            bank_right=bank_right,
+            create_backup=create_backup
         )
 
     @staticmethod
@@ -158,6 +176,37 @@ class RasGeometry:
 
     @staticmethod
     @log_call
+    def set_bank_stations(geom_file: Union[str, Path],
+                          river: str,
+                          reach: str,
+                          rs: str,
+                          bank_left: float,
+                          bank_right: float,
+                          create_backup: bool = True):
+        """
+        Set left and right bank station locations for a cross section.
+
+        DEPRECATED: Use GeomCrossSection.set_bank_stations() instead.
+        """
+        warnings.warn(
+            "RasGeometry.set_bank_stations() is deprecated. "
+            "Use GeomCrossSection.set_bank_stations() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        from .geom import GeomCrossSection
+        return GeomCrossSection.set_bank_stations(
+            geom_file,
+            river,
+            reach,
+            rs,
+            bank_left,
+            bank_right,
+            create_backup=create_backup
+        )
+
+    @staticmethod
+    @log_call
     def get_expansion_contraction(geom_file: Union[str, Path],
                                   river: str,
                                   reach: str,
@@ -175,6 +224,103 @@ class RasGeometry:
         )
         from .geom import GeomCrossSection
         return GeomCrossSection.get_expansion_contraction(geom_file, river, reach, rs)
+
+    @staticmethod
+    @log_call
+    def set_expansion_contraction(geom_file: Union[str, Path],
+                                  river: str,
+                                  reach: str,
+                                  rs: str,
+                                  expansion: float,
+                                  contraction: float,
+                                  create_backup: bool = True):
+        """
+        Set expansion and contraction coefficients for a cross section.
+
+        DEPRECATED: Use GeomCrossSection.set_expansion_contraction() instead.
+        """
+        warnings.warn(
+            "RasGeometry.set_expansion_contraction() is deprecated. "
+            "Use GeomCrossSection.set_expansion_contraction() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        from .geom import GeomCrossSection
+        return GeomCrossSection.set_expansion_contraction(
+            geom_file,
+            river,
+            reach,
+            rs,
+            expansion,
+            contraction,
+            create_backup=create_backup
+        )
+
+    @staticmethod
+    @log_call
+    def interpolate_station_elevation(upstream_df: pd.DataFrame,
+                                      downstream_df: pd.DataFrame,
+                                      ratio: float = 0.5,
+                                      bank_left: Optional[float] = None,
+                                      bank_right: Optional[float] = None,
+                                      max_points: int = 500) -> pd.DataFrame:
+        """
+        Interpolate a station/elevation profile between two cross sections.
+
+        DEPRECATED: Use GeomCrossSection.interpolate_station_elevation() instead.
+        """
+        warnings.warn(
+            "RasGeometry.interpolate_station_elevation() is deprecated. "
+            "Use GeomCrossSection.interpolate_station_elevation() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        from .geom import GeomCrossSection
+        return GeomCrossSection.interpolate_station_elevation(
+            upstream_df,
+            downstream_df,
+            ratio=ratio,
+            bank_left=bank_left,
+            bank_right=bank_right,
+            max_points=max_points
+        )
+
+    @staticmethod
+    @log_call
+    def interpolate_cross_section(geom_file: Union[str, Path],
+                                  river: str,
+                                  reach: str,
+                                  upstream_rs: str,
+                                  downstream_rs: str,
+                                  ratio: float = 0.5,
+                                  bank_left: Optional[float] = None,
+                                  bank_right: Optional[float] = None,
+                                  max_points: int = 500,
+                                  interpolated_rs: Optional[str] = None) -> pd.DataFrame:
+        """
+        Read two cross sections and interpolate a reviewable profile.
+
+        DEPRECATED: Use GeomCrossSection.interpolate_cross_section() instead.
+        """
+        warnings.warn(
+            "RasGeometry.interpolate_cross_section() is deprecated. "
+            "Use GeomCrossSection.interpolate_cross_section() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        from .geom import GeomCrossSection
+        return GeomCrossSection.interpolate_cross_section(
+            geom_file,
+            river,
+            reach,
+            upstream_rs,
+            downstream_rs,
+            ratio=ratio,
+            bank_left=bank_left,
+            bank_right=bank_right,
+            max_points=max_points,
+            interpolated_rs=interpolated_rs
+        )
 
     @staticmethod
     @log_call
@@ -319,6 +465,28 @@ class RasGeometry:
         )
         from .geom import GeomLateral
         return GeomLateral.get_connection_profile(geom_file, connection_name)
+
+    @staticmethod
+    @log_call
+    def set_connection_weir_profile(geom_file: Union[str, Path],
+                                    connection_name: str,
+                                    sta_elev_df: pd.DataFrame,
+                                    create_backup: bool = True):
+        """
+        Write weir/dam crest station-elevation profile for a connection.
+
+        DEPRECATED: Use GeomLateral.set_connection_profile() instead.
+        """
+        warnings.warn(
+            "RasGeometry.set_connection_weir_profile() is deprecated. "
+            "Use GeomLateral.set_connection_profile() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        from .geom import GeomLateral
+        return GeomLateral.set_connection_profile(
+            geom_file, connection_name, sta_elev_df, create_backup=create_backup
+        )
 
     @staticmethod
     @log_call

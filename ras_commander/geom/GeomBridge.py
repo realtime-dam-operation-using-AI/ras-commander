@@ -12,9 +12,17 @@ List of Functions:
 - get_piers() - Read pier definitions (widths, elevations)
 - get_abutment() - Read abutment geometry
 - get_approach_sections() - Read BR U/BR D approach sections
+- get_bridge_opening_xs() - Read inside-bridge ground profile (sections 2/3)
 - get_coefficients() - Read hydraulic coefficients
+- get_hydraulic_methods() - Read bridge low-flow/high-flow method selections
+- set_hydraulic_methods() - Set bridge low-flow/high-flow method selections
 - get_htab() - Read hydraulic table parameters (returns DataFrame)
 - get_htab_dict() - Read hydraulic table parameters (returns dict with invert)
+- set_deck() - Create/replace bridge deck, high chord, and low chord blocks
+- set_piers() - Create/replace/remove bridge pier blocks
+- set_abutments() - Create/replace/remove bridge abutment blocks
+- set_approach_sections() - Create/replace/remove BR U/BR D approach blocks
+- set_coefficients() - Create/replace BR Coef, WSPro, and BC Design lines
 
 Example Usage:
     >>> from ras_commander import GeomBridge
@@ -58,6 +66,57 @@ class GeomBridge:
     VALUES_PER_LINE = 10
     DEFAULT_SEARCH_RANGE = 100
     MAX_PARSE_LINES = 200
+
+    LOW_FLOW_METHOD_CODES = {
+        'energy': 0,
+        'momentum': 1,
+        'yarnell': 2,
+        'wspro': 3,
+    }
+    LOW_FLOW_METHOD_NAMES = {value: key for key, value in LOW_FLOW_METHOD_CODES.items()}
+    HIGH_FLOW_METHODS = {'energy', 'pressure_weir'}
+
+    BR_COEF_FIELD_NAMES = {
+        0: 'use_energy',
+        1: 'use_momentum',
+        2: 'use_yarnell',
+        3: 'yarnell_k',
+        4: 'use_wspro',
+        6: 'submerged_inlet_cd',
+        7: 'submerged_inlet_outlet_cd',
+        8: 'use_high_standard_step',
+        9: 'momentum_cd',
+        10: 'low_flow_method_code',
+        11: 'low_chord_weir_check',
+    }
+
+    WSPRO_FIELD_NAMES = {
+        0: 'left_top_elevation',
+        1: 'right_top_elevation',
+        2: 'left_toe_elevation',
+        3: 'right_toe_elevation',
+        4: 'abutment_type',
+        5: 'abutment_slope',
+        6: 'bridge_opening_width',
+        7: 'centroid_station',
+        8: 'wing_wall_type',
+        9: 'wing_wall_width',
+        10: 'wing_wall_angle',
+        11: 'wing_wall_radius',
+        12: 'guide_bank_type',
+        13: 'guide_bank_length',
+        14: 'guide_bank_offset',
+        15: 'guide_bank_angle',
+        16: 'piers_continuous',
+        17: 'friction_slope_geometric_mean',
+        18: 'use_tables',
+        19: 'use_ce_approach',
+        20: 'use_ce_guide_banks',
+        21: 'use_ce_upstream_xs',
+        22: 'use_ce_upstream_bridge',
+        23: 'use_ce_downstream_bridge',
+    }
+    WSPRO_BOOLEAN_FIELDS = set(range(16, 24))
 
     @staticmethod
     def _find_bridge(lines: List[str], river: str, reach: str, rs: str) -> Optional[int]:
@@ -126,6 +185,657 @@ class GeomBridge:
                 flags[name] = None
 
         return flags
+
+    @staticmethod
+    def _split_line_ending(line: str) -> tuple:
+        """Split a text line into body and original line ending."""
+        if line.endswith('\r\n'):
+            return line[:-2], '\r\n'
+        if line.endswith('\n'):
+            return line[:-1], '\n'
+        if line.endswith('\r'):
+            return line[:-1], '\r'
+        return line, ''
+
+    @staticmethod
+    def _split_comma_fields_from_line(line: str, prefix: str) -> List[str]:
+        """Return comma fields after a HEC-RAS keyword while preserving field padding."""
+        body, _ = GeomBridge._split_line_ending(line)
+        return body[len(prefix):].split(',')
+
+    @staticmethod
+    def _parse_float_field(field: str) -> Optional[float]:
+        stripped = field.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_missing(value: Any) -> bool:
+        """Return True for None/NaN values without treating lists as ambiguous."""
+        if value is None:
+            return True
+        try:
+            return bool(pd.isna(value))
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _format_csv_value(value: Any, precision: int = 6) -> str:
+        """Format a scalar for HEC-RAS comma-delimited geometry records."""
+        if GeomBridge._is_missing(value):
+            return ""
+
+        if isinstance(value, (np.integer, int)):
+            return str(int(value))
+
+        if isinstance(value, (np.floating, float)):
+            value = float(value)
+            if np.isnan(value):
+                return ""
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:.{precision}f}".rstrip('0').rstrip('.')
+
+        try:
+            float_value = float(value)
+            if float_value.is_integer():
+                return str(int(float_value))
+            return f"{float_value:.{precision}f}".rstrip('0').rstrip('.')
+        except (TypeError, ValueError):
+            return str(value).strip()
+
+    @staticmethod
+    def _format_csv_line(keyword: str, values: List[Any]) -> str:
+        """Format a keyword=value1,value2,... geometry record."""
+        return f"{keyword}={','.join(GeomBridge._format_csv_value(v) for v in values)}\n"
+
+    @staticmethod
+    def _parse_csv_values(line: str) -> List[str]:
+        """Parse raw comma-delimited values from a HEC-RAS geometry record."""
+        value = line.split('=', 1)[1] if '=' in line else line
+        return [part.strip() for part in value.rstrip('\n\r').split(',')]
+
+    @staticmethod
+    def _parse_optional_float(value: Any) -> Optional[float]:
+        """Parse optional numeric values from geometry CSV fields."""
+        if GeomBridge._is_missing(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_int_field(field: str) -> Optional[int]:
+        value = GeomBridge._parse_float_field(field)
+        if value is None:
+            return None
+        return int(value)
+
+    @staticmethod
+    def _parse_bool_field(field: str) -> Optional[bool]:
+        value = GeomBridge._parse_float_field(field)
+        if value is None:
+            return None
+        return value != 0
+
+    @staticmethod
+    def _format_scalar_field(value: Any) -> str:
+        if isinstance(value, bool):
+            return '-1' if value else '0'
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    @staticmethod
+    def _format_bool_field(value: bool, existing_field: str = '') -> str:
+        if value:
+            existing = existing_field.strip()
+            if existing and existing not in {'0', '0.0'}:
+                return existing
+            return '-1'
+        return '0'
+
+    @staticmethod
+    def _set_comma_field(fields: List[str], index: int, value: Any) -> None:
+        """Set one comma field, preserving its surrounding whitespace when present."""
+        while len(fields) <= index:
+            fields.append('')
+
+        old_field = fields[index]
+        new_value = GeomBridge._format_scalar_field(value)
+        if old_field.strip():
+            leading_count = len(old_field) - len(old_field.lstrip())
+            trailing_count = len(old_field) - len(old_field.rstrip())
+            leading = old_field[:leading_count]
+            trailing = old_field[len(old_field) - trailing_count:] if trailing_count else ''
+            fields[index] = f"{leading}{new_value}{trailing}"
+        else:
+            fields[index] = new_value
+
+    @staticmethod
+    def _default_br_coef_fields() -> List[str]:
+        """Return a conservative default BR Coef field list for structures missing the line."""
+        return ['-1 ', ' 0 ', ' 0 ', '', ' 0 ', '', '', '0.8', '0', '', '0', '']
+
+    @staticmethod
+    def _format_comma_line(prefix: str, fields: List[str], line_ending: str = '\n') -> str:
+        return f"{prefix}{','.join(fields)}{line_ending}"
+
+    @staticmethod
+    def _find_bridge_method_lines(
+        lines: List[str],
+        bridge_idx: int,
+        struct_end_idx: int,
+        opening_index: int = 0
+    ) -> Dict[str, Optional[int]]:
+        """Find BR Coef and matching WSPro records for one bridge opening."""
+        if opening_index < 0:
+            raise ValueError("opening_index must be >= 0")
+
+        br_coef_indices = []
+        wspro_indices = []
+
+        for i in range(bridge_idx, struct_end_idx):
+            line = lines[i]
+            if line.startswith("BR Coef="):
+                br_coef_indices.append(i)
+            elif line.startswith("WSPro="):
+                wspro_indices.append(i)
+
+        br_coef_idx = br_coef_indices[opening_index] if opening_index < len(br_coef_indices) else None
+        wspro_idx = None
+
+        if br_coef_idx is not None:
+            next_br_coef_idx = (
+                br_coef_indices[opening_index + 1]
+                if opening_index + 1 < len(br_coef_indices)
+                else struct_end_idx
+            )
+            for idx in wspro_indices:
+                if br_coef_idx < idx < next_br_coef_idx:
+                    wspro_idx = idx
+                    break
+        elif opening_index < len(wspro_indices):
+            wspro_idx = wspro_indices[opening_index]
+
+        return {
+            'br_coef_idx': br_coef_idx,
+            'wspro_idx': wspro_idx,
+            'br_coef_count': len(br_coef_indices),
+            'wspro_count': len(wspro_indices),
+        }
+
+    @staticmethod
+    def _find_br_coef_insert_idx(lines: List[str], bridge_idx: int, struct_end_idx: int) -> int:
+        """Choose a stable insertion point for a missing BR Coef record."""
+        for i in range(bridge_idx + 1, struct_end_idx):
+            if (lines[i].startswith("WSPro=") or
+                    lines[i].startswith("BC Design=") or
+                    lines[i].startswith("BC HTab")):
+                return i
+        return struct_end_idx
+
+    @staticmethod
+    def _find_bridge_deck_line(lines: List[str], bridge_idx: int, struct_end_idx: int) -> Optional[int]:
+        """Find the data line following the bridge Deck Dist Width WeirC header."""
+        for i in range(bridge_idx + 1, struct_end_idx - 1):
+            if lines[i].startswith("Deck Dist Width WeirC"):
+                return i + 1
+        return None
+
+    @staticmethod
+    def _parse_wspro_fields(fields: List[str]) -> Dict[str, Any]:
+        wspro = {}
+        for idx, name in GeomBridge.WSPRO_FIELD_NAMES.items():
+            if idx >= len(fields):
+                wspro[name] = None
+                continue
+            if idx in GeomBridge.WSPRO_BOOLEAN_FIELDS:
+                wspro[name] = GeomBridge._parse_bool_field(fields[idx])
+            else:
+                value = GeomBridge._parse_float_field(fields[idx])
+                wspro[name] = value if value is not None else None
+        return wspro
+
+    @staticmethod
+    def _parse_br_coef_fields(fields: List[str]) -> Dict[str, Any]:
+        method_code = GeomBridge._parse_int_field(fields[10]) if len(fields) > 10 else None
+        high_standard_step = (
+            GeomBridge._parse_bool_field(fields[8]) if len(fields) > 8 else None
+        )
+
+        coefficients = {
+            'momentum_cd': GeomBridge._parse_float_field(fields[9]) if len(fields) > 9 else None,
+            'yarnell_k': GeomBridge._parse_float_field(fields[3]) if len(fields) > 3 else None,
+            'submerged_inlet_cd': GeomBridge._parse_float_field(fields[6]) if len(fields) > 6 else None,
+            'submerged_inlet_outlet_cd': (
+                GeomBridge._parse_float_field(fields[7]) if len(fields) > 7 else None
+            ),
+            'low_chord_weir_check': GeomBridge._parse_float_field(fields[11]) if len(fields) > 11 else None,
+        }
+
+        enabled = {
+            'energy': GeomBridge._parse_bool_field(fields[0]) if len(fields) > 0 else None,
+            'momentum': GeomBridge._parse_bool_field(fields[1]) if len(fields) > 1 else None,
+            'yarnell': GeomBridge._parse_bool_field(fields[2]) if len(fields) > 2 else None,
+            'wspro': GeomBridge._parse_bool_field(fields[4]) if len(fields) > 4 else None,
+        }
+
+        return {
+            'low_flow_method_code': method_code,
+            'low_flow_method': GeomBridge.LOW_FLOW_METHOD_NAMES.get(method_code),
+            'high_flow_method': (
+                'energy' if high_standard_step else 'pressure_weir'
+                if high_standard_step is not None else None
+            ),
+            'use_high_standard_step': high_standard_step,
+            'enabled_low_flow_methods': enabled,
+            'coefficients': coefficients,
+        }
+
+    @staticmethod
+    def _parse_bridge_deck_fields(fields: List[str]) -> Dict[str, Any]:
+        """Parse common bridge deck fields from the Deck Dist Width WeirC record."""
+        return {
+            'deck_distance': GeomBridge._parse_float_field(fields[0]) if len(fields) > 0 else None,
+            'deck_width': GeomBridge._parse_float_field(fields[1]) if len(fields) > 1 else None,
+            'weir_coefficient': GeomBridge._parse_float_field(fields[2]) if len(fields) > 2 else None,
+            'skew': GeomBridge._parse_float_field(fields[3]) if len(fields) > 3 else None,
+            'max_submergence': GeomBridge._parse_float_field(fields[8]) if len(fields) > 8 else None,
+            'is_ogee': GeomBridge._parse_bool_field(fields[9]) if len(fields) > 9 else None,
+        }
+
+    @staticmethod
+    def _normalize_hydraulic_method(method: Optional[str], accepted: set, field_name: str) -> Optional[str]:
+        if method is None:
+            return None
+        normalized = method.strip().lower().replace('-', '_').replace(' ', '_')
+        if normalized not in accepted:
+            accepted_values = ', '.join(sorted(accepted))
+            raise ValueError(f"{field_name} must be one of: {accepted_values}")
+        return normalized
+
+    @staticmethod
+    def _validate_hydraulic_method_selection(
+        low_flow_method: Optional[str],
+        high_flow_method: Optional[str],
+        enabled: Dict[str, Optional[bool]],
+        wspro_idx: Optional[int],
+        require_selected_enabled: bool = True,
+    ) -> None:
+        if (require_selected_enabled and
+                low_flow_method is not None and
+                enabled.get(low_flow_method) is False):
+            raise ValueError(
+                f"selected low_flow_method '{low_flow_method}' cannot be disabled"
+            )
+        if low_flow_method == 'wspro' and wspro_idx is None:
+            raise ValueError("low_flow_method 'wspro' requires an existing WSPro= record")
+        if high_flow_method is not None and high_flow_method not in GeomBridge.HIGH_FLOW_METHODS:
+            accepted_values = ', '.join(sorted(GeomBridge.HIGH_FLOW_METHODS))
+            raise ValueError(f"high_flow_method must be one of: {accepted_values}")
+
+    @staticmethod
+    def _parse_optional_int(value: Any) -> Optional[int]:
+        """Parse optional integer values from geometry CSV fields."""
+        parsed = GeomBridge._parse_optional_float(value)
+        if parsed is None:
+            return None
+        return int(parsed)
+
+    @staticmethod
+    def _listify(value: Any) -> List[Any]:
+        """Return a plain list from list-like DataFrame cells or scalar values."""
+        if GeomBridge._is_missing(value):
+            return []
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (list, tuple, pd.Series)):
+            return list(value)
+        return [value]
+
+    @staticmethod
+    def _read_fixed_width_values(lines: List[str], start_idx: int, count: int) -> tuple:
+        """
+        Read a fixed-width numeric vector and return (values, next_line_idx).
+
+        Bridge deck, pier, and abutment sub-blocks store each station/elevation
+        vector independently. Counts therefore describe one vector, not paired
+        station/elevation rows.
+        """
+        values = []
+        idx = start_idx
+
+        while len(values) < count and idx < len(lines):
+            if '=' in lines[idx]:
+                break
+            values.extend(GeomParser.parse_fixed_width(lines[idx], GeomBridge.FIXED_WIDTH_COLUMN))
+            idx += 1
+
+        if len(values) < count:
+            raise ValueError(f"Expected {count} fixed-width values, found {len(values)}")
+
+        return values[:count], idx
+
+    @staticmethod
+    def _format_fixed_width_values(values: List[Any], precision: int = 2) -> List[str]:
+        """Format a single numeric vector as HEC-RAS fixed-width data lines."""
+        numeric_values = [float(value) for value in values]
+        return GeomParser.format_fixed_width(
+            numeric_values,
+            column_width=GeomBridge.FIXED_WIDTH_COLUMN,
+            values_per_line=GeomBridge.VALUES_PER_LINE,
+            precision=precision
+        )
+
+    @staticmethod
+    def _find_section_end(lines: List[str], section_start_idx: int) -> int:
+        """Find the first line after a Type RM geometry section."""
+        for i in range(section_start_idx + 1, len(lines)):
+            line = lines[i]
+            if (line.startswith("Type RM Length L Ch R =") or
+                    line.startswith("River Reach=") or
+                    line.startswith("Reach XS=")):
+                return i
+        return len(lines)
+
+    @staticmethod
+    def _find_station_section(lines: List[str], river: str, reach: str, rs: str) -> Optional[Dict[str, Any]]:
+        """Find an existing geometry station section by river/reach/RS."""
+        current_river = None
+        current_reach = None
+        rs = str(rs)
+
+        for i, line in enumerate(lines):
+            if line.startswith("River Reach="):
+                values = GeomParser.extract_comma_list(line, "River Reach")
+                if len(values) >= 2:
+                    current_river = values[0]
+                    current_reach = values[1]
+
+            elif line.startswith("Type RM Length L Ch R ="):
+                value_str = GeomParser.extract_keyword_value(line, "Type RM Length L Ch R")
+                values = [v.strip() for v in value_str.split(',')]
+                if len(values) > 1 and current_river == river and current_reach == reach and values[1] == rs:
+                    return {
+                        'river': current_river,
+                        'reach': current_reach,
+                        'rs': values[1],
+                        'type_idx': i,
+                        'end_idx': GeomBridge._find_section_end(lines, i),
+                        'type_code': GeomBridge._parse_optional_int(values[0])
+                    }
+
+        return None
+
+    @staticmethod
+    def _format_bridge_header(bridge_flags: Optional[List[Any]] = None) -> str:
+        """Format the Bridge Culvert marker line."""
+        flags = bridge_flags if bridge_flags is not None else [-1, 0, -1, -1, 0]
+        return f"Bridge Culvert-{','.join(GeomBridge._format_csv_value(flag) for flag in flags)} \n"
+
+    @staticmethod
+    def _set_station_type(lines: List[str], type_idx: int, type_code: int = 3) -> None:
+        """Update the section type code on a Type RM Length line in-place."""
+        line = lines[type_idx]
+        if '=' not in line:
+            return
+
+        ending = '\n' if line.endswith('\n') else ''
+        body = line.rstrip('\n\r')
+        prefix, value = body.split('=', 1)
+        parts = value.split(',')
+        if not parts:
+            return
+        parts[0] = f" {type_code} "
+        lines[type_idx] = f"{prefix}={','.join(parts)}{ending}"
+
+    @staticmethod
+    def _bridge_insert_index_for_station(lines: List[str], station: Dict[str, Any]) -> int:
+        """Choose where to insert a missing Bridge Culvert block in a station section."""
+        insert_idx = station['type_idx'] + 1
+        in_description = False
+
+        for idx in range(station['type_idx'] + 1, station['end_idx']):
+            line = lines[idx]
+            stripped = line.strip()
+
+            if line.startswith("BEGIN DESCRIPTION:"):
+                in_description = True
+                insert_idx = idx + 1
+                continue
+
+            if in_description:
+                insert_idx = idx + 1
+                if line.startswith("END DESCRIPTION:"):
+                    in_description = False
+                continue
+
+            if (line.startswith("Node Name=") or
+                    line.startswith("Node Photo=") or
+                    line.startswith("Node Last Edited Time=") or
+                    stripped == ""):
+                insert_idx = idx + 1
+                continue
+
+            break
+
+        return insert_idx
+
+    @staticmethod
+    def _ensure_bridge_block(lines: List[str],
+                             river: str,
+                             reach: str,
+                             rs: str,
+                             bridge_flags: Optional[List[Any]] = None) -> tuple:
+        """
+        Ensure a Bridge Culvert marker exists and return (lines, marker_idx, created).
+
+        If the bridge marker is missing but the river/reach/station exists, the
+        station is converted to type 3 and a bridge marker is inserted after the
+        station metadata.
+        """
+        bridge_idx = GeomBridge._find_bridge(lines, river, reach, rs)
+        if bridge_idx is not None:
+            return lines, bridge_idx, False
+
+        station = GeomBridge._find_station_section(lines, river, reach, rs)
+        if station is None:
+            raise ValueError(f"Station not found: {river}/{reach}/RS {rs}")
+
+        modified_lines = lines.copy()
+        GeomBridge._set_station_type(modified_lines, station['type_idx'], type_code=3)
+        insert_idx = GeomBridge._bridge_insert_index_for_station(station=station, lines=modified_lines)
+        modified_lines[insert_idx:insert_idx] = [GeomBridge._format_bridge_header(bridge_flags)]
+
+        return modified_lines, insert_idx, True
+
+    @staticmethod
+    def _get_bridge_range(lines: List[str], river: str, reach: str, rs: str) -> tuple:
+        """Return (marker_idx, end_idx) for an existing bridge block."""
+        bridge_idx = GeomBridge._find_bridge(lines, river, reach, str(rs))
+        if bridge_idx is None:
+            raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
+        return bridge_idx, GeomBridge._find_structure_end(lines, bridge_idx)
+
+    @staticmethod
+    def _find_deck_block_range(lines: List[str], bridge_idx: int, bridge_end_idx: int) -> tuple:
+        """Return (start, end) for the deck block or (None, None)."""
+        for idx in range(bridge_idx, bridge_end_idx):
+            if lines[idx].startswith("Deck Dist Width WeirC"):
+                if idx + 1 >= bridge_end_idx:
+                    return idx, idx + 1
+
+                parts = GeomBridge._parse_csv_values(lines[idx + 1])
+                num_up = GeomBridge._parse_optional_int(parts[4]) if len(parts) > 4 else 0
+                num_dn = GeomBridge._parse_optional_int(parts[5]) if len(parts) > 5 else 0
+                num_up = num_up or 0
+                num_dn = num_dn or 0
+
+                end_idx = idx + 2
+                try:
+                    for count in (num_up, num_up, num_up, num_dn, num_dn, num_dn):
+                        if count > 0:
+                            _, end_idx = GeomBridge._read_fixed_width_values(lines, end_idx, count)
+                except ValueError:
+                    end_idx = idx + 2
+                    while end_idx < bridge_end_idx and '=' not in lines[end_idx]:
+                        end_idx += 1
+
+                return idx, end_idx
+
+        return None, None
+
+    @staticmethod
+    def _find_pier_block_ranges(lines: List[str], bridge_idx: int, bridge_end_idx: int) -> List[tuple]:
+        """Return ranges for all pier blocks in a bridge."""
+        ranges = []
+        idx = bridge_idx
+
+        while idx < bridge_end_idx:
+            if not lines[idx].startswith("Pier Skew, UpSta & Num, DnSta & Num="):
+                idx += 1
+                continue
+
+            parts = GeomBridge._parse_csv_values(lines[idx])
+            num_up = GeomBridge._parse_optional_int(parts[2]) if len(parts) > 2 else 0
+            num_dn = GeomBridge._parse_optional_int(parts[4]) if len(parts) > 4 else 0
+            num_up = num_up or 0
+            num_dn = num_dn or 0
+
+            end_idx = idx + 1
+            try:
+                for count in (num_up, num_up, num_dn, num_dn):
+                    if count > 0:
+                        _, end_idx = GeomBridge._read_fixed_width_values(lines, end_idx, count)
+            except ValueError:
+                end_idx = idx + 1
+                while end_idx < bridge_end_idx and '=' not in lines[end_idx]:
+                    end_idx += 1
+
+            ranges.append((idx, end_idx))
+            idx = end_idx
+
+        return ranges
+
+    @staticmethod
+    def _find_abutment_block_ranges(lines: List[str], bridge_idx: int, bridge_end_idx: int) -> List[tuple]:
+        """Return ranges for all abutment blocks in a bridge."""
+        ranges = []
+        idx = bridge_idx
+
+        while idx < bridge_end_idx:
+            if not lines[idx].startswith("Abutment Skew #Up #Dn="):
+                idx += 1
+                continue
+
+            parts = GeomBridge._parse_csv_values(lines[idx])
+            num_up = GeomBridge._parse_optional_int(parts[1]) if len(parts) > 1 else 0
+            num_dn = GeomBridge._parse_optional_int(parts[2]) if len(parts) > 2 else 0
+            num_up = num_up or 0
+            num_dn = num_dn or 0
+
+            end_idx = idx + 1
+            try:
+                for count in (num_up, num_up, num_dn, num_dn):
+                    if count > 0:
+                        _, end_idx = GeomBridge._read_fixed_width_values(lines, end_idx, count)
+            except ValueError:
+                end_idx = idx + 1
+                while end_idx < bridge_end_idx and '=' not in lines[end_idx]:
+                    end_idx += 1
+
+            ranges.append((idx, end_idx))
+            idx = end_idx
+
+        return ranges
+
+    @staticmethod
+    def _find_approach_block_ranges(lines: List[str], bridge_idx: int, bridge_end_idx: int) -> List[tuple]:
+        """Return ranges for embedded BR U/BR D approach section blocks."""
+        ranges = []
+        idx = bridge_idx
+
+        while idx < bridge_end_idx:
+            if not (lines[idx].startswith("BR U ") or lines[idx].startswith("BR D ")):
+                idx += 1
+                continue
+
+            end_idx = idx + 1
+            if "#Sta/Elev=" in lines[idx]:
+                count = GeomBridge._parse_optional_int(lines[idx].split('=', 1)[1])
+                if count:
+                    try:
+                        _, end_idx = GeomBridge._read_fixed_width_values(lines, idx + 1, count * 2)
+                    except ValueError:
+                        end_idx = idx + 1
+            elif "#Mann=" in lines[idx]:
+                values = GeomBridge._parse_csv_values(lines[idx])
+                count = GeomBridge._parse_optional_int(values[0]) if values else 0
+                if count:
+                    try:
+                        _, end_idx = GeomBridge._read_fixed_width_values(lines, idx + 1, count * 3)
+                    except ValueError:
+                        end_idx = idx + 1
+            elif "#XS Ineff=" in lines[idx]:
+                end_idx = idx + 1
+                while end_idx < bridge_end_idx and '=' not in lines[end_idx]:
+                    end_idx += 1
+
+            ranges.append((idx, end_idx))
+            idx = end_idx
+
+        return ranges
+
+    @staticmethod
+    def _remove_ranges(lines: List[str], ranges: List[tuple]) -> List[str]:
+        """Remove ranges from a line list, processing from bottom to top."""
+        modified = lines.copy()
+        for start_idx, end_idx in sorted(ranges, reverse=True):
+            del modified[start_idx:end_idx]
+        return modified
+
+    @staticmethod
+    def _insert_index_for_bridge_section(lines: List[str],
+                                         bridge_idx: int,
+                                         bridge_end_idx: int,
+                                         section: str) -> int:
+        """Find the insertion index for a bridge sub-section using canonical order."""
+        section_order = {
+            'deck': 0,
+            'piers': 1,
+            'abutments': 2,
+            'approach': 3,
+            'coefficients': 4,
+            'htab': 5,
+        }
+        prefixes = [
+            ('deck', ("Deck Dist Width WeirC",)),
+            ('piers', ("Pier Skew, UpSta & Num, DnSta & Num=",)),
+            ('abutments', ("Abutment Skew #Up #Dn=",)),
+            ('approach', ("BR U ", "BR D ")),
+            ('coefficients', ("BR Coef=", "WSPro=", "BC Design=")),
+            ('htab', ("BC HTab ", "BC Use User HTab Curves=", "BC User HTab ")),
+        ]
+        target_order = section_order[section]
+
+        for idx in range(bridge_idx + 1, bridge_end_idx):
+            for name, section_prefixes in prefixes:
+                if section_order[name] > target_order and lines[idx].startswith(section_prefixes):
+                    return idx
+
+        return bridge_end_idx
 
     @staticmethod
     @log_call
@@ -213,6 +923,9 @@ class GeomBridge:
                         'RS': last_rs,
                         'NodeName': last_node_name,
                         'NumDecks': None,
+                        'NumUpstreamDeckPoints': None,
+                        'NumDownstreamDeckPoints': None,
+                        'DeckDistance': None,
                         'DeckWidth': None,
                         'WeirCoefficient': None,
                         'Skew': None,
@@ -223,47 +936,43 @@ class GeomBridge:
                         'NodeLastEdited': last_edited
                     }
 
-                    pier_count = 0
-                    for j in range(i + 1, min(i + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines))):
+                    bridge_end_idx = GeomBridge._find_structure_end(lines, i)
+                    deck_start, _ = GeomBridge._find_deck_block_range(lines, i, bridge_end_idx)
+                    if deck_start is not None and deck_start + 1 < bridge_end_idx:
+                        parts = GeomBridge._parse_csv_values(lines[deck_start + 1])
+
+                        if len(parts) > 0:
+                            bridge_data['DeckDistance'] = GeomBridge._parse_optional_float(parts[0])
+                        if len(parts) > 1:
+                            bridge_data['DeckWidth'] = GeomBridge._parse_optional_float(parts[1])
+                        if len(parts) > 2:
+                            bridge_data['WeirCoefficient'] = GeomBridge._parse_optional_float(parts[2])
+                        if len(parts) > 3:
+                            bridge_data['Skew'] = GeomBridge._parse_optional_float(parts[3])
+                        if len(parts) > 4:
+                            bridge_data['NumUpstreamDeckPoints'] = GeomBridge._parse_optional_int(parts[4])
+                        if len(parts) > 5:
+                            bridge_data['NumDownstreamDeckPoints'] = GeomBridge._parse_optional_int(parts[5])
+                        if len(parts) > 8:
+                            bridge_data['MaxSubmergence'] = GeomBridge._parse_optional_float(parts[8])
+
+                        bridge_data['NumDecks'] = (
+                            bridge_data['NumUpstreamDeckPoints'] or
+                            bridge_data['NumDownstreamDeckPoints']
+                        )
+
+                    bridge_data['NumPiers'] = len(GeomBridge._find_pier_block_ranges(lines, i, bridge_end_idx))
+                    bridge_data['HasAbutment'] = bool(GeomBridge._find_abutment_block_ranges(lines, i, bridge_end_idx))
+
+                    for j in range(i + 1, bridge_end_idx):
                         search_line = lines[j]
 
-                        if search_line.startswith("Deck Dist Width WeirC"):
-                            if j + 1 < len(lines):
-                                param_line = lines[j + 1]
-                                parts = [p.strip() for p in param_line.split(',')]
-
-                                if len(parts) > 0 and parts[0]:
-                                    try: bridge_data['NumDecks'] = int(parts[0])
-                                    except: pass
-                                if len(parts) > 2 and parts[2]:
-                                    try: bridge_data['DeckWidth'] = float(parts[2])
-                                    except: pass
-                                if len(parts) > 3 and parts[3]:
-                                    try: bridge_data['WeirCoefficient'] = float(parts[3])
-                                    except: pass
-                                if len(parts) > 4 and parts[4]:
-                                    try: bridge_data['Skew'] = float(parts[4])
-                                    except: pass
-                                if len(parts) > 9 and parts[9]:
-                                    try: bridge_data['MaxSubmergence'] = float(parts[9])
-                                    except: pass
-
-                        elif search_line.startswith("Pier Skew, UpSta & Num"):
-                            pier_count += 1
-
-                        elif search_line.startswith("Abutment Skew #Up #Dn="):
-                            bridge_data['HasAbutment'] = True
-
-                        elif search_line.startswith("BC HTab HWMax="):
+                        if search_line.startswith("BC HTab HWMax="):
                             val = GeomParser.extract_keyword_value(search_line, "BC HTab HWMax")
                             if val:
                                 try: bridge_data['HTabHWMax'] = float(val)
                                 except: pass
 
-                        elif search_line.startswith("Type RM Length L Ch R ="):
-                            break
-
-                    bridge_data['NumPiers'] = pier_count
                     bridges.append(bridge_data)
                     last_node_name = None
                     last_edited = None
@@ -326,85 +1035,50 @@ class GeomBridge:
                 raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
 
             deck_data = []
+            bridge_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            deck_start, _ = GeomBridge._find_deck_block_range(lines, bridge_idx, bridge_end_idx)
 
-            for j in range(bridge_idx, min(bridge_idx + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines))):
-                line = lines[j]
+            if deck_start is None or deck_start + 1 >= bridge_end_idx:
+                df = pd.DataFrame(deck_data)
+                logger.debug(f"No deck geometry found for {river}/{reach}/RS {rs}")
+                return df
 
-                if line.startswith("Deck Dist Width WeirC"):
-                    if j + 1 < len(lines):
-                        param_line = lines[j + 1]
-                        parts = [p.strip() for p in param_line.split(',')]
+            parts = GeomBridge._parse_csv_values(lines[deck_start + 1])
+            num_up = GeomBridge._parse_optional_int(parts[4]) if len(parts) > 4 else 0
+            num_dn = GeomBridge._parse_optional_int(parts[5]) if len(parts) > 5 else 0
+            num_up = num_up or 0
+            num_dn = num_dn or 0
 
-                        num_up = 0
-                        num_dn = 0
-                        if len(parts) > 5 and parts[5]:
-                            try: num_up = int(parts[5])
-                            except: pass
-                        if len(parts) > 6 and parts[6]:
-                            try: num_dn = int(parts[6])
-                            except: pass
+            data_idx = deck_start + 2
 
-                        # Read upstream data
-                        if num_up > 0:
-                            data_start = j + 2
-                            all_up_values = []
+            if num_up > 0:
+                stations, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
+                elevations, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
+                lowchords, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
 
-                            for k in range(data_start, min(data_start + 10, len(lines))):
-                                data_line = lines[k]
-                                if '=' in data_line:
-                                    break
-                                values = GeomParser.parse_fixed_width(data_line, 8)
-                                all_up_values.extend(values)
-                                if len(all_up_values) >= num_up * 3:
-                                    break
+                for idx in range(min(len(stations), len(elevations), len(lowchords))):
+                    deck_data.append({
+                        'Location': 'upstream',
+                        'Station': stations[idx],
+                        'Elevation': elevations[idx],
+                        'LowChord': lowchords[idx]
+                    })
 
-                            if len(all_up_values) >= num_up * 3:
-                                stations = all_up_values[:num_up]
-                                elevations = all_up_values[num_up:num_up*2]
-                                lowchords = all_up_values[num_up*2:num_up*3]
+            if num_dn > 0:
+                stations, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
+                elevations, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
+                lowchords, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
 
-                                for idx in range(min(len(stations), len(elevations), len(lowchords))):
-                                    deck_data.append({
-                                        'Location': 'upstream',
-                                        'Station': stations[idx],
-                                        'Elevation': elevations[idx],
-                                        'LowChord': lowchords[idx]
-                                    })
-
-                        # Read downstream data
-                        if num_dn > 0 and num_up > 0:
-                            expected_up_lines = (num_up * 3 + 9) // 10 + 1
-                            dn_start = j + 2 + expected_up_lines
-
-                            all_dn_values = []
-                            for k in range(dn_start, min(dn_start + 10, len(lines))):
-                                if k >= len(lines):
-                                    break
-                                data_line = lines[k]
-                                if '=' in data_line or data_line.startswith("Pier"):
-                                    break
-                                values = GeomParser.parse_fixed_width(data_line, 8)
-                                all_dn_values.extend(values)
-                                if len(all_dn_values) >= num_dn * 3:
-                                    break
-
-                            if len(all_dn_values) >= num_dn * 3:
-                                stations = all_dn_values[:num_dn]
-                                elevations = all_dn_values[num_dn:num_dn*2]
-                                lowchords = all_dn_values[num_dn*2:num_dn*3]
-
-                                for idx in range(min(len(stations), len(elevations), len(lowchords))):
-                                    deck_data.append({
-                                        'Location': 'downstream',
-                                        'Station': stations[idx],
-                                        'Elevation': elevations[idx],
-                                        'LowChord': lowchords[idx]
-                                    })
-
-                    break
+                for idx in range(min(len(stations), len(elevations), len(lowchords))):
+                    deck_data.append({
+                        'Location': 'downstream',
+                        'Station': stations[idx],
+                        'Elevation': elevations[idx],
+                        'LowChord': lowchords[idx]
+                    })
 
             df = pd.DataFrame(deck_data)
-            logger.info(f"Extracted deck geometry for {river}/{reach}/RS {rs}: {len(df)} points")
+            logger.debug(f"Extracted deck geometry for {river}/{reach}/RS {rs}: {len(df)} points")
             return df
 
         except FileNotFoundError:
@@ -462,78 +1136,46 @@ class GeomBridge:
 
             piers = []
             pier_index = 0
+            bridge_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            pier_ranges = GeomBridge._find_pier_block_ranges(lines, bridge_idx, bridge_end_idx)
 
-            i = bridge_idx
-            while i < min(bridge_idx + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines)):
-                line = lines[i]
+            for pier_start, _ in pier_ranges:
+                pier_index += 1
+                line = lines[pier_start]
+                parts = GeomBridge._parse_csv_values(line)
 
-                if line.startswith("Type RM Length L Ch R =") and i > bridge_idx + 5:
-                    break
+                pier_data = {
+                    'PierIndex': pier_index,
+                    'Skew': GeomBridge._parse_optional_float(parts[0]) if len(parts) > 0 else None,
+                    'UpstreamStation': GeomBridge._parse_optional_float(parts[1]) if len(parts) > 1 else None,
+                    'NumUpstreamPoints': GeomBridge._parse_optional_int(parts[2]) if len(parts) > 2 else 0,
+                    'DownstreamStation': GeomBridge._parse_optional_float(parts[3]) if len(parts) > 3 else None,
+                    'NumDownstreamPoints': GeomBridge._parse_optional_int(parts[4]) if len(parts) > 4 else 0,
+                    'UpstreamWidths': [],
+                    'UpstreamElevations': [],
+                    'DownstreamWidths': [],
+                    'DownstreamElevations': []
+                }
 
-                if line.startswith("Pier Skew, UpSta & Num, DnSta & Num="):
-                    pier_index += 1
+                num_up = pier_data['NumUpstreamPoints'] or 0
+                num_dn = pier_data['NumDownstreamPoints'] or 0
+                data_idx = pier_start + 1
 
-                    value_str = GeomParser.extract_keyword_value(line, "Pier Skew, UpSta & Num, DnSta & Num")
-                    parts = [p.strip() for p in value_str.split(',')]
+                if num_up > 0:
+                    pier_data['UpstreamWidths'], data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
+                    pier_data['UpstreamElevations'], data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
 
-                    pier_data = {
-                        'PierIndex': pier_index,
-                        'UpstreamStation': None,
-                        'NumUpstreamPoints': 0,
-                        'DownstreamStation': None,
-                        'NumDownstreamPoints': 0,
-                        'UpstreamWidths': [],
-                        'UpstreamElevations': [],
-                        'DownstreamWidths': [],
-                        'DownstreamElevations': []
-                    }
+                if num_dn > 0:
+                    pier_data['DownstreamWidths'], data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
+                    pier_data['DownstreamElevations'], data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
 
-                    if len(parts) > 1 and parts[1]:
-                        try: pier_data['UpstreamStation'] = float(parts[1])
-                        except: pass
-                    if len(parts) > 2 and parts[2]:
-                        try: pier_data['NumUpstreamPoints'] = int(parts[2])
-                        except: pass
-                    if len(parts) > 3 and parts[3]:
-                        try: pier_data['DownstreamStation'] = float(parts[3])
-                        except: pass
-                    if len(parts) > 4 and parts[4]:
-                        try: pier_data['NumDownstreamPoints'] = int(parts[4])
-                        except: pass
-
-                    num_up = pier_data['NumUpstreamPoints']
-                    num_dn = pier_data['NumDownstreamPoints']
-
-                    if num_up > 0 and i + 2 < len(lines):
-                        widths_line = lines[i + 1]
-                        if '=' not in widths_line:
-                            pier_data['UpstreamWidths'] = GeomParser.parse_fixed_width(widths_line, 8)[:num_up]
-
-                        if i + 2 < len(lines):
-                            elev_line = lines[i + 2]
-                            if '=' not in elev_line:
-                                pier_data['UpstreamElevations'] = GeomParser.parse_fixed_width(elev_line, 8)[:num_up]
-
-                    if num_dn > 0 and i + 4 < len(lines):
-                        widths_line = lines[i + 3]
-                        if '=' not in widths_line:
-                            pier_data['DownstreamWidths'] = GeomParser.parse_fixed_width(widths_line, 8)[:num_dn]
-
-                        if i + 4 < len(lines):
-                            elev_line = lines[i + 4]
-                            if '=' not in elev_line:
-                                pier_data['DownstreamElevations'] = GeomParser.parse_fixed_width(elev_line, 8)[:num_dn]
-
-                    piers.append(pier_data)
-                    i += 4
-
-                i += 1
+                piers.append(pier_data)
 
             if not piers:
                 raise ValueError(f"No piers found for bridge: {river}/{reach}/RS {rs}")
 
             df = pd.DataFrame(piers)
-            logger.info(f"Extracted {len(df)} piers for {river}/{reach}/RS {rs}")
+            logger.debug(f"Extracted {len(df)} piers for {river}/{reach}/RS {rs}")
             return df
 
         except FileNotFoundError:
@@ -588,65 +1230,51 @@ class GeomBridge:
                 raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
 
             abutment_data = []
+            bridge_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            abutment_ranges = GeomBridge._find_abutment_block_ranges(lines, bridge_idx, bridge_end_idx)
 
-            for j in range(bridge_idx, min(bridge_idx + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines))):
-                line = lines[j]
+            for abutment_index, (abutment_start, _) in enumerate(abutment_ranges, start=1):
+                line = lines[abutment_start]
+                parts = GeomBridge._parse_csv_values(line)
 
-                if line.startswith("Type RM Length L Ch R =") and j > bridge_idx + 5:
-                    break
+                skew = GeomBridge._parse_optional_float(parts[0]) if len(parts) > 0 else None
+                num_up = GeomBridge._parse_optional_int(parts[1]) if len(parts) > 1 else 0
+                num_dn = GeomBridge._parse_optional_int(parts[2]) if len(parts) > 2 else 0
+                num_up = num_up or 0
+                num_dn = num_dn or 0
+                data_idx = abutment_start + 1
 
-                if line.startswith("Abutment Skew #Up #Dn="):
-                    value_str = GeomParser.extract_keyword_value(line, "Abutment Skew #Up #Dn")
-                    parts = [p.strip() for p in value_str.split(',')]
+                if num_up > 0:
+                    stations, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
+                    params, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_up)
 
-                    num_up = 0
-                    num_dn = 0
-                    if len(parts) > 0 and parts[0]:
-                        try: num_up = int(parts[0])
-                        except: pass
-                    if len(parts) > 1 and parts[1]:
-                        try: num_dn = int(parts[1])
-                        except: pass
+                    for idx in range(min(len(stations), len(params))):
+                        abutment_data.append({
+                            'AbutmentIndex': abutment_index,
+                            'Skew': skew,
+                            'Location': 'upstream',
+                            'Station': stations[idx],
+                            'Parameter': params[idx]
+                        })
 
-                    if num_up > 0 and j + 2 < len(lines):
-                        sta_line = lines[j + 1]
-                        if '=' not in sta_line:
-                            stations = GeomParser.parse_fixed_width(sta_line, 8)[:num_up]
+                if num_dn > 0:
+                    stations, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
+                    params, data_idx = GeomBridge._read_fixed_width_values(lines, data_idx, num_dn)
 
-                        param_line = lines[j + 2]
-                        if '=' not in param_line:
-                            params = GeomParser.parse_fixed_width(param_line, 8)[:num_up]
-
-                        for idx in range(min(len(stations), len(params))):
-                            abutment_data.append({
-                                'Location': 'upstream',
-                                'Station': stations[idx],
-                                'Parameter': params[idx]
-                            })
-
-                    if num_dn > 0 and j + 4 < len(lines):
-                        sta_line = lines[j + 3]
-                        if '=' not in sta_line:
-                            stations = GeomParser.parse_fixed_width(sta_line, 8)[:num_dn]
-
-                        param_line = lines[j + 4]
-                        if '=' not in param_line:
-                            params = GeomParser.parse_fixed_width(param_line, 8)[:num_dn]
-
-                        for idx in range(min(len(stations), len(params))):
-                            abutment_data.append({
-                                'Location': 'downstream',
-                                'Station': stations[idx],
-                                'Parameter': params[idx]
-                            })
-
-                    break
+                    for idx in range(min(len(stations), len(params))):
+                        abutment_data.append({
+                            'AbutmentIndex': abutment_index,
+                            'Skew': skew,
+                            'Location': 'downstream',
+                            'Station': stations[idx],
+                            'Parameter': params[idx]
+                        })
 
             if not abutment_data:
                 raise ValueError(f"No abutment found for bridge: {river}/{reach}/RS {rs}")
 
             df = pd.DataFrame(abutment_data)
-            logger.info(f"Extracted abutment for {river}/{reach}/RS {rs}: {len(df)} points")
+            logger.debug(f"Extracted abutment for {river}/{reach}/RS {rs}: {len(df)} points")
             return df
 
         except FileNotFoundError:
@@ -702,25 +1330,17 @@ class GeomBridge:
                 raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
 
             approach_data = []
+            bridge_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
 
-            for j in range(bridge_idx, min(bridge_idx + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines))):
+            for j in range(bridge_idx, bridge_end_idx):
                 line = lines[j]
-
-                if line.startswith("Type RM Length L Ch R =") and j > bridge_idx + 5:
-                    break
 
                 # Upstream station/elevation
                 if line.startswith("BR U #Sta/Elev="):
                     count_str = GeomParser.extract_keyword_value(line, "BR U #Sta/Elev")
                     count = int(count_str.strip())
 
-                    values = []
-                    k = j + 1
-                    while len(values) < count * 2 and k < len(lines):
-                        if '=' in lines[k]:
-                            break
-                        values.extend(GeomParser.parse_fixed_width(lines[k], 8))
-                        k += 1
+                    values, _ = GeomBridge._read_fixed_width_values(lines, j + 1, count * 2)
 
                     stations = values[0::2]
                     elevations = values[1::2]
@@ -741,13 +1361,7 @@ class GeomBridge:
                     count_str = GeomParser.extract_keyword_value(line, "BR D #Sta/Elev")
                     count = int(count_str.strip())
 
-                    values = []
-                    k = j + 1
-                    while len(values) < count * 2 and k < len(lines):
-                        if '=' in lines[k]:
-                            break
-                        values.extend(GeomParser.parse_fixed_width(lines[k], 8))
-                        k += 1
+                    values, _ = GeomBridge._read_fixed_width_values(lines, j + 1, count * 2)
 
                     stations = values[0::2]
                     elevations = values[1::2]
@@ -762,6 +1376,44 @@ class GeomBridge:
                             'LeftBank': None,
                             'RightBank': None
                         })
+
+                # Upstream Manning's n
+                elif line.startswith("BR U #Mann="):
+                    value_str = GeomParser.extract_keyword_value(line, "BR U #Mann")
+                    count_values = [v.strip() for v in value_str.split(',')]
+                    count = int(count_values[0]) if count_values and count_values[0] else 0
+
+                    values, _ = GeomBridge._read_fixed_width_values(lines, j + 1, count * 3)
+                    for idx in range(0, len(values), 3):
+                        if idx + 1 < len(values):
+                            approach_data.append({
+                                'Location': 'upstream',
+                                'DataType': 'mannings_n',
+                                'Station': values[idx],
+                                'Elevation': None,
+                                'N_Value': values[idx + 1],
+                                'LeftBank': None,
+                                'RightBank': None
+                            })
+
+                # Downstream Manning's n
+                elif line.startswith("BR D #Mann="):
+                    value_str = GeomParser.extract_keyword_value(line, "BR D #Mann")
+                    count_values = [v.strip() for v in value_str.split(',')]
+                    count = int(count_values[0]) if count_values and count_values[0] else 0
+
+                    values, _ = GeomBridge._read_fixed_width_values(lines, j + 1, count * 3)
+                    for idx in range(0, len(values), 3):
+                        if idx + 1 < len(values):
+                            approach_data.append({
+                                'Location': 'downstream',
+                                'DataType': 'mannings_n',
+                                'Station': values[idx],
+                                'Elevation': None,
+                                'N_Value': values[idx + 1],
+                                'LeftBank': None,
+                                'RightBank': None
+                            })
 
                 # Upstream banks
                 elif line.startswith("BR U Banks="):
@@ -796,7 +1448,7 @@ class GeomBridge:
                     })
 
             df = pd.DataFrame(approach_data)
-            logger.info(f"Extracted approach sections for {river}/{reach}/RS {rs}")
+            logger.debug(f"Extracted approach sections for {river}/{reach}/RS {rs}")
             return df
 
         except FileNotFoundError:
@@ -806,6 +1458,212 @@ class GeomBridge:
         except Exception as e:
             logger.error(f"Error reading approach sections: {str(e)}")
             raise IOError(f"Failed to read approach sections: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def get_bridge_opening_xs(geom_file: Union[str, Path],
+                              river: str,
+                              reach: str,
+                              rs: str,
+                              section: str = 'upstream') -> pd.DataFrame:
+        """
+        Extract the ground profile inside the bridge opening for a 1D bridge.
+
+        In HEC-RAS 1D bridge modeling, sections 2 and 3 represent the ground
+        profile at the downstream and upstream faces of the bridge opening.
+        These are stored as BR D / BR U #Sta/Elev records in the bridge block.
+        When no explicit inside-bridge XS data exists, the method falls back to
+        the nearest regular cross-section in the appropriate direction.
+
+        Inside-bridge sections are typically initialized as copies of the
+        approach cross-sections when a bridge is first created in HEC-RAS, but
+        users may edit them independently.
+
+        Parameters:
+            geom_file: Path to geometry file (.g##)
+            river: River name (case-sensitive)
+            reach: Reach name (case-sensitive)
+            rs: River station (as string)
+            section: 'upstream' for section 3 (upstream face) or
+                     'downstream' for section 2 (downstream face)
+
+        Returns:
+            pd.DataFrame with columns:
+            - Station: Cross-section station (float)
+            - Elevation: Ground elevation (float)
+            - Source: 'bridge_block' if from BR U/BR D data,
+                      'approach_xs' if from adjacent regular cross-section
+
+        Raises:
+            FileNotFoundError: If geometry file doesn't exist
+            ValueError: If bridge not found, invalid section, or no XS data available
+
+        Example:
+            >>> xs = GeomBridge.get_bridge_opening_xs("model.g01", "River", "Reach", "5.4")
+            >>> print(f"Section 3 has {len(xs)} points, source: {xs['Source'].iloc[0]}")
+            >>> downstream = GeomBridge.get_bridge_opening_xs(
+            ...     "model.g01", "River", "Reach", "5.4", section='downstream'
+            ... )
+        """
+        geom_file = Path(geom_file)
+        section = section.lower()
+
+        if section not in ('upstream', 'downstream'):
+            raise ValueError(f"section must be 'upstream' or 'downstream', got '{section}'")
+
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx = GeomBridge._find_bridge(lines, river, reach, rs)
+            if bridge_idx is None:
+                raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
+
+            struct_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+
+            keyword = "BR U #Sta/Elev" if section == 'upstream' else "BR D #Sta/Elev"
+            stations, elevations = GeomBridge._parse_bridge_xs_block(
+                lines, bridge_idx, struct_end_idx, keyword
+            )
+
+            if stations:
+                df = pd.DataFrame({
+                    'Station': stations,
+                    'Elevation': elevations,
+                    'Source': 'bridge_block'
+                })
+                logger.info(
+                    f"Extracted {section} bridge opening XS ({len(df)} pts) "
+                    f"for {river}/{reach}/RS {rs} from bridge block"
+                )
+                return df
+
+            stations, elevations = GeomBridge._parse_adjacent_xs(
+                lines, bridge_idx, section
+            )
+
+            if stations:
+                df = pd.DataFrame({
+                    'Station': stations,
+                    'Elevation': elevations,
+                    'Source': 'approach_xs'
+                })
+                logger.info(
+                    f"Extracted {section} bridge opening XS ({len(df)} pts) "
+                    f"for {river}/{reach}/RS {rs} from adjacent approach XS"
+                )
+                return df
+
+            raise ValueError(
+                f"No inside-bridge or adjacent approach XS data found "
+                f"for {section} face of bridge {river}/{reach}/RS {rs}"
+            )
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error reading bridge opening XS: {str(e)}")
+            raise IOError(f"Failed to read bridge opening XS: {str(e)}")
+
+    @staticmethod
+    def _parse_bridge_xs_block(
+        lines: List[str],
+        bridge_idx: int,
+        struct_end_idx: int,
+        keyword: str
+    ) -> tuple:
+        """Parse BR U/BR D #Sta/Elev block, returning (stations, elevations) lists."""
+        for j in range(bridge_idx, struct_end_idx):
+            line = lines[j]
+            if line.startswith(f"{keyword}="):
+                count_str = GeomParser.extract_keyword_value(line, keyword)
+                count = int(count_str.strip())
+
+                values = []
+                k = j + 1
+                while len(values) < count * 2 and k < len(lines):
+                    if '=' in lines[k]:
+                        break
+                    values.extend(GeomParser.parse_fixed_width(lines[k], 8))
+                    k += 1
+
+                stations = values[0::2]
+                elevations = values[1::2]
+                n = min(len(stations), len(elevations))
+                return stations[:n], elevations[:n]
+
+        return [], []
+
+    @staticmethod
+    def _parse_adjacent_xs(
+        lines: List[str],
+        bridge_idx: int,
+        section: str
+    ) -> tuple:
+        """Find the nearest regular XS adjacent to the bridge and parse its station/elevation data.
+
+        For 'upstream', searches backward from the bridge marker to find the
+        preceding "Type RM Length L Ch R = 1" entry (regular XS). For 'downstream',
+        searches forward past the bridge block.
+        """
+        if section == 'upstream':
+            xs_header_idx = None
+            for i in range(bridge_idx - 1, -1, -1):
+                if lines[i].startswith("Type RM Length L Ch R ="):
+                    val = GeomParser.extract_keyword_value(lines[i], "Type RM Length L Ch R")
+                    parts = [p.strip() for p in val.split(',')]
+                    if parts and parts[0] == '1':
+                        xs_header_idx = i
+                        break
+            if xs_header_idx is None:
+                return [], []
+
+            search_end = bridge_idx
+        else:
+            struct_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            xs_header_idx = None
+            for i in range(struct_end_idx, min(struct_end_idx + GeomBridge.MAX_PARSE_LINES, len(lines))):
+                if lines[i].startswith("Type RM Length L Ch R ="):
+                    val = GeomParser.extract_keyword_value(lines[i], "Type RM Length L Ch R")
+                    parts = [p.strip() for p in val.split(',')]
+                    if parts and parts[0] == '1':
+                        xs_header_idx = i
+                        break
+            if xs_header_idx is None:
+                return [], []
+
+            next_end = len(lines)
+            for i in range(xs_header_idx + 1, min(xs_header_idx + GeomBridge.MAX_PARSE_LINES, len(lines))):
+                if lines[i].startswith("Type RM Length L Ch R =") or lines[i].startswith("River Reach="):
+                    next_end = i
+                    break
+            search_end = next_end
+
+        for j in range(xs_header_idx, search_end):
+            line = lines[j]
+            if line.startswith("#Sta/Elev="):
+                count_str = GeomParser.extract_keyword_value(line, "#Sta/Elev")
+                count = int(count_str.strip())
+
+                values = []
+                k = j + 1
+                while len(values) < count * 2 and k < len(lines):
+                    if '=' in lines[k]:
+                        break
+                    values.extend(GeomParser.parse_fixed_width(lines[k], 8))
+                    k += 1
+
+                stations = values[0::2]
+                elevations = values[1::2]
+                n = min(len(stations), len(elevations))
+                return stations[:n], elevations[:n]
+
+        return [], []
 
     @staticmethod
     @log_call
@@ -852,12 +1710,10 @@ class GeomBridge:
                 raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
 
             coef_data = []
+            bridge_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
 
-            for j in range(bridge_idx, min(bridge_idx + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines))):
+            for j in range(bridge_idx, bridge_end_idx):
                 line = lines[j]
-
-                if line.startswith("Type RM Length L Ch R =") and j > bridge_idx + 5:
-                    break
 
                 if line.startswith("BR Coef="):
                     val = GeomParser.extract_keyword_value(line, "BR Coef")
@@ -907,7 +1763,7 @@ class GeomBridge:
                             })
 
             df = pd.DataFrame(coef_data)
-            logger.info(f"Extracted coefficients for {river}/{reach}/RS {rs}")
+            logger.debug(f"Extracted coefficients for {river}/{reach}/RS {rs}")
             return df
 
         except FileNotFoundError:
@@ -917,6 +1773,482 @@ class GeomBridge:
         except Exception as e:
             logger.error(f"Error reading bridge coefficients: {str(e)}")
             raise IOError(f"Failed to read bridge coefficients: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def get_hydraulic_methods(geom_file: Union[str, Path],
+                              river: str,
+                              reach: str,
+                              rs: str,
+                              opening_index: int = 0) -> Dict[str, Any]:
+        """
+        Read bridge hydraulic method selections from geometry text records.
+
+        This parser reads the bridge ``Bridge Culvert-`` marker, deck/weir
+        coefficient record, and the selected opening's ``BR Coef=`` and
+        ``WSPro=`` records. The ``BR Coef=`` record stores the selected
+        low-flow method code and high-flow method flag used by the Bridge
+        Modeling Approach editor.
+
+        Parameters:
+            geom_file: Path to geometry file (.g##)
+            river: River name (case-sensitive)
+            reach: Reach name (case-sensitive)
+            rs: River station (as string)
+            opening_index: Zero-based bridge opening/coefficient record index
+                when a bridge has multiple ``BR Coef=`` records (default 0)
+
+        Returns:
+            dict with keys:
+            - low_flow_method: one of ``energy``, ``momentum``, ``yarnell``,
+              ``wspro`` or None if no method code is present
+            - high_flow_method: ``energy`` or ``pressure_weir`` when available
+            - enabled_low_flow_methods: per-method compute flags from BR Coef
+            - coefficients: Momentum, Yarnell, pressure-flow, deck/weir, and
+              audit values
+            - deck: parsed values from the ``Deck Dist Width WeirC`` record
+            - wspro: named WSPRO fields, or None if no WSPro record exists
+            - raw: original method records and comma fields for audit
+
+        Raises:
+            FileNotFoundError: If geometry file doesn't exist
+            ValueError: If bridge or opening is not found
+            IOError: If file read fails
+
+        Example:
+            >>> methods = GeomBridge.get_hydraulic_methods(
+            ...     "model.g01", "Beaver Creek", "Kentwood", "5.4"
+            ... )
+            >>> methods["low_flow_method"]
+            'momentum'
+        """
+        geom_file = Path(geom_file)
+
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx = GeomBridge._find_bridge(lines, river, reach, rs)
+            if bridge_idx is None:
+                raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
+
+            struct_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            method_lines = GeomBridge._find_bridge_method_lines(
+                lines, bridge_idx, struct_end_idx, opening_index
+            )
+
+            br_coef_idx = method_lines['br_coef_idx']
+            wspro_idx = method_lines['wspro_idx']
+
+            if br_coef_idx is None:
+                if method_lines['br_coef_count'] == 0:
+                    raise ValueError(
+                        f"BR Coef= record not found for bridge {river}/{reach}/RS {rs}"
+                    )
+                raise ValueError(
+                    f"BR Coef= opening_index {opening_index} not found for "
+                    f"{river}/{reach}/RS {rs}; found {method_lines['br_coef_count']}"
+                )
+
+            br_coef_fields = GeomBridge._split_comma_fields_from_line(
+                lines[br_coef_idx], "BR Coef="
+            )
+            parsed = GeomBridge._parse_br_coef_fields(br_coef_fields)
+
+            wspro_fields = None
+            wspro = None
+            if wspro_idx is not None:
+                wspro_fields = GeomBridge._split_comma_fields_from_line(
+                    lines[wspro_idx], "WSPro="
+                )
+                wspro = GeomBridge._parse_wspro_fields(wspro_fields)
+
+            bridge_culvert_fields = GeomBridge._split_comma_fields_from_line(
+                lines[bridge_idx], "Bridge Culvert-"
+            )
+            deck_idx = GeomBridge._find_bridge_deck_line(lines, bridge_idx, struct_end_idx)
+            deck_fields = None
+            deck = None
+            if deck_idx is not None:
+                deck_body, _ = GeomBridge._split_line_ending(lines[deck_idx])
+                deck_fields = deck_body.split(',')
+                deck = GeomBridge._parse_bridge_deck_fields(deck_fields)
+                parsed['coefficients']['weir_coefficient'] = deck['weir_coefficient']
+            else:
+                parsed['coefficients']['weir_coefficient'] = None
+
+            result = {
+                'river': river,
+                'reach': reach,
+                'rs': str(rs),
+                'opening_index': opening_index,
+                'low_flow_method': parsed['low_flow_method'],
+                'low_flow_method_code': parsed['low_flow_method_code'],
+                'high_flow_method': parsed['high_flow_method'],
+                'use_high_standard_step': parsed['use_high_standard_step'],
+                'enabled_low_flow_methods': parsed['enabled_low_flow_methods'],
+                'coefficients': parsed['coefficients'],
+                'deck': deck,
+                'wspro': wspro,
+                'raw': {
+                    'bridge_culvert_line': lines[bridge_idx].rstrip('\r\n'),
+                    'bridge_culvert_fields': [field.strip() for field in bridge_culvert_fields],
+                    'bridge_culvert_flags': GeomBridge._parse_bridge_header(lines[bridge_idx]),
+                    'br_coef_line': lines[br_coef_idx].rstrip('\r\n'),
+                    'br_coef_fields': [field.strip() for field in br_coef_fields],
+                    'deck_line': lines[deck_idx].rstrip('\r\n') if deck_idx is not None else None,
+                    'deck_fields': (
+                        [field.strip() for field in deck_fields]
+                        if deck_fields is not None else None
+                    ),
+                    'wspro_line': lines[wspro_idx].rstrip('\r\n') if wspro_idx is not None else None,
+                    'wspro_fields': (
+                        [field.strip() for field in wspro_fields]
+                        if wspro_fields is not None else None
+                    ),
+                },
+            }
+
+            logger.debug(
+                f"Read bridge hydraulic methods for {river}/{reach}/RS {rs}: "
+                f"low={result['low_flow_method']}, high={result['high_flow_method']}"
+            )
+            return result
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error reading bridge hydraulic methods: {str(e)}")
+            raise IOError(f"Failed to read bridge hydraulic methods: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def set_hydraulic_methods(geom_file: Union[str, Path],
+                              river: str,
+                              reach: str,
+                              rs: str,
+                              low_flow_method: Optional[str] = None,
+                              high_flow_method: Optional[str] = None,
+                              use_energy: Optional[bool] = None,
+                              use_momentum: Optional[bool] = None,
+                              use_yarnell: Optional[bool] = None,
+                              use_wspro: Optional[bool] = None,
+                              momentum_cd: Optional[float] = None,
+                              yarnell_k: Optional[float] = None,
+                              pressure_flow_submerged_inlet_cd: Optional[float] = None,
+                              pressure_flow_submerged_inlet_outlet_cd: Optional[float] = None,
+                              weir_coefficient: Optional[float] = None,
+                              opening_index: int = 0,
+                              create_backup: bool = True,
+                              validate: bool = True) -> Dict[str, Any]:
+        """
+        Set bridge low-flow/high-flow hydraulic method selections.
+
+        Accepted ``low_flow_method`` values are ``energy``, ``momentum``,
+        ``yarnell``, and ``wspro``. Accepted ``high_flow_method`` values are
+        ``energy`` and ``pressure_weir``. Momentum and Yarnell selections
+        require an existing or supplied coefficient. Existing comma-field
+        spacing is preserved for updated ``BR Coef=`` and deck/weir fields,
+        and a ``.bak`` backup is created by default before writing.
+
+        Parameters:
+            geom_file: Path to geometry file (.g##)
+            river: River name (case-sensitive)
+            reach: Reach name (case-sensitive)
+            rs: River station (as string)
+            low_flow_method: Optional low-flow method selection
+            high_flow_method: Optional high-flow method selection
+            use_energy: Optional compute flag for the energy method
+            use_momentum: Optional compute flag for the momentum method
+            use_yarnell: Optional compute flag for the Yarnell method
+            use_wspro: Optional compute flag for the WSPRO method
+            momentum_cd: Optional momentum drag coefficient
+            yarnell_k: Optional Yarnell pier coefficient
+            pressure_flow_submerged_inlet_cd: Optional pressure-flow Cd
+            pressure_flow_submerged_inlet_outlet_cd: Optional pressure-flow Cd
+            weir_coefficient: Optional bridge deck/weir coefficient from the
+                ``Deck Dist Width WeirC`` record
+            opening_index: Zero-based bridge opening/coefficient record index
+            create_backup: Create ``.bak`` backup before writing (default True)
+            validate: Validate method names and unsupported combinations
+
+        Returns:
+            dict with before/after method dictionaries, changed line text, and
+            backup path.
+
+        Raises:
+            FileNotFoundError: If geometry file doesn't exist
+            ValueError: If bridge, method value, or combination is invalid
+            IOError: If file write fails
+
+        Example:
+            >>> GeomBridge.set_hydraulic_methods(
+            ...     "model.g01", "Beaver Creek", "Kentwood", "5.4",
+            ...     low_flow_method="yarnell",
+            ...     high_flow_method="energy",
+            ...     yarnell_k=1.05
+            ... )
+        """
+        geom_file = Path(geom_file)
+
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        normalized_low = GeomBridge._normalize_hydraulic_method(
+            low_flow_method,
+            set(GeomBridge.LOW_FLOW_METHOD_CODES),
+            'low_flow_method'
+        )
+        normalized_high = GeomBridge._normalize_hydraulic_method(
+            high_flow_method,
+            GeomBridge.HIGH_FLOW_METHODS,
+            'high_flow_method'
+        )
+
+        if all(value is None for value in [
+            normalized_low,
+            normalized_high,
+            use_energy,
+            use_momentum,
+            use_yarnell,
+            use_wspro,
+            momentum_cd,
+            yarnell_k,
+            pressure_flow_submerged_inlet_cd,
+            pressure_flow_submerged_inlet_outlet_cd,
+            weir_coefficient,
+        ]):
+            raise ValueError("At least one hydraulic method or coefficient must be specified")
+
+        if validate and weir_coefficient is not None and float(weir_coefficient) <= 0:
+            raise ValueError("weir_coefficient must be positive")
+
+        backup_path = None
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx = GeomBridge._find_bridge(lines, river, reach, rs)
+            if bridge_idx is None:
+                raise ValueError(f"Bridge not found: {river}/{reach}/RS {rs}")
+
+            struct_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            method_lines = GeomBridge._find_bridge_method_lines(
+                lines, bridge_idx, struct_end_idx, opening_index
+            )
+            br_coef_idx = method_lines['br_coef_idx']
+            wspro_idx = method_lines['wspro_idx']
+            deck_idx = GeomBridge._find_bridge_deck_line(lines, bridge_idx, struct_end_idx)
+            if weir_coefficient is not None and deck_idx is None:
+                raise ValueError(
+                    f"Deck Dist Width WeirC record not found for bridge {river}/{reach}/RS {rs}"
+                )
+
+            if br_coef_idx is None and method_lines['br_coef_count'] > 0:
+                raise ValueError(
+                    f"BR Coef= opening_index {opening_index} not found for "
+                    f"{river}/{reach}/RS {rs}; found {method_lines['br_coef_count']}"
+                )
+
+            inserted_br_coef = False
+            if br_coef_idx is None:
+                line_ending = '\n'
+                if bridge_idx < len(lines):
+                    _, line_ending = GeomBridge._split_line_ending(lines[bridge_idx])
+                    line_ending = line_ending or '\n'
+                br_coef_fields = GeomBridge._default_br_coef_fields()
+                insert_idx = GeomBridge._find_br_coef_insert_idx(lines, bridge_idx, struct_end_idx)
+                lines.insert(
+                    insert_idx,
+                    GeomBridge._format_comma_line("BR Coef=", br_coef_fields, line_ending)
+                )
+                br_coef_idx = insert_idx
+                inserted_br_coef = True
+                if wspro_idx is not None and wspro_idx >= insert_idx:
+                    wspro_idx += 1
+            else:
+                br_coef_fields = GeomBridge._split_comma_fields_from_line(
+                    lines[br_coef_idx], "BR Coef="
+                )
+
+            before_line = lines[br_coef_idx].rstrip('\r\n')
+            current = GeomBridge._parse_br_coef_fields(br_coef_fields)
+            before = None if inserted_br_coef else GeomBridge.get_hydraulic_methods(
+                geom_file, river, reach, rs, opening_index=opening_index
+            )
+
+            if validate and normalized_low == 'momentum':
+                effective_momentum_cd = (
+                    momentum_cd
+                    if momentum_cd is not None
+                    else current['coefficients']['momentum_cd']
+                )
+                if effective_momentum_cd is None:
+                    raise ValueError(
+                        "low_flow_method 'momentum' requires momentum_cd when no "
+                        "existing momentum Cd is set"
+                    )
+
+            if validate and normalized_low == 'yarnell':
+                effective_yarnell_k = (
+                    yarnell_k
+                    if yarnell_k is not None
+                    else current['coefficients']['yarnell_k']
+                )
+                if effective_yarnell_k is None:
+                    raise ValueError(
+                        "low_flow_method 'yarnell' requires yarnell_k when no "
+                        "existing Yarnell K is set"
+                    )
+
+            explicit_enabled = {
+                'energy': use_energy,
+                'momentum': use_momentum,
+                'yarnell': use_yarnell,
+                'wspro': use_wspro,
+            }
+            enabled = dict(current['enabled_low_flow_methods'])
+
+            for method_name, flag_value in explicit_enabled.items():
+                if flag_value is not None:
+                    enabled[method_name] = bool(flag_value)
+
+            if normalized_low is not None:
+                if explicit_enabled.get(normalized_low) is False:
+                    raise ValueError(
+                        f"selected low_flow_method '{normalized_low}' cannot be disabled"
+                    )
+                enabled[normalized_low] = True
+
+            method_to_validate = normalized_low or current['low_flow_method']
+            require_selected_enabled = (
+                normalized_low is not None or
+                (method_to_validate is not None and explicit_enabled.get(method_to_validate) is False)
+            )
+            if validate:
+                GeomBridge._validate_hydraulic_method_selection(
+                    method_to_validate,
+                    normalized_high,
+                    enabled,
+                    wspro_idx,
+                    require_selected_enabled=require_selected_enabled,
+                )
+
+            flag_fields = {
+                'energy': 0,
+                'momentum': 1,
+                'yarnell': 2,
+                'wspro': 4,
+            }
+            for method_name, field_idx in flag_fields.items():
+                if explicit_enabled.get(method_name) is not None or normalized_low == method_name:
+                    existing = br_coef_fields[field_idx] if field_idx < len(br_coef_fields) else ''
+                    GeomBridge._set_comma_field(
+                        br_coef_fields,
+                        field_idx,
+                        GeomBridge._format_bool_field(bool(enabled[method_name]), existing)
+                    )
+
+            if normalized_low is not None:
+                GeomBridge._set_comma_field(
+                    br_coef_fields,
+                    10,
+                    GeomBridge.LOW_FLOW_METHOD_CODES[normalized_low]
+                )
+
+            if normalized_high is not None:
+                high_standard_step = normalized_high == 'energy'
+                existing = br_coef_fields[8] if len(br_coef_fields) > 8 else ''
+                GeomBridge._set_comma_field(
+                    br_coef_fields,
+                    8,
+                    GeomBridge._format_bool_field(high_standard_step, existing)
+                )
+
+            if momentum_cd is not None:
+                GeomBridge._set_comma_field(br_coef_fields, 9, float(momentum_cd))
+
+            if yarnell_k is not None:
+                GeomBridge._set_comma_field(br_coef_fields, 3, float(yarnell_k))
+
+            if pressure_flow_submerged_inlet_cd is not None:
+                GeomBridge._set_comma_field(
+                    br_coef_fields, 6, float(pressure_flow_submerged_inlet_cd)
+                )
+
+            if pressure_flow_submerged_inlet_outlet_cd is not None:
+                GeomBridge._set_comma_field(
+                    br_coef_fields, 7, float(pressure_flow_submerged_inlet_outlet_cd)
+                )
+
+            body, line_ending = GeomBridge._split_line_ending(lines[br_coef_idx])
+            line_ending = line_ending or '\n'
+            lines[br_coef_idx] = GeomBridge._format_comma_line(
+                "BR Coef=", br_coef_fields, line_ending
+            )
+            after_line = lines[br_coef_idx].rstrip('\r\n')
+            deck_line_before = None
+            deck_line_after = None
+
+            if weir_coefficient is not None and deck_idx is not None:
+                deck_body, deck_line_ending = GeomBridge._split_line_ending(lines[deck_idx])
+                deck_line_ending = deck_line_ending or '\n'
+                deck_fields = deck_body.split(',')
+                deck_line_before = lines[deck_idx].rstrip('\r\n')
+                GeomBridge._set_comma_field(deck_fields, 2, float(weir_coefficient))
+                lines[deck_idx] = f"{','.join(deck_fields)}{deck_line_ending}"
+                deck_line_after = lines[deck_idx].rstrip('\r\n')
+
+            if create_backup:
+                backup_path = GeomParser.create_backup(geom_file)
+                logger.info(f"Created backup: {backup_path}")
+
+            with open(geom_file, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+
+            after = GeomBridge.get_hydraulic_methods(
+                geom_file, river, reach, rs, opening_index=opening_index
+            )
+
+            result = {
+                'river': river,
+                'reach': reach,
+                'rs': str(rs),
+                'opening_index': opening_index,
+                'low_flow_method': after['low_flow_method'],
+                'high_flow_method': after['high_flow_method'],
+                'inserted_br_coef': inserted_br_coef,
+                'br_coef_before': before_line,
+                'br_coef_after': after_line,
+                'deck_line_before': deck_line_before,
+                'deck_line_after': deck_line_after,
+                'backup_path': str(backup_path) if backup_path else None,
+                'before': before,
+                'after': after,
+            }
+
+            logger.debug(
+                f"Set bridge hydraulic methods for {river}/{reach}/RS {rs}: "
+                f"low={result['low_flow_method']}, high={result['high_flow_method']}"
+            )
+            return result
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing bridge hydraulic methods: {str(e)}")
+            if backup_path and backup_path.exists():
+                logger.info(f"Restoring from backup: {backup_path}")
+                import shutil
+                shutil.copy2(backup_path, geom_file)
+            raise IOError(f"Failed to write bridge hydraulic methods: {str(e)}")
 
     @staticmethod
     @log_call
@@ -962,17 +2294,12 @@ class GeomBridge:
                 raise ValueError(f"Structure not found: {river}/{reach}/RS {rs}")
 
             structure_idx = structure['marker_idx']
+            structure_end_idx = GeomBridge._find_structure_end(lines, structure_idx)
 
             htab_data = []
 
-            for j in range(
-                structure_idx,
-                min(structure_idx + GeomBridge.DEFAULT_SEARCH_RANGE, len(lines))
-            ):
+            for j in range(structure_idx, structure_end_idx):
                 line = lines[j]
-
-                if line.startswith("Type RM Length L Ch R =") and j > structure_idx + 5:
-                    break
 
                 if line.startswith("BC HTab HWMax="):
                     val = GeomParser.extract_keyword_value(line, "BC HTab HWMax")
@@ -1024,7 +2351,7 @@ class GeomBridge:
                         except: pass
 
             df = pd.DataFrame(htab_data)
-            logger.info(f"Extracted HTab parameters for {river}/{reach}/RS {rs}")
+            logger.debug(f"Extracted HTab parameters for {river}/{reach}/RS {rs}")
             return df
 
         except FileNotFoundError:
@@ -1150,9 +2477,9 @@ class GeomBridge:
                 # If deck extraction fails, just leave invert as None
                 logger.debug(f"Could not extract invert from deck geometry: {e}")
 
-        logger.info(f"Extracted HTab dict for {river}/{reach}/RS {rs}: "
-                   f"hw_max={result['hw_max']}, max_flow={result['max_flow']}, "
-                   f"invert={result['invert']}")
+        logger.debug(f"Extracted HTab dict for {river}/{reach}/RS {rs}: "
+                    f"hw_max={result['hw_max']}, max_flow={result['max_flow']}, "
+                    f"invert={result['invert']}")
 
         return result
 
@@ -1168,8 +2495,9 @@ class GeomBridge:
         Returns:
             int: Index of first line AFTER the structure block
         """
-        # Search for next element marker within reasonable range
-        for i in range(struct_start_idx + 1, min(struct_start_idx + GeomBridge.MAX_PARSE_LINES, len(lines))):
+        # Search to the next geometry section. Large bridge blocks can contain
+        # many pier/abutment records, so do not impose a fixed line-count limit.
+        for i in range(struct_start_idx + 1, len(lines)):
             line = lines[i]
             # These markers indicate start of next element
             if (line.startswith("Type RM Length L Ch R =") or
@@ -1266,6 +2594,593 @@ class GeomBridge:
             htab_lines.append(f"BC User HTab Pts/SubCrv(D)= {points_per_curve}\n")
 
         return htab_lines
+
+    @staticmethod
+    def _format_deck_block_lines(deck_df: pd.DataFrame,
+                                 distance: float,
+                                 width: float,
+                                 weir_coefficient: float = 2.6,
+                                 skew: float = 0.0,
+                                 min_low_chord: Optional[float] = None,
+                                 max_high_chord: Optional[float] = None,
+                                 max_submergence: float = 0.95,
+                                 is_ogee: int = 0,
+                                 extra_parameters: Optional[List[Any]] = None) -> List[str]:
+        """Format a complete Deck Dist Width WeirC block."""
+        required = {'Location', 'Station', 'Elevation', 'LowChord'}
+        if not required.issubset(deck_df.columns):
+            raise ValueError("deck_df must contain Location, Station, Elevation, and LowChord columns")
+
+        upstream = deck_df[deck_df['Location'].astype(str).str.lower().isin(['upstream', 'up', 'u'])]
+        downstream = deck_df[deck_df['Location'].astype(str).str.lower().isin(['downstream', 'down', 'dn', 'd'])]
+
+        if upstream.empty and downstream.empty:
+            raise ValueError("deck_df must contain at least one upstream or downstream deck row")
+
+        extras = extra_parameters if extra_parameters is not None else [0, 0, "", ""]
+        params = [
+            distance,
+            width,
+            weir_coefficient,
+            skew,
+            len(upstream),
+            len(downstream),
+            min_low_chord,
+            max_high_chord,
+            max_submergence,
+            is_ogee,
+            *extras
+        ]
+
+        block_lines = [
+            "Deck Dist Width WeirC Skew NumUp NumDn MinLoCord MaxHiCord MaxSubmerge Is_Ogee\n",
+            f"{','.join(GeomBridge._format_csv_value(value) for value in params)}\n",
+        ]
+
+        for face_df in (upstream, downstream):
+            if face_df.empty:
+                continue
+            for column in ('Station', 'Elevation', 'LowChord'):
+                block_lines.extend(
+                    GeomBridge._format_fixed_width_values(face_df[column].tolist(), precision=2)
+                )
+
+        return block_lines
+
+    @staticmethod
+    @log_call
+    def set_deck(geom_file: Union[str, Path],
+                 river: str,
+                 reach: str,
+                 rs: str,
+                 deck_df: pd.DataFrame,
+                 distance: Optional[float] = None,
+                 width: Optional[float] = None,
+                 weir_coefficient: Optional[float] = None,
+                 skew: Optional[float] = None,
+                 min_low_chord: Optional[float] = None,
+                 max_high_chord: Optional[float] = None,
+                 max_submergence: Optional[float] = None,
+                 is_ogee: Optional[int] = None,
+                 bridge_flags: Optional[List[Any]] = None,
+                 extra_parameters: Optional[List[Any]] = None,
+                 create_backup: bool = True) -> Optional[Path]:
+        """
+        Create or replace bridge deck/roadway high chord and low chord geometry.
+
+        If the bridge marker is missing but the river/reach/station exists, this
+        method creates the ``Bridge Culvert-`` block at that station before
+        writing the deck block.
+        """
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+        if not isinstance(deck_df, pd.DataFrame):
+            raise ValueError("deck_df must be a pandas DataFrame")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            lines, bridge_idx, _ = GeomBridge._ensure_bridge_block(
+                lines, river, reach, str(rs), bridge_flags=bridge_flags
+            )
+            bridge_end_idx = GeomBridge._find_structure_end(lines, bridge_idx)
+            deck_start, deck_end = GeomBridge._find_deck_block_range(lines, bridge_idx, bridge_end_idx)
+
+            existing_parts = []
+            if deck_start is not None and deck_start + 1 < bridge_end_idx:
+                existing_parts = GeomBridge._parse_csv_values(lines[deck_start + 1])
+
+            def existing_float(index: int, default: Optional[float] = None) -> Optional[float]:
+                if len(existing_parts) <= index:
+                    return default
+                parsed = GeomBridge._parse_optional_float(existing_parts[index])
+                return parsed if parsed is not None else default
+
+            def existing_int(index: int, default: Optional[int] = None) -> Optional[int]:
+                if len(existing_parts) <= index:
+                    return default
+                parsed = GeomBridge._parse_optional_int(existing_parts[index])
+                return parsed if parsed is not None else default
+
+            resolved_distance = distance if distance is not None else existing_float(0)
+            resolved_width = width if width is not None else existing_float(1)
+            if resolved_distance is None:
+                raise ValueError("distance is required when creating a new deck block")
+            if resolved_width is None:
+                raise ValueError("width is required when creating a new deck block")
+
+            if deck_start is None and min_low_chord is None and 'LowChord' in deck_df.columns:
+                min_low_chord = float(deck_df['LowChord'].min())
+
+            new_deck_lines = GeomBridge._format_deck_block_lines(
+                deck_df=deck_df,
+                distance=resolved_distance,
+                width=resolved_width,
+                weir_coefficient=weir_coefficient if weir_coefficient is not None else existing_float(2, 2.6),
+                skew=skew if skew is not None else existing_float(3, 0.0),
+                min_low_chord=min_low_chord if min_low_chord is not None else existing_float(6),
+                max_high_chord=max_high_chord if max_high_chord is not None else existing_float(7),
+                max_submergence=max_submergence if max_submergence is not None else existing_float(8, 0.95),
+                is_ogee=is_ogee if is_ogee is not None else existing_int(9, 0),
+                extra_parameters=extra_parameters if extra_parameters is not None else existing_parts[10:] if len(existing_parts) > 10 else None,
+            )
+
+            if deck_start is not None:
+                lines[deck_start:deck_end] = new_deck_lines
+            else:
+                insert_idx = GeomBridge._insert_index_for_bridge_section(
+                    lines, bridge_idx, bridge_end_idx, 'deck'
+                )
+                lines[insert_idx:insert_idx] = new_deck_lines
+
+            return GeomParser.safe_write_geometry(geom_file, lines, create_backup=create_backup)
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing bridge deck: {str(e)}")
+            raise IOError(f"Failed to write bridge deck: {str(e)}")
+
+    @staticmethod
+    def _normalize_pier_records(piers: Union[pd.DataFrame, List[Dict[str, Any]], None]) -> List[Dict[str, Any]]:
+        """Normalize pier setter input into records with list-valued vectors."""
+        if piers is None:
+            return []
+        if isinstance(piers, pd.DataFrame):
+            df = piers.copy()
+        elif isinstance(piers, (list, tuple)):
+            df = pd.DataFrame(piers)
+        else:
+            raise ValueError("piers must be a pandas DataFrame, list of dicts, or None")
+
+        if df.empty:
+            return []
+
+        records = []
+        for _, row in df.iterrows():
+            up_widths = GeomBridge._listify(row.get('UpstreamWidths'))
+            up_elevs = GeomBridge._listify(row.get('UpstreamElevations'))
+            dn_widths = GeomBridge._listify(row.get('DownstreamWidths'))
+            dn_elevs = GeomBridge._listify(row.get('DownstreamElevations'))
+
+            if len(up_widths) != len(up_elevs):
+                raise ValueError("UpstreamWidths and UpstreamElevations must have the same length")
+            if len(dn_widths) != len(dn_elevs):
+                raise ValueError("DownstreamWidths and DownstreamElevations must have the same length")
+            if up_widths and GeomBridge._is_missing(row.get('UpstreamStation')):
+                raise ValueError("UpstreamStation is required for upstream pier points")
+            if dn_widths and GeomBridge._is_missing(row.get('DownstreamStation')):
+                raise ValueError("DownstreamStation is required for downstream pier points")
+
+            records.append({
+                'Skew': row.get('Skew'),
+                'UpstreamStation': row.get('UpstreamStation'),
+                'DownstreamStation': row.get('DownstreamStation'),
+                'UpstreamWidths': up_widths,
+                'UpstreamElevations': up_elevs,
+                'DownstreamWidths': dn_widths,
+                'DownstreamElevations': dn_elevs,
+                'ExtraParameters': GeomBridge._listify(row.get('ExtraParameters')) or [0, 0, 0, "", ""],
+            })
+
+        return records
+
+    @staticmethod
+    def _format_pier_block_lines(pier_records: List[Dict[str, Any]]) -> List[str]:
+        """Format pier records as HEC-RAS bridge pier blocks."""
+        block_lines = []
+        for record in pier_records:
+            up_widths = record['UpstreamWidths']
+            up_elevs = record['UpstreamElevations']
+            dn_widths = record['DownstreamWidths']
+            dn_elevs = record['DownstreamElevations']
+            header_values = [
+                record.get('Skew'),
+                record.get('UpstreamStation'),
+                len(up_widths),
+                record.get('DownstreamStation'),
+                len(dn_widths),
+                *record.get('ExtraParameters', [0, 0, 0, "", ""]),
+            ]
+            block_lines.append(GeomBridge._format_csv_line(
+                "Pier Skew, UpSta & Num, DnSta & Num", header_values
+            ))
+
+            for values in (up_widths, up_elevs, dn_widths, dn_elevs):
+                if values:
+                    block_lines.extend(GeomBridge._format_fixed_width_values(values, precision=2))
+
+        return block_lines
+
+    @staticmethod
+    @log_call
+    def set_piers(geom_file: Union[str, Path],
+                  river: str,
+                  reach: str,
+                  rs: str,
+                  piers: Union[pd.DataFrame, List[Dict[str, Any]], None],
+                  create_backup: bool = True) -> Optional[Path]:
+        """Create, replace, or remove bridge pier blocks."""
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        try:
+            pier_records = GeomBridge._normalize_pier_records(piers)
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            ranges = GeomBridge._find_pier_block_ranges(lines, bridge_idx, bridge_end_idx)
+            lines = GeomBridge._remove_ranges(lines, ranges)
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            new_lines = GeomBridge._format_pier_block_lines(pier_records)
+            if new_lines:
+                insert_idx = GeomBridge._insert_index_for_bridge_section(
+                    lines, bridge_idx, bridge_end_idx, 'piers'
+                )
+                lines[insert_idx:insert_idx] = new_lines
+
+            return GeomParser.safe_write_geometry(geom_file, lines, create_backup=create_backup)
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing bridge piers: {str(e)}")
+            raise IOError(f"Failed to write bridge piers: {str(e)}")
+
+    @staticmethod
+    def _normalize_abutment_records(abutments: Union[pd.DataFrame, List[Dict[str, Any]], None]) -> List[Dict[str, Any]]:
+        """Normalize abutment setter input into one record per abutment block."""
+        if abutments is None:
+            return []
+        if isinstance(abutments, pd.DataFrame):
+            df = abutments.copy()
+        elif isinstance(abutments, (list, tuple)):
+            df = pd.DataFrame(abutments)
+        else:
+            raise ValueError("abutments must be a pandas DataFrame, list of dicts, or None")
+
+        if df.empty:
+            return []
+
+        if {'Location', 'Station', 'Parameter'}.issubset(df.columns):
+            if 'AbutmentIndex' not in df.columns:
+                df['AbutmentIndex'] = 1
+            records = []
+            for _, group in df.groupby('AbutmentIndex', sort=True):
+                upstream = group[group['Location'].astype(str).str.lower().isin(['upstream', 'up', 'u'])]
+                downstream = group[group['Location'].astype(str).str.lower().isin(['downstream', 'down', 'dn', 'd'])]
+                records.append({
+                    'Skew': group['Skew'].dropna().iloc[0] if 'Skew' in group.columns and not group['Skew'].dropna().empty else None,
+                    'UpstreamStations': upstream['Station'].tolist(),
+                    'UpstreamParameters': upstream['Parameter'].tolist(),
+                    'DownstreamStations': downstream['Station'].tolist(),
+                    'DownstreamParameters': downstream['Parameter'].tolist(),
+                })
+            return records
+
+        records = []
+        for _, row in df.iterrows():
+            up_stations = GeomBridge._listify(row.get('UpstreamStations'))
+            up_params = GeomBridge._listify(row.get('UpstreamParameters'))
+            dn_stations = GeomBridge._listify(row.get('DownstreamStations'))
+            dn_params = GeomBridge._listify(row.get('DownstreamParameters'))
+
+            if len(up_stations) != len(up_params):
+                raise ValueError("UpstreamStations and UpstreamParameters must have the same length")
+            if len(dn_stations) != len(dn_params):
+                raise ValueError("DownstreamStations and DownstreamParameters must have the same length")
+
+            records.append({
+                'Skew': row.get('Skew'),
+                'UpstreamStations': up_stations,
+                'UpstreamParameters': up_params,
+                'DownstreamStations': dn_stations,
+                'DownstreamParameters': dn_params,
+            })
+
+        return records
+
+    @staticmethod
+    def _format_abutment_block_lines(abutment_records: List[Dict[str, Any]]) -> List[str]:
+        """Format abutment records as HEC-RAS abutment blocks."""
+        block_lines = []
+        for record in abutment_records:
+            up_stations = record['UpstreamStations']
+            up_params = record['UpstreamParameters']
+            dn_stations = record['DownstreamStations']
+            dn_params = record['DownstreamParameters']
+            block_lines.append(GeomBridge._format_csv_line(
+                "Abutment Skew #Up #Dn",
+                [record.get('Skew'), len(up_stations), len(dn_stations)]
+            ))
+
+            for values in (up_stations, up_params, dn_stations, dn_params):
+                if values:
+                    block_lines.extend(GeomBridge._format_fixed_width_values(values, precision=2))
+
+        return block_lines
+
+    @staticmethod
+    @log_call
+    def set_abutments(geom_file: Union[str, Path],
+                      river: str,
+                      reach: str,
+                      rs: str,
+                      abutments: Union[pd.DataFrame, List[Dict[str, Any]], None],
+                      create_backup: bool = True) -> Optional[Path]:
+        """Create, replace, or remove bridge abutment blocks."""
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        try:
+            abutment_records = GeomBridge._normalize_abutment_records(abutments)
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            ranges = GeomBridge._find_abutment_block_ranges(lines, bridge_idx, bridge_end_idx)
+            lines = GeomBridge._remove_ranges(lines, ranges)
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            new_lines = GeomBridge._format_abutment_block_lines(abutment_records)
+            if new_lines:
+                insert_idx = GeomBridge._insert_index_for_bridge_section(
+                    lines, bridge_idx, bridge_end_idx, 'abutments'
+                )
+                lines[insert_idx:insert_idx] = new_lines
+
+            return GeomParser.safe_write_geometry(geom_file, lines, create_backup=create_backup)
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing bridge abutments: {str(e)}")
+            raise IOError(f"Failed to write bridge abutments: {str(e)}")
+
+    @staticmethod
+    def _format_approach_section_lines(approach_df: Optional[pd.DataFrame],
+                                       upstream_banks: Optional[List[float]] = None,
+                                       downstream_banks: Optional[List[float]] = None) -> List[str]:
+        """Format embedded BR U/BR D approach section lines."""
+        block_lines = []
+        if approach_df is None:
+            approach_df = pd.DataFrame()
+        if not isinstance(approach_df, pd.DataFrame):
+            raise ValueError("approach_df must be a pandas DataFrame or None")
+
+        for location, prefix, banks in (
+            ('upstream', 'BR U', upstream_banks),
+            ('downstream', 'BR D', downstream_banks),
+        ):
+            loc_df = approach_df[
+                approach_df.get('Location', pd.Series(dtype=object)).astype(str).str.lower().isin(
+                    [location, location[:2], location[0]]
+                )
+            ] if not approach_df.empty and 'Location' in approach_df.columns else pd.DataFrame()
+
+            if not loc_df.empty:
+                se_df = loc_df[
+                    loc_df.get('DataType', pd.Series(dtype=object)).astype(str).str.lower().eq('station_elevation')
+                ] if 'DataType' in loc_df.columns else loc_df
+                if not se_df.empty:
+                    if not {'Station', 'Elevation'}.issubset(se_df.columns):
+                        raise ValueError("station_elevation approach rows require Station and Elevation columns")
+                    values = []
+                    for _, row in se_df.iterrows():
+                        values.extend([row['Station'], row['Elevation']])
+                    block_lines.append(f"{prefix} #Sta/Elev= {len(se_df)}\n")
+                    block_lines.extend(GeomBridge._format_fixed_width_values(values, precision=2))
+
+                mann_df = loc_df[
+                    loc_df.get('DataType', pd.Series(dtype=object)).astype(str).str.lower().eq('mannings_n')
+                ] if 'DataType' in loc_df.columns else pd.DataFrame()
+                if not mann_df.empty:
+                    if 'N_Value' in mann_df.columns:
+                        n_col = 'N_Value'
+                    elif 'n_value' in mann_df.columns:
+                        n_col = 'n_value'
+                    else:
+                        raise ValueError("mannings_n approach rows require Station and N_Value columns")
+                    if 'Station' not in mann_df.columns:
+                        raise ValueError("mannings_n approach rows require Station and N_Value columns")
+
+                    values = []
+                    for _, row in mann_df.iterrows():
+                        values.extend([row['Station'], row[n_col], 0])
+                    block_lines.append(f"{prefix} #Mann= {len(mann_df)} , 0 , 0\n")
+                    block_lines.extend(GeomBridge._format_fixed_width_values(values, precision=3))
+
+                bank_df = loc_df[
+                    loc_df.get('DataType', pd.Series(dtype=object)).astype(str).str.lower().eq('banks')
+                ] if 'DataType' in loc_df.columns else pd.DataFrame()
+                if banks is None and not bank_df.empty:
+                    first = bank_df.iloc[0]
+                    if 'LeftBank' in bank_df.columns and 'RightBank' in bank_df.columns:
+                        banks = [first['LeftBank'], first['RightBank']]
+
+            if banks is not None:
+                if len(banks) != 2:
+                    raise ValueError("Approach banks must contain [left_bank, right_bank]")
+                block_lines.append(GeomBridge._format_csv_line(f"{prefix} Banks", list(banks)))
+
+        return block_lines
+
+    @staticmethod
+    @log_call
+    def set_approach_sections(geom_file: Union[str, Path],
+                              river: str,
+                              reach: str,
+                              rs: str,
+                              approach_df: Optional[pd.DataFrame] = None,
+                              upstream_banks: Optional[List[float]] = None,
+                              downstream_banks: Optional[List[float]] = None,
+                              create_backup: bool = True) -> Optional[Path]:
+        """Create, replace, or remove embedded BR U/BR D approach section blocks."""
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        try:
+            new_lines = GeomBridge._format_approach_section_lines(
+                approach_df,
+                upstream_banks=upstream_banks,
+                downstream_banks=downstream_banks,
+            )
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            ranges = GeomBridge._find_approach_block_ranges(lines, bridge_idx, bridge_end_idx)
+            lines = GeomBridge._remove_ranges(lines, ranges)
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            if new_lines:
+                insert_idx = GeomBridge._insert_index_for_bridge_section(
+                    lines, bridge_idx, bridge_end_idx, 'approach'
+                )
+                lines[insert_idx:insert_idx] = new_lines
+
+            return GeomParser.safe_write_geometry(geom_file, lines, create_backup=create_backup)
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing bridge approach sections: {str(e)}")
+            raise IOError(f"Failed to write bridge approach sections: {str(e)}")
+
+    @staticmethod
+    def _prepare_coefficient_values(existing: Optional[List[Any]], provided: Any) -> Optional[List[Any]]:
+        """Prepare a full coefficient vector from full or sparse user input."""
+        if provided is None:
+            return existing
+
+        if isinstance(provided, pd.DataFrame):
+            if not {'Index', 'Value'}.issubset(provided.columns):
+                raise ValueError("Coefficient DataFrame input requires Index and Value columns")
+            provided = dict(zip(provided['Index'], provided['Value']))
+
+        if isinstance(provided, dict):
+            values = list(existing or [])
+            if provided:
+                max_idx = max(int(idx) for idx in provided)
+                while len(values) <= max_idx:
+                    values.append("")
+                for idx, value in provided.items():
+                    values[int(idx)] = value
+            return values
+
+        if isinstance(provided, (list, tuple, np.ndarray, pd.Series)):
+            values = list(provided)
+            return values if values else None
+
+        return [provided]
+
+    @staticmethod
+    @log_call
+    def set_coefficients(geom_file: Union[str, Path],
+                         river: str,
+                         reach: str,
+                         rs: str,
+                         br_coef: Any = None,
+                         wspro: Any = None,
+                         bc_design: Any = None,
+                         create_backup: bool = True) -> Optional[Path]:
+        """
+        Create or replace bridge coefficient lines.
+
+        ``br_coef``, ``wspro``, and ``bc_design`` accept full lists or sparse
+        ``{index: value}`` dictionaries. Sparse updates are merged into the
+        existing line before writing.
+        """
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+        if br_coef is None and wspro is None and bc_design is None:
+            raise ValueError("At least one of br_coef, wspro, or bc_design must be provided")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+            existing = {'br_coef': None, 'wspro': None, 'bc_design': None}
+            coefficient_ranges = []
+
+            for idx in range(bridge_idx, bridge_end_idx):
+                if lines[idx].startswith("BR Coef="):
+                    existing['br_coef'] = GeomBridge._parse_csv_values(lines[idx])
+                    coefficient_ranges.append((idx, idx + 1))
+                elif lines[idx].startswith("WSPro="):
+                    existing['wspro'] = GeomBridge._parse_csv_values(lines[idx])
+                    coefficient_ranges.append((idx, idx + 1))
+                elif lines[idx].startswith("BC Design="):
+                    existing['bc_design'] = GeomBridge._parse_csv_values(lines[idx])
+                    coefficient_ranges.append((idx, idx + 1))
+
+            final_values = {
+                'BR Coef': GeomBridge._prepare_coefficient_values(existing['br_coef'], br_coef),
+                'WSPro': GeomBridge._prepare_coefficient_values(existing['wspro'], wspro),
+                'BC Design': GeomBridge._prepare_coefficient_values(existing['bc_design'], bc_design),
+            }
+
+            lines = GeomBridge._remove_ranges(lines, coefficient_ranges)
+            bridge_idx, bridge_end_idx = GeomBridge._get_bridge_range(lines, river, reach, str(rs))
+
+            new_lines = [
+                GeomBridge._format_csv_line(keyword, values)
+                for keyword, values in final_values.items()
+                if values is not None
+            ]
+
+            if new_lines:
+                insert_idx = GeomBridge._insert_index_for_bridge_section(
+                    lines, bridge_idx, bridge_end_idx, 'coefficients'
+                )
+                lines[insert_idx:insert_idx] = new_lines
+
+            return GeomParser.safe_write_geometry(geom_file, lines, create_backup=create_backup)
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing bridge coefficients: {str(e)}")
+            raise IOError(f"Failed to write bridge coefficients: {str(e)}")
 
     @staticmethod
     @log_call
@@ -1429,7 +3344,7 @@ class GeomBridge:
                 lines_replaced = last_htab - first_htab + 1
                 lines = lines[:first_htab] + new_htab_lines + lines[last_htab + 1:]
                 lines_inserted = len(new_htab_lines)
-                logger.info(
+                logger.debug(
                     f"Replaced {lines_replaced} existing HTAB lines with {lines_inserted} new lines"
                 )
             else:
@@ -1438,13 +3353,13 @@ class GeomBridge:
                 insert_idx = struct_end_idx
                 lines = lines[:insert_idx] + new_htab_lines + lines[insert_idx:]
                 lines_inserted = len(new_htab_lines)
-                logger.info(f"Inserted {lines_inserted} new HTAB lines at line {insert_idx}")
+                logger.debug(f"Inserted {lines_inserted} new HTAB lines at line {insert_idx}")
 
             # Write modified file
             with open(geom_file, 'w', encoding='utf-8') as f:
                 f.writelines(lines)
 
-            logger.info(f"Successfully wrote HTAB parameters for {river}/{reach}/RS {rs}")
+            logger.debug(f"Successfully wrote HTAB parameters for {river}/{reach}/RS {rs}")
 
             # Return summary of what was written
             result = {
@@ -1700,7 +3615,7 @@ class GeomBridge:
             structures = GeomBridge._find_all_structures(lines)
 
             if not structures:
-                logger.info(f"No structures found in {geom_file.name}")
+                logger.debug(f"No structures found in {geom_file.name}")
                 return {
                     'bridges': 0,
                     'inline_weirs': 0,
@@ -1806,7 +3721,7 @@ class GeomBridge:
                 f.writelines(lines)
 
             total_modified = bridges_modified + inline_weirs_modified
-            logger.info(
+            logger.debug(
                 f"Successfully modified HTAB for {total_modified} structures "
                 f"({bridges_modified} bridges/culverts, {inline_weirs_modified} inline weirs)"
             )
@@ -1977,7 +3892,7 @@ class GeomBridge:
         # Use headwater as tailwater estimate if not found
         if max_tw is None:
             max_tw = max_hw
-            logger.info(f"Using headwater ({max_hw:.2f}) as tailwater estimate")
+            logger.debug(f"Using headwater ({max_hw:.2f}) as tailwater estimate")
 
         # Step 3: Calculate optimal HTAB parameters
         optimal_params = GeomHtabUtils.calculate_optimal_structure_htab(
@@ -1993,7 +3908,7 @@ class GeomBridge:
             points_per_curve=points_per_curve
         )
 
-        logger.info(
+        logger.debug(
             f"Calculated optimal HTAB for {river}/{reach}/RS {rs}: "
             f"HW from {max_hw:.1f} to {optimal_params['hw_max']:.1f}, "
             f"Flow from {max_flow:.0f} to {optimal_params['max_flow']:.0f}"
@@ -2047,7 +3962,7 @@ class GeomBridge:
             'backup_path': write_result.get('backup_path')
         }
 
-        logger.info(
+        logger.debug(
             f"Successfully optimized HTAB for {river}/{reach}/RS {rs}: "
             f"HWMax={result['hw_max']:.1f}, TWMax={result['tw_max']:.1f}, "
             f"MaxFlow={result['max_flow']:.0f}"
@@ -2144,7 +4059,7 @@ class GeomBridge:
         structures = GeomBridge._find_all_structures(lines)
 
         if not structures:
-            logger.info(f"No structures found in {geom_file.name}")
+            logger.debug(f"No structures found in {geom_file.name}")
             return {
                 'optimized': 0,
                 'failed': 0,
@@ -2221,7 +4136,7 @@ class GeomBridge:
             'backup_path': str(backup_path) if backup_path else None
         }
 
-        logger.info(
+        logger.debug(
             f"Structure HTAB optimization complete: "
             f"{optimized_count} optimized, {failed_count} failed of {len(structures)} total"
         )

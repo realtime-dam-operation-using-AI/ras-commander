@@ -11,8 +11,20 @@ List of Functions:
 - get_station_elevation() - Read station/elevation pairs for a cross section
 - set_station_elevation() - Write station/elevation with automatic bank interpolation
 - get_bank_stations() - Read left and right bank station locations
+- set_bank_stations() - Write left and right bank station locations
 - get_expansion_contraction() - Read expansion and contraction coefficients
+- set_expansion_contraction() - Write expansion and contraction coefficients
+- get_blocked_obstructions() - Read blocked obstruction triplets
+- set_blocked_obstructions() - Write blocked obstruction triplets
+- validate_blocked_obstructions_hdf() - Cross-check text obstruction blocks against HDF flags
+- interpolate_station_elevation() - Interpolate between two station/elevation profiles
+- interpolate_cross_section() - Read two cross sections and interpolate a reviewable profile
 - get_mannings_n() - Read Manning's roughness values with LOB/Channel/ROB classification
+- get_levees() - Read left/right levee station-elevation points
+- set_levees() - Write left/right levee station-elevation points
+- get_ineffective_flow() - Read ineffective flow area triplets (left_sta, right_sta, elevation)
+- set_ineffective_flow() - Write corrected ineffective flow area data
+- set_mannings_n() - Write Manning's n breakpoints (station, n_value triplets)
 - get_xs_coords() - Extract XYZ coordinates combining cut line geometry with station/elevation data
 
 Example Usage:
@@ -42,8 +54,10 @@ Technical Notes:
     - Always creates .bak backup before modification
 """
 
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Union, Optional, List, Tuple
+from numbers import Number
+from typing import Callable, Dict, Mapping, Sequence, Union, Optional, List, Tuple, Any
 import pandas as pd
 import numpy as np
 import math
@@ -53,6 +67,111 @@ from ..Decorators import log_call
 from .GeomParser import GeomParser
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class CrossSectionBankStations:
+    """Resolved cross-section bank stations and their profile elevations."""
+
+    left_station: float
+    right_station: float
+    left_elevation: float
+    right_elevation: float
+    source: str = "user"
+
+
+@dataclass
+class CrossSectionManningsN:
+    """Resolved LOB, main-channel, and ROB Manning's n values."""
+
+    lob: float
+    channel: float
+    rob: float
+    source: str = "user"
+
+
+@dataclass
+class CrossSectionReachLengths:
+    """Left overbank, channel, and right overbank reach lengths."""
+
+    left: float
+    channel: float
+    right: float
+
+
+@dataclass
+class CrossSectionBuildInput:
+    """
+    Optional dataclass accepted by :meth:`GeomCrossSection.build_cross_section`.
+
+    Any field can also be supplied directly as a keyword argument to the builder.
+    Keyword arguments override values from this dataclass.
+    """
+
+    river: str
+    reach: str
+    rs: str
+    cut_line: Optional[Any] = None
+    river_centerline: Optional[Any] = None
+    station_elevation: Optional[pd.DataFrame] = None
+    terrain_profile: Optional[pd.DataFrame] = None
+    rasmap_path: Optional[Union[str, Path]] = None
+    geom_hdf_path: Optional[Union[str, Path]] = None
+    upstream_profile: Optional[pd.DataFrame] = None
+    downstream_profile: Optional[pd.DataFrame] = None
+    geom_file: Optional[Union[str, Path]] = None
+    upstream_rs: Optional[str] = None
+    downstream_rs: Optional[str] = None
+    interpolation_ratio: float = 0.5
+    bank_stations: Optional[Any] = None
+    bank_left: Optional[float] = None
+    bank_right: Optional[float] = None
+    bank_left_elevation: Optional[float] = None
+    bank_right_elevation: Optional[float] = None
+    mannings_n: Optional[Any] = None
+    n_lob: Optional[float] = None
+    n_channel: Optional[float] = None
+    n_rob: Optional[float] = None
+    reach_lengths: Optional[Any] = None
+    length_left: Optional[float] = None
+    length_channel: Optional[float] = None
+    length_right: Optional[float] = None
+    landcover_samples: Optional[Any] = None
+    landcover_table: Optional[pd.DataFrame] = None
+    landcover_geom_file: Optional[Union[str, Path]] = None
+    landcover_sampler: Optional[Callable[..., Any]] = None
+    upstream_mannings: Optional[Any] = None
+    downstream_mannings: Optional[Any] = None
+    station_elevation_strategy: str = "auto"
+    bank_strategy: str = "auto"
+    mannings_strategy: str = "auto"
+    strategy: Optional[str] = None
+    default_main_channel_width: float = 20.0
+    default_n_channel: float = 0.06
+    default_n_overbank: float = 0.08
+    max_points: int = 500
+    terrain_filter_tolerance: float = 0.01
+    include_gis_cut_line: bool = True
+
+
+@dataclass
+class CrossSectionBuildResult:
+    """Resolved complete 1D cross-section geometry entry."""
+
+    river: str
+    reach: str
+    rs: str
+    station_elevation: pd.DataFrame
+    bank_stations: CrossSectionBankStations
+    mannings_n: pd.DataFrame
+    reach_lengths: CrossSectionReachLengths
+    lines: List[str]
+    fallback_messages: List[str]
+
+    @property
+    def text(self) -> str:
+        """Return the formatted HEC-RAS geometry entry text."""
+        return "".join(self.lines)
 
 
 class GeomCrossSection:
@@ -65,10 +184,23 @@ class GeomCrossSection:
     # HEC-RAS format constants
     FIXED_WIDTH_COLUMN = 8      # Character width for numeric data in geometry files
     VALUES_PER_LINE = 10        # Number of values per line in fixed-width format
+    MANNINGS_VALUES_PER_LINE = 9  # 3 Manning's n triplets per line
+    BLOCKED_OBSTRUCTION_VALUES_PER_LINE = 9  # 3 obstructions x 3 values
     MAX_XS_POINTS = 500         # HEC-RAS computational limit on cross section points
+    MAX_MANNINGS_N_BLOCKS = 20  # HEC-RAS 6.6 rejects 21+ blocks per cross section
 
     # Parsing constants
     MAX_PARSE_LINES = 100       # Safety limit on lines to parse for data blocks
+    BLOCKED_OBSTRUCTION_KEYWORD = "#Block Obstruct="
+    BLOCKED_OBSTRUCTION_COLUMNS = ["xs_id", "start_sta", "end_sta", "elevation"]
+    BLOCKED_OBSTRUCTION_TERMINATORS = (
+        "Bank Sta=",
+        "#XS Ineff=",
+        "#Mann=",
+        "XS Rating Curve=",
+        "XS HTab",
+        "Exp/Cntr=",
+    )
 
     # ========== PRIVATE HELPER METHODS ==========
 
@@ -242,58 +374,1686 @@ class GeomCrossSection:
     @staticmethod
     def _interpolate_at_banks(sta_elev_df: pd.DataFrame,
                              bank_left: Optional[float] = None,
-                             bank_right: Optional[float] = None) -> pd.DataFrame:
+                             bank_right: Optional[float] = None,
+                             tolerance: float = 0.005) -> pd.DataFrame:
         """
         Interpolate elevation at bank stations and insert into station/elevation data.
 
         HEC-RAS REQUIRES that bank station values appear as exact points in the
         station/elevation data. This method ensures banks are interpolated and inserted.
 
+        If an existing station is within tolerance of a bank station, its station
+        value is snapped to the exact bank value (avoiding near-duplicate points).
+        Otherwise, a new point is interpolated and inserted.
+
         Args:
             sta_elev_df: Station/elevation data
             bank_left: Left bank station
             bank_right: Right bank station
+            tolerance: Snap tolerance for matching existing stations (default 0.005)
 
         Returns:
             Modified DataFrame with banks interpolated and inserted
         """
         result_df = sta_elev_df.copy()
+        result_df['Station'] = pd.to_numeric(result_df['Station'], errors='raise')
+        result_df['Elevation'] = pd.to_numeric(result_df['Elevation'], errors='raise')
+        result_df = result_df.sort_values('Station').reset_index(drop=True)
 
-        # Interpolate and insert left bank if needed
-        if bank_left is not None:
+        if result_df['Station'].duplicated().any():
+            raise ValueError("Station values must be unique")
+
+        for bank_sta, label in [(bank_left, "left"), (bank_right, "right")]:
+            if bank_sta is None:
+                continue
+
+            bank_sta = float(bank_sta)
             stations = result_df['Station'].values
-            elevations = result_df['Elevation'].values
+            min_station = float(stations[0])
+            max_station = float(stations[-1])
 
-            if bank_left not in stations:
-                # Interpolate elevation at left bank
-                bank_left_elev = np.interp(bank_left, stations, elevations)
+            if bank_sta < min_station - tolerance or bank_sta > max_station + tolerance:
+                raise ValueError(
+                    f"{label.title()} bank station ({bank_sta}) must be within "
+                    f"station/elevation range {min_station:g} to {max_station:g}"
+                )
 
-                # Insert into DataFrame
-                new_row = pd.DataFrame({'Station': [bank_left], 'Elevation': [bank_left_elev]})
+            # Check for near-match within tolerance
+            diffs = np.abs(stations - bank_sta)
+            min_idx = np.argmin(diffs)
+
+            if diffs[min_idx] <= tolerance:
+                # Snap existing station to exact bank value
+                old_sta = stations[min_idx]
+                result_df.iloc[min_idx, result_df.columns.get_loc('Station')] = bank_sta
+                logger.debug(
+                    f"Snapped {label} bank station {old_sta} -> {bank_sta} "
+                    f"(diff={diffs[min_idx]:.6f})"
+                )
+            else:
+                # Interpolate elevation at bank station and insert new point
+                elevations = result_df['Elevation'].values
+                bank_elev = np.interp(bank_sta, stations, elevations)
+
+                new_row = pd.DataFrame({'Station': [bank_sta], 'Elevation': [bank_elev]})
                 result_df = pd.concat([result_df, new_row], ignore_index=True)
                 result_df = result_df.sort_values('Station').reset_index(drop=True)
 
-                logger.debug(f"Interpolated left bank at station {bank_left:.2f}, elevation {bank_left_elev:.2f}")
-
-        # Interpolate and insert right bank if needed
-        if bank_right is not None:
-            stations = result_df['Station'].values
-            elevations = result_df['Elevation'].values
-
-            if bank_right not in stations:
-                # Interpolate elevation at right bank
-                bank_right_elev = np.interp(bank_right, stations, elevations)
-
-                # Insert into DataFrame
-                new_row = pd.DataFrame({'Station': [bank_right], 'Elevation': [bank_right_elev]})
-                result_df = pd.concat([result_df, new_row], ignore_index=True)
-                result_df = result_df.sort_values('Station').reset_index(drop=True)
-
-                logger.debug(f"Interpolated right bank at station {bank_right:.2f}, elevation {bank_right_elev:.2f}")
+                logger.debug(
+                    f"Interpolated {label} bank at station {bank_sta:.2f}, "
+                    f"elevation {bank_elev:.2f}"
+                )
 
         return result_df
 
+    @staticmethod
+    def _format_numeric(value: float) -> str:
+        """Format a geometry-line scalar compactly without losing useful precision."""
+        value = float(value)
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:g}"
+
+    @staticmethod
+    def _format_numeric_like(value: float, original: str, min_decimals: int = 0) -> str:
+        """Format a scalar using the decimal precision of an existing value string."""
+        original = original.strip()
+        if '.' in original:
+            decimals = max(len(original.split('.', 1)[1]), int(min_decimals))
+            return f"{float(value):.{decimals}f}"
+        return GeomCrossSection._format_numeric(value)
+
+    @staticmethod
+    def _decimal_places_for_value(value: float) -> int:
+        """Return decimal places needed by the compact formatter for a scalar."""
+        text = GeomCrossSection._format_numeric(value)
+        if 'e' in text.lower():
+            text = f"{float(value):.12f}".rstrip('0').rstrip('.')
+        if '.' not in text:
+            return 0
+        return len(text.split('.', 1)[1].rstrip('0'))
+
+    @staticmethod
+    def _find_keyword_index(lines: List[str], start_idx: int, keyword: str) -> Optional[int]:
+        """Find a keyword line inside one cross-section block."""
+        section_end = GeomCrossSection._find_xs_section_end(lines, start_idx)
+        for idx in range(start_idx, section_end):
+            if lines[idx].startswith(keyword):
+                return idx
+        return None
+
+    @staticmethod
+    def _resolve_geom_text_path(
+        geom_number: Union[str, Number, Path],
+        ras_object=None,
+    ) -> Path:
+        """Resolve a geometry number or direct path to a ``.g##`` text file."""
+        candidate = None
+        if isinstance(geom_number, Path):
+            candidate = geom_number
+        elif isinstance(geom_number, str):
+            candidate = Path(geom_number)
+
+        if candidate is not None and candidate.is_file():
+            return candidate
+
+        try:
+            from ..RasPlan import RasPlan
+            resolved = RasPlan.get_geom_path(geom_number, ras_object=ras_object)
+            if resolved is not None and Path(resolved).is_file():
+                return Path(resolved)
+        except Exception as exc:
+            logger.debug(f"Could not resolve geometry input via RasPlan: {exc}")
+
+        raise FileNotFoundError(f"Geometry file not found for: {geom_number}")
+
+    @staticmethod
+    def _make_xs_id(river: str, reach: str, rs: str) -> str:
+        """Build the stable cross-section identifier returned by obstruction APIs."""
+        return f"{str(river).strip()}|{str(reach).strip()}|{str(rs).strip()}"
+
+    @staticmethod
+    def _resolve_xs_identifier(xs_id: Any, xs_df: pd.DataFrame) -> Tuple[str, str, str]:
+        """
+        Resolve a public ``xs_id`` value to ``(river, reach, rs)``.
+
+        Accepts the ``xs_id`` string returned by ``get_blocked_obstructions()``,
+        a plain RS string when unique in the geometry, a tuple/list
+        ``(river, reach, rs)``, or a mapping/Series with River/Reach/RS fields.
+        """
+        if isinstance(xs_id, pd.Series):
+            xs_id = xs_id.to_dict()
+
+        if isinstance(xs_id, dict):
+            if "xs_id" in xs_id:
+                return GeomCrossSection._resolve_xs_identifier(xs_id["xs_id"], xs_df)
+            river = xs_id.get("River", xs_id.get("river"))
+            reach = xs_id.get("Reach", xs_id.get("reach"))
+            rs = xs_id.get("RS", xs_id.get("rs", xs_id.get("station")))
+            if river is not None and reach is not None and rs is not None:
+                return str(river), str(reach), str(rs)
+
+        if isinstance(xs_id, (tuple, list)) and len(xs_id) == 3:
+            river, reach, rs = xs_id
+            return str(river), str(reach), str(rs)
+
+        xs_text = str(xs_id).strip()
+        if "|" in xs_text:
+            parts = [part.strip() for part in xs_text.split("|")]
+            if len(parts) == 3 and all(parts):
+                return parts[0], parts[1], parts[2]
+
+        if xs_df.empty:
+            raise ValueError(f"Cross section not found: {xs_id}")
+
+        matches = xs_df[xs_df["RS"].astype(str).str.strip() == xs_text]
+        if matches.empty:
+            raise ValueError(f"Cross section not found: {xs_id}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Cross section RS '{xs_text}' is not unique; pass the xs_id "
+                "returned by get_blocked_obstructions() or a (river, reach, rs) tuple"
+            )
+
+        row = matches.iloc[0]
+        return str(row["River"]), str(row["Reach"]), str(row["RS"])
+
+    @staticmethod
+    def _find_blocked_obstruction_block(
+        lines: List[str],
+        xs_idx: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Find a ``#Block Obstruct=`` block inside one cross section.
+
+        Returns ``(header_idx, data_start, data_end, count)`` where ``data_end``
+        is the first line after the fixed-width obstruction data.
+        """
+        section_end = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+
+        for idx in range(xs_idx, section_end):
+            if not lines[idx].strip().startswith(GeomCrossSection.BLOCKED_OBSTRUCTION_KEYWORD):
+                continue
+
+            value_str = GeomParser.extract_keyword_value(lines[idx], "#Block Obstruct")
+            try:
+                count = int(str(value_str).split(",", 1)[0].strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid #Block Obstruct count at line {idx + 1}") from exc
+
+            data_start = idx + 1
+            data_end = section_end
+            for data_idx in range(data_start, section_end):
+                stripped = lines[data_idx].strip()
+                if stripped.startswith(GeomCrossSection.BLOCKED_OBSTRUCTION_TERMINATORS):
+                    data_end = data_idx
+                    break
+                if stripped.startswith("Type RM Length L Ch R =") or stripped.startswith("River Reach="):
+                    data_end = data_idx
+                    break
+
+            return idx, data_start, data_end, count
+
+        return None
+
+    @staticmethod
+    def _blocked_obstruction_insert_index(lines: List[str], xs_idx: int) -> int:
+        """Choose a safe insertion point for a new blocked-obstruction block."""
+        section_end = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+        for idx in range(xs_idx, section_end):
+            if lines[idx].strip().startswith(GeomCrossSection.BLOCKED_OBSTRUCTION_TERMINATORS):
+                return idx
+        return section_end
+
+    @staticmethod
+    def _format_blocked_obstruction_value(value: float) -> str:
+        """Format one blocked-obstruction scalar into an 8-character field."""
+        text = f"{float(value):.2f}"
+        if len(text) > GeomCrossSection.FIXED_WIDTH_COLUMN:
+            return "*" * GeomCrossSection.FIXED_WIDTH_COLUMN
+        return text.rjust(GeomCrossSection.FIXED_WIDTH_COLUMN)
+
+    @staticmethod
+    def _normalize_blocked_obstructions(obstructions: Any) -> List[Any]:
+        """Normalize obstruction-like input to ``BlockedObstruction`` objects."""
+        from ..fixit.obstructions import BlockedObstruction
+
+        if obstructions is None:
+            return []
+
+        normalized = []
+
+        if isinstance(obstructions, pd.DataFrame):
+            column_map = {
+                "start_sta": "start_sta",
+                "Start Sta": "start_sta",
+                "start_station": "start_sta",
+                "left_station": "start_sta",
+                "end_sta": "end_sta",
+                "End Sta": "end_sta",
+                "end_station": "end_sta",
+                "right_station": "end_sta",
+                "elevation": "elevation",
+                "Elevation": "elevation",
+            }
+            renamed = obstructions.rename(
+                columns={col: column_map[col] for col in obstructions.columns if col in column_map}
+            )
+            required = {"start_sta", "end_sta", "elevation"}
+            missing = required - set(renamed.columns)
+            if missing:
+                raise ValueError(
+                    "obstructions DataFrame must contain start_sta, end_sta, "
+                    f"and elevation columns; missing {sorted(missing)}"
+                )
+
+            for _, row in renamed.iterrows():
+                normalized.append(
+                    BlockedObstruction(
+                        start_sta=float(row["start_sta"]),
+                        end_sta=float(row["end_sta"]),
+                        elevation=float(row["elevation"]),
+                    )
+                )
+            return normalized
+
+        if isinstance(obstructions, BlockedObstruction):
+            return [obstructions]
+
+        if isinstance(obstructions, dict):
+            obstructions = [obstructions]
+
+        elif all(
+            hasattr(obstructions, attr)
+            for attr in ("start_sta", "end_sta", "elevation")
+        ):
+            obstructions = [obstructions]
+
+        for obs in obstructions:
+            if isinstance(obs, BlockedObstruction):
+                normalized.append(obs)
+            elif isinstance(obs, dict):
+                normalized.append(
+                    BlockedObstruction(
+                        start_sta=float(obs.get("start_sta", obs.get("left_station"))),
+                        end_sta=float(obs.get("end_sta", obs.get("right_station"))),
+                        elevation=float(obs["elevation"]),
+                    )
+                )
+            elif all(hasattr(obs, attr) for attr in ("start_sta", "end_sta", "elevation")):
+                normalized.append(
+                    BlockedObstruction(
+                        start_sta=float(obs.start_sta),
+                        end_sta=float(obs.end_sta),
+                        elevation=float(obs.elevation),
+                    )
+                )
+            else:
+                start_sta, end_sta, elevation = obs
+                normalized.append(
+                    BlockedObstruction(
+                        start_sta=float(start_sta),
+                        end_sta=float(end_sta),
+                        elevation=float(elevation),
+                    )
+                )
+
+        return normalized
+
+    @staticmethod
+    def _insert_xs_keyword_line(lines: List[str],
+                                xs_idx: int,
+                                new_line: str,
+                                prefer_after: Optional[List[str]] = None,
+                                prefer_before: Optional[List[str]] = None) -> int:
+        """
+        Insert a cross-section keyword line without splitting fixed-width data blocks.
+
+        The caller can prefer inserting after simple one-line keywords or before
+        count/data keywords. If no anchor is found, the line is appended to the
+        end of the cross-section block.
+        """
+        section_end = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+
+        if prefer_after:
+            for keyword in prefer_after:
+                for idx in range(xs_idx, section_end):
+                    if lines[idx].startswith(keyword):
+                        lines.insert(idx + 1, new_line)
+                        return idx + 1
+
+        if prefer_before:
+            for keyword in prefer_before:
+                for idx in range(xs_idx, section_end):
+                    if lines[idx].startswith(keyword):
+                        lines.insert(idx, new_line)
+                        return idx
+
+        lines.insert(section_end, new_line)
+        return section_end
+
+    @staticmethod
+    def _bank_station_line(bank_left: float,
+                           bank_right: float,
+                           existing_line: Optional[str] = None) -> str:
+        """Build a Bank Sta= line, preserving existing precision when available."""
+        if existing_line:
+            existing = GeomParser.extract_keyword_value(existing_line, "Bank Sta")
+            existing_vals = [v.strip() for v in existing.split(',')]
+            if len(existing_vals) >= 2:
+                left = GeomCrossSection._format_numeric_like(bank_left, existing_vals[0])
+                right = GeomCrossSection._format_numeric_like(bank_right, existing_vals[1])
+                return f"Bank Sta={left},{right}\n"
+
+        return (
+            f"Bank Sta={GeomCrossSection._format_numeric(bank_left)},"
+            f"{GeomCrossSection._format_numeric(bank_right)}\n"
+        )
+
+    @staticmethod
+    def _exp_cntr_line(expansion: float,
+                       contraction: float,
+                       existing_line: Optional[str] = None) -> str:
+        """Build an Exp/Cntr= line, preserving existing precision when available."""
+        if existing_line:
+            existing = GeomParser.extract_keyword_value(existing_line, "Exp/Cntr")
+            existing_vals = [v.strip() for v in existing.split(',')]
+            if len(existing_vals) >= 2:
+                exp = GeomCrossSection._format_numeric_like(
+                    expansion,
+                    existing_vals[0],
+                    min_decimals=GeomCrossSection._decimal_places_for_value(expansion)
+                )
+                cntr = GeomCrossSection._format_numeric_like(
+                    contraction,
+                    existing_vals[1],
+                    min_decimals=GeomCrossSection._decimal_places_for_value(contraction)
+                )
+                return f"Exp/Cntr={exp},{cntr}\n"
+
+        return (
+            f"Exp/Cntr={GeomCrossSection._format_numeric(expansion)},"
+            f"{GeomCrossSection._format_numeric(contraction)}\n"
+        )
+
+
+    @staticmethod
+    def _is_missing_number(value) -> bool:
+        """Return True for scalar missing numeric inputs."""
+        if value is None:
+            return True
+        try:
+            return bool(pd.isna(value))
+        except TypeError:
+            return False
+
+    @staticmethod
+    def _parse_levee_line(line: str) -> Tuple[float, float, float, float]:
+        """
+        Parse a HEC-RAS cross-section Levee= line.
+
+        The observed XS format is:
+        ``Levee=<left_flag>,<left_sta>,<left_elev>,<right_flag>,<right_sta>,<right_elev>,,``.
+        A flag of ``-1`` means active; ``0`` or blank means the side is absent.
+        """
+        value_str = GeomParser.extract_keyword_value(line, "Levee")
+        values = [v.strip() for v in value_str.split(',')]
+        values.extend([''] * (8 - len(values)))
+
+        def parse_side(flag_idx: int, sta_idx: int, elev_idx: int) -> Tuple[float, float]:
+            flag = values[flag_idx]
+            if not flag or flag == '0':
+                return (math.nan, math.nan)
+
+            station = values[sta_idx]
+            elevation = values[elev_idx]
+            if not station:
+                return (math.nan, math.nan)
+
+            return (float(station), float(elevation) if elevation else math.nan)
+
+        left_station, left_elevation = parse_side(0, 1, 2)
+        right_station, right_elevation = parse_side(3, 4, 5)
+        return left_station, left_elevation, right_station, right_elevation
+
+    @staticmethod
+    def _levee_line(left_station: Optional[float] = None,
+                    left_elevation: Optional[float] = None,
+                    right_station: Optional[float] = None,
+                    right_elevation: Optional[float] = None,
+                    existing_line: Optional[str] = None) -> str:
+        """Build a Levee= line, preserving existing numeric precision when possible."""
+        existing_vals = []
+        if existing_line:
+            existing = GeomParser.extract_keyword_value(existing_line, "Levee")
+            existing_vals = [v.strip() for v in existing.split(',')]
+        existing_vals.extend([''] * (8 - len(existing_vals)))
+
+        def format_value(value: float, original: str) -> str:
+            min_decimals = GeomCrossSection._decimal_places_for_value(float(value))
+            if original:
+                return GeomCrossSection._format_numeric_like(
+                    value,
+                    original,
+                    min_decimals=min_decimals
+                )
+            return GeomCrossSection._format_numeric(value)
+
+        def side_tokens(station, elevation, sta_idx: int, elev_idx: int) -> List[str]:
+            station_missing = GeomCrossSection._is_missing_number(station)
+            elevation_missing = GeomCrossSection._is_missing_number(elevation)
+            if station_missing and elevation_missing:
+                return ['0', '', '']
+            if station_missing:
+                raise ValueError("Levee elevation requires a station")
+            sta_str = format_value(float(station), existing_vals[sta_idx])
+            elev_str = format_value(float(elevation), existing_vals[elev_idx]) if not elevation_missing else ''
+            return ['-1', sta_str, elev_str]
+
+        values = (
+            side_tokens(left_station, left_elevation, 1, 2)
+            + side_tokens(right_station, right_elevation, 4, 5)
+            + ['', '']
+        )
+        return f"Levee={','.join(values)}\n"
+
+    @staticmethod
+    def _find_mann_block_end(lines: List[str], xs_idx: int) -> Optional[int]:
+        """Return the insertion index immediately after the #Mann= data block."""
+        section_end = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+
+        for idx in range(xs_idx, section_end):
+            if lines[idx].startswith("#Mann="):
+                value_str = GeomParser.extract_keyword_value(lines[idx], "#Mann")
+                parts = [p.strip() for p in value_str.split(',')]
+                count = int(parts[0]) if parts and parts[0] else 0
+                return GeomCrossSection._find_mann_data_end(lines, idx, section_end, count)
+
+        return None
+
+    @staticmethod
+    def _find_mann_data_end(
+        lines: List[str],
+        mann_idx: int,
+        section_end: int,
+        count: int,
+    ) -> int:
+        """Find the first line after a Manning's n fixed-width data block."""
+        expected_values = max(int(count), 0) * 3
+        if expected_values == 0:
+            return mann_idx + 1
+
+        values_read = 0
+        data_end = mann_idx + 1
+        for idx in range(mann_idx + 1, section_end):
+            stripped = lines[idx].strip()
+            if stripped and (
+                stripped.startswith("Type RM Length L Ch R =")
+                or stripped.startswith("River Reach=")
+                or "=" in stripped
+            ):
+                break
+
+            parsed_values = GeomParser.parse_fixed_width(
+                lines[idx],
+                column_width=GeomCrossSection.FIXED_WIDTH_COLUMN,
+            )
+            values_read += len(parsed_values)
+            data_end = idx + 1
+            if values_read >= expected_values:
+                break
+
+        return min(data_end, section_end)
+
+    @staticmethod
+    def _format_mannings_n_lines(mann_df: pd.DataFrame) -> List[str]:
+        """
+        Format Manning's n triplets using HEC-RAS-compatible 3-triplet wrapping.
+
+        Station fields keep two decimals, n-values keep three decimals, and the
+        per-triplet change flag is written as zero unless a ChangeFlag column is
+        supplied.
+        """
+        lines = []
+        fields = []
+        for _, row in mann_df.iterrows():
+            change = row["ChangeFlag"] if "ChangeFlag" in mann_df.columns else 0.0
+            fields.extend([
+                f"{float(row['Station']):8.2f}",
+                f"{float(row['n_value']):8.3f}",
+                f"{float(change):8.0f}",
+            ])
+
+        for idx in range(0, len(fields), GeomCrossSection.MANNINGS_VALUES_PER_LINE):
+            row_fields = fields[idx:idx + GeomCrossSection.MANNINGS_VALUES_PER_LINE]
+            lines.append("".join(row_fields) + "\n")
+
+        return lines
+
+    @staticmethod
+    def _prepare_station_elevation_df(sta_elev_df: pd.DataFrame,
+                                      label: str = "sta_elev_df") -> pd.DataFrame:
+        """Validate and normalize station/elevation input for interpolation."""
+        if not isinstance(sta_elev_df, pd.DataFrame):
+            raise ValueError(f"{label} must be a pandas DataFrame")
+        if 'Station' not in sta_elev_df.columns or 'Elevation' not in sta_elev_df.columns:
+            raise ValueError(f"{label} must have 'Station' and 'Elevation' columns")
+        if len(sta_elev_df) < 2:
+            raise ValueError(f"{label} must contain at least two points")
+
+        df = sta_elev_df[['Station', 'Elevation']].copy()
+        df['Station'] = pd.to_numeric(df['Station'], errors='raise')
+        df['Elevation'] = pd.to_numeric(df['Elevation'], errors='raise')
+        df = df.sort_values('Station').reset_index(drop=True)
+
+        if df['Station'].duplicated().any():
+            raise ValueError(f"{label} contains duplicate Station values")
+        if float(df['Station'].iloc[0]) == float(df['Station'].iloc[-1]):
+            raise ValueError(f"{label} station range must be greater than zero")
+
+        return df
+
+    @staticmethod
+    def _station_fractions(stations: np.ndarray) -> np.ndarray:
+        """Map station values to normalized lateral fractions from 0 to 1."""
+        station_min = float(stations[0])
+        station_max = float(stations[-1])
+        return (stations - station_min) / (station_max - station_min)
+
+    @staticmethod
+    def _builder_kwargs(input_spec: Optional[Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge a builder dataclass/mapping with direct keyword overrides."""
+        values: Dict[str, Any] = {}
+        if input_spec is not None:
+            if is_dataclass(input_spec):
+                values.update({
+                    field.name: getattr(input_spec, field.name)
+                    for field in fields(input_spec)
+                })
+            elif isinstance(input_spec, Mapping):
+                values.update(dict(input_spec))
+            else:
+                raise ValueError(
+                    "input_spec must be a CrossSectionBuildInput, dataclass, mapping, or None"
+                )
+        values.update({key: value for key, value in kwargs.items() if value is not None})
+        valid_fields = {field.name for field in fields(CrossSectionBuildInput)}
+        unknown = sorted(set(values) - valid_fields)
+        if unknown:
+            raise ValueError(f"Unknown cross-section builder argument(s): {unknown}")
+        return values
+
+    @staticmethod
+    def _builder_error(fallback_messages: List[str], xs_id: str, message: str) -> None:
+        """Record and ERROR-log a builder fallback with a stable XS identifier."""
+        full_message = f"{xs_id}: {message}"
+        fallback_messages.append(full_message)
+        logger.error(full_message)
+
+    @staticmethod
+    def _extract_xy_points(line_like: Any) -> Optional[List[Tuple[float, float]]]:
+        """Normalize a shapely line or sequence of XY pairs to plain tuples."""
+        if line_like is None:
+            return None
+        if hasattr(line_like, "coords"):
+            return [(float(x), float(y)) for x, y, *_ in line_like.coords]
+        points = []
+        try:
+            for point in line_like:
+                if len(point) < 2:
+                    raise ValueError("Polyline points must contain x and y values")
+                points.append((float(point[0]), float(point[1])))
+        except TypeError as exc:
+            raise ValueError("cut_line and river_centerline must be shapely lines or XY sequences") from exc
+        if len(points) < 2:
+            raise ValueError("Polyline inputs must contain at least two points")
+        return points
+
+    @staticmethod
+    def _profile_from_terrain(
+        cut_line: Any,
+        terrain_profile: Optional[pd.DataFrame],
+        rasmap_path: Optional[Union[str, Path]],
+        geom_hdf_path: Optional[Union[str, Path]],
+        filter_tolerance: float,
+    ) -> Optional[pd.DataFrame]:
+        """Return a normalized terrain profile from supplied data or RasTerrainMod."""
+        if terrain_profile is not None:
+            return GeomCrossSection._prepare_builder_profile_df(
+                terrain_profile,
+                "terrain_profile",
+            )
+
+        if rasmap_path is None or geom_hdf_path is None or cut_line is None:
+            return None
+
+        points = GeomCrossSection._extract_xy_points(cut_line)
+        if not points:
+            return None
+
+        try:
+            from ..terrain.RasTerrainMod import RasTerrainMod
+        except Exception as exc:
+            raise ImportError(
+                "RasTerrainMod is required to sample terrain from rasmap_path and geom_hdf_path"
+            ) from exc
+
+        x_coords = [point[0] for point in points]
+        y_coords = [point[1] for point in points]
+        sampled = RasTerrainMod.get_terrain_profile(
+            rasmap_path,
+            geom_hdf_path,
+            x_coords,
+            y_coords,
+            filter_tolerance=filter_tolerance,
+        )
+        return GeomCrossSection._prepare_builder_profile_df(sampled, "terrain_profile")
+
+    @staticmethod
+    def _prepare_builder_profile_df(profile_df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """Normalize builder profile columns to Station/Elevation."""
+        if not isinstance(profile_df, pd.DataFrame):
+            raise ValueError(f"{label} must be a pandas DataFrame")
+
+        lower_map = {str(col).lower(): col for col in profile_df.columns}
+        station_col = lower_map.get("station")
+        elevation_col = lower_map.get("elevation")
+        if station_col is None or elevation_col is None:
+            raise ValueError(f"{label} must have station/elevation columns")
+
+        df = pd.DataFrame({
+            "Station": pd.to_numeric(profile_df[station_col], errors="raise"),
+            "Elevation": pd.to_numeric(profile_df[elevation_col], errors="raise"),
+        })
+        df = df[np.isfinite(df["Station"]) & np.isfinite(df["Elevation"])]
+        df = df.sort_values("Station").drop_duplicates("Station").reset_index(drop=True)
+        return GeomCrossSection._prepare_station_elevation_df(df, label)
+
+    @staticmethod
+    def _profile_from_adjacent_sections(
+        geom_file: Optional[Union[str, Path]],
+        river: str,
+        reach: str,
+        upstream_rs: Optional[str],
+        downstream_rs: Optional[str],
+        upstream_profile: Optional[pd.DataFrame],
+        downstream_profile: Optional[pd.DataFrame],
+        ratio: float,
+        max_points: int,
+    ) -> Optional[pd.DataFrame]:
+        """Build station/elevation by interpolating adjacent cross sections."""
+        if upstream_profile is not None and downstream_profile is not None:
+            return GeomCrossSection.interpolate_station_elevation(
+                GeomCrossSection._prepare_builder_profile_df(upstream_profile, "upstream_profile"),
+                GeomCrossSection._prepare_builder_profile_df(downstream_profile, "downstream_profile"),
+                ratio=ratio,
+                max_points=max_points,
+            )[["Station", "Elevation"]]
+
+        if geom_file is not None and upstream_rs is not None and downstream_rs is not None:
+            return GeomCrossSection.interpolate_cross_section(
+                geom_file,
+                river,
+                reach,
+                upstream_rs,
+                downstream_rs,
+                ratio=ratio,
+                max_points=max_points,
+            )[["Station", "Elevation"]]
+
+        return None
+
+    @staticmethod
+    def _resolve_reach_lengths(
+        reach_lengths: Optional[Any],
+        length_left: Optional[float],
+        length_channel: Optional[float],
+        length_right: Optional[float],
+        xs_id: str,
+        fallback_messages: List[str],
+    ) -> CrossSectionReachLengths:
+        """Resolve reach lengths with a valid all-zero fallback."""
+        if isinstance(reach_lengths, CrossSectionReachLengths):
+            return reach_lengths
+        if isinstance(reach_lengths, Mapping):
+            length_left = reach_lengths.get("left", reach_lengths.get("Length_Left", length_left))
+            length_channel = reach_lengths.get(
+                "channel",
+                reach_lengths.get("Length_Channel", length_channel),
+            )
+            length_right = reach_lengths.get("right", reach_lengths.get("Length_Right", length_right))
+        elif reach_lengths is not None:
+            values = list(reach_lengths)
+            if len(values) != 3:
+                raise ValueError("reach_lengths must contain left, channel, and right values")
+            length_left, length_channel, length_right = values
+
+        if length_left is None or length_channel is None or length_right is None:
+            GeomCrossSection._builder_error(
+                fallback_messages,
+                xs_id,
+                "reach lengths missing; using default LOB/MC/ROB lengths 0.0, 0.0, 0.0",
+            )
+            length_left = 0.0 if length_left is None else length_left
+            length_channel = 0.0 if length_channel is None else length_channel
+            length_right = 0.0 if length_right is None else length_right
+
+        return CrossSectionReachLengths(
+            left=float(length_left),
+            channel=float(length_channel),
+            right=float(length_right),
+        )
+
+    @staticmethod
+    def _resolve_bank_input(
+        bank_stations: Optional[Any],
+        bank_left: Optional[float],
+        bank_right: Optional[float],
+        bank_left_elevation: Optional[float],
+        bank_right_elevation: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """Normalize bank station inputs from dataclass, mapping, sequence, or kwargs."""
+        if isinstance(bank_stations, CrossSectionBankStations):
+            bank_left = bank_stations.left_station
+            bank_right = bank_stations.right_station
+            bank_left_elevation = bank_stations.left_elevation
+            bank_right_elevation = bank_stations.right_elevation
+        elif isinstance(bank_stations, Mapping):
+            bank_left = bank_stations.get(
+                "left_station",
+                bank_stations.get("bank_left", bank_stations.get("left", bank_left)),
+            )
+            bank_right = bank_stations.get(
+                "right_station",
+                bank_stations.get("bank_right", bank_stations.get("right", bank_right)),
+            )
+            bank_left_elevation = bank_stations.get(
+                "left_elevation",
+                bank_stations.get("bank_left_elevation", bank_left_elevation),
+            )
+            bank_right_elevation = bank_stations.get(
+                "right_elevation",
+                bank_stations.get("bank_right_elevation", bank_right_elevation),
+            )
+        elif bank_stations is not None:
+            values = list(bank_stations)
+            if len(values) not in (2, 4):
+                raise ValueError("bank_stations must contain 2 station values or 4 station/elevation values")
+            bank_left, bank_right = values[:2]
+            if len(values) == 4:
+                bank_left_elevation, bank_right_elevation = values[2:]
+
+        return bank_left, bank_right, bank_left_elevation, bank_right_elevation
+
+    @staticmethod
+    def _center_station_from_intersection(
+        cut_line: Any,
+        river_centerline: Any,
+        profile_df: pd.DataFrame,
+    ) -> Optional[float]:
+        """Project the river-centerline/cut-line intersection onto the XS station axis."""
+        if cut_line is None or river_centerline is None:
+            return None
+
+        try:
+            from shapely.geometry import LineString, Point
+        except ImportError:
+            return None
+
+        def to_line(value: Any) -> LineString:
+            if hasattr(value, "coords"):
+                return value
+            points = GeomCrossSection._extract_xy_points(value)
+            return LineString(points)
+
+        cut = to_line(cut_line)
+        centerline = to_line(river_centerline)
+        if cut.is_empty or centerline.is_empty:
+            return None
+
+        intersection = cut.intersection(centerline)
+        if intersection.is_empty:
+            return None
+        if hasattr(intersection, "geoms"):
+            points = [geom for geom in intersection.geoms if isinstance(geom, Point)]
+            if points:
+                middle = cut.interpolate(0.5, normalized=True)
+                point = min(points, key=lambda item: item.distance(middle))
+            else:
+                point = intersection.centroid
+        elif isinstance(intersection, Point):
+            point = intersection
+        else:
+            point = intersection.centroid
+
+        fraction = cut.project(point) / cut.length if cut.length else 0.5
+        station_min = float(profile_df["Station"].iloc[0])
+        station_max = float(profile_df["Station"].iloc[-1])
+        return station_min + fraction * (station_max - station_min)
+
+    @staticmethod
+    def _derive_default_bank_stations(
+        profile_df: pd.DataFrame,
+        center_station: float,
+        default_width: float,
+    ) -> Tuple[float, float]:
+        """Derive valid default bank stations around a center station."""
+        station_min = float(profile_df["Station"].iloc[0])
+        station_max = float(profile_df["Station"].iloc[-1])
+        if station_max <= station_min:
+            raise ValueError("station/elevation range must be greater than zero")
+
+        width = min(float(default_width), station_max - station_min)
+        if width <= 0:
+            raise ValueError("default_main_channel_width must be positive")
+        half_width = width / 2.0
+        center = min(max(float(center_station), station_min + half_width), station_max - half_width)
+        left = center - half_width
+        right = center + half_width
+
+        if left <= station_min and right >= station_max:
+            margin = (station_max - station_min) * 0.001
+            left = station_min + margin
+            right = station_max - margin
+
+        if left >= right:
+            raise ValueError("Could not derive valid default bank stations")
+        return left, right
+
+    @staticmethod
+    def _resolve_bank_stations(
+        profile_df: pd.DataFrame,
+        terrain_profile: Optional[pd.DataFrame],
+        cut_line: Any,
+        river_centerline: Any,
+        bank_stations: Optional[Any],
+        bank_left: Optional[float],
+        bank_right: Optional[float],
+        bank_left_elevation: Optional[float],
+        bank_right_elevation: Optional[float],
+        default_width: float,
+        xs_id: str,
+        fallback_messages: List[str],
+    ) -> CrossSectionBankStations:
+        """Resolve complete bank station/elevation values."""
+        bank_left, bank_right, bank_left_elevation, bank_right_elevation = (
+            GeomCrossSection._resolve_bank_input(
+                bank_stations,
+                bank_left,
+                bank_right,
+                bank_left_elevation,
+                bank_right_elevation,
+            )
+        )
+
+        bank_source = "user"
+        if bank_left is None or bank_right is None:
+            center_station = GeomCrossSection._center_station_from_intersection(
+                cut_line,
+                river_centerline,
+                profile_df,
+            )
+            if center_station is None:
+                center_station = float(
+                    profile_df.loc[profile_df["Elevation"].idxmin(), "Station"]
+                )
+                GeomCrossSection._builder_error(
+                    fallback_messages,
+                    xs_id,
+                    "bank stations missing and no river-centerline intersection was available; "
+                    f"using thalweg station {center_station:g} as default center",
+                )
+
+            bank_left, bank_right = GeomCrossSection._derive_default_bank_stations(
+                profile_df,
+                center_station,
+                default_width,
+            )
+            bank_source = "default_centerline"
+            GeomCrossSection._builder_error(
+                fallback_messages,
+                xs_id,
+                "bank stations missing; using river-centerline/default main-channel "
+                f"width fallback with MC width {float(default_width):g}",
+            )
+
+        bank_left = float(bank_left)
+        bank_right = float(bank_right)
+        if bank_left >= bank_right:
+            raise ValueError(f"Left bank ({bank_left}) must be < right bank ({bank_right})")
+
+        def interp_elevation(source_profile: pd.DataFrame, station: float) -> float:
+            return float(np.interp(
+                station,
+                source_profile["Station"].to_numpy(dtype=float),
+                source_profile["Elevation"].to_numpy(dtype=float),
+            ))
+
+        if bank_left_elevation is None or bank_right_elevation is None:
+            if terrain_profile is not None:
+                if bank_left_elevation is None:
+                    bank_left_elevation = interp_elevation(terrain_profile, bank_left)
+                if bank_right_elevation is None:
+                    bank_right_elevation = interp_elevation(terrain_profile, bank_right)
+                if bank_source == "user":
+                    bank_source = "user_station_terrain_elevation"
+                GeomCrossSection._builder_error(
+                    fallback_messages,
+                    xs_id,
+                    "bank elevations missing; interpolated LOB/ROB elevations from terrain profile",
+                )
+            else:
+                if bank_left_elevation is None:
+                    bank_left_elevation = interp_elevation(profile_df, bank_left)
+                if bank_right_elevation is None:
+                    bank_right_elevation = interp_elevation(profile_df, bank_right)
+                if bank_source == "user":
+                    bank_source = "user_station_profile_elevation"
+                GeomCrossSection._builder_error(
+                    fallback_messages,
+                    xs_id,
+                    "terrain unavailable for bank elevations; interpolated LOB/ROB elevations "
+                    "from station/elevation profile",
+                )
+
+        return CrossSectionBankStations(
+            left_station=bank_left,
+            right_station=bank_right,
+            left_elevation=float(bank_left_elevation),
+            right_elevation=float(bank_right_elevation),
+            source=bank_source,
+        )
+
+    @staticmethod
+    def _normalize_mannings_input(
+        mannings_n: Optional[Any],
+        n_lob: Optional[float],
+        n_channel: Optional[float],
+        n_rob: Optional[float],
+    ) -> Optional[CrossSectionManningsN]:
+        """Normalize user Manning's n input, returning None when incomplete."""
+        source = "user"
+        if isinstance(mannings_n, CrossSectionManningsN):
+            return mannings_n
+        if isinstance(mannings_n, Mapping):
+            n_lob = mannings_n.get("lob", mannings_n.get("LOB", n_lob))
+            n_channel = mannings_n.get(
+                "channel",
+                mannings_n.get("mc", mannings_n.get("MC", mannings_n.get("main_channel", n_channel))),
+            )
+            n_rob = mannings_n.get("rob", mannings_n.get("ROB", n_rob))
+            source = str(mannings_n.get("source", "user"))
+        elif mannings_n is not None:
+            values = list(mannings_n)
+            if len(values) != 3:
+                raise ValueError("mannings_n must contain LOB, channel, and ROB values")
+            n_lob, n_channel, n_rob = values
+
+        if n_lob is None or n_channel is None or n_rob is None:
+            return None
+
+        return CrossSectionManningsN(
+            lob=float(n_lob),
+            channel=float(n_channel),
+            rob=float(n_rob),
+            source=source,
+        )
+
+    @staticmethod
+    def _lookup_landcover_n(value: Any, table: Optional[pd.DataFrame]) -> Optional[float]:
+        """Map a land-cover sample value or class name to Manning's n."""
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+            if numeric > 0:
+                return numeric
+        except (TypeError, ValueError):
+            pass
+
+        if table is None or table.empty:
+            return None
+        if "Land Cover Name" not in table.columns:
+            return None
+
+        n_col = None
+        for candidate in (
+            "Base Mannings n Value",
+            "Base Manning's n Value",
+            "ManningsN",
+            "Manning's n",
+            "n_value",
+        ):
+            if candidate in table.columns:
+                n_col = candidate
+                break
+        if n_col is None:
+            return None
+
+        matches = table[
+            table["Land Cover Name"].astype(str).str.casefold() == str(value).casefold()
+        ]
+        if matches.empty:
+            return None
+        return float(matches.iloc[0][n_col])
+
+    @staticmethod
+    def _mannings_from_landcover(
+        landcover_samples: Optional[Any],
+        landcover_table: Optional[pd.DataFrame],
+        landcover_geom_file: Optional[Union[str, Path]],
+        landcover_sampler: Optional[Callable[..., Any]],
+        cut_line: Any,
+        profile_df: pd.DataFrame,
+        banks: CrossSectionBankStations,
+    ) -> Optional[CrossSectionManningsN]:
+        """Resolve Manning's n values from supplied land-cover samples/table."""
+        samples = None
+        if landcover_sampler is not None:
+            samples = landcover_sampler(
+                cut_line=cut_line,
+                station_elevation=profile_df,
+                bank_stations=banks,
+            )
+        elif landcover_samples is not None:
+            samples = landcover_samples
+
+        if samples is None:
+            return None
+
+        table = landcover_table
+        if table is None and landcover_geom_file is not None:
+            from .GeomLandCover import GeomLandCover
+            table = GeomLandCover.get_base_mannings_n(landcover_geom_file)
+
+        if isinstance(samples, Mapping):
+            sample_lookup = {str(key).casefold(): value for key, value in samples.items()}
+            lob_sample = sample_lookup.get("lob")
+            channel_sample = sample_lookup.get(
+                "channel",
+                sample_lookup.get("mc", sample_lookup.get("main_channel")),
+            )
+            rob_sample = sample_lookup.get("rob")
+        else:
+            sample_values = list(samples)
+            if len(sample_values) != 3:
+                raise ValueError("landcover_samples must contain LOB, channel, and ROB samples")
+            lob_sample, channel_sample, rob_sample = sample_values
+
+        lob = GeomCrossSection._lookup_landcover_n(lob_sample, table)
+        channel = GeomCrossSection._lookup_landcover_n(channel_sample, table)
+        rob = GeomCrossSection._lookup_landcover_n(rob_sample, table)
+        if lob is None or channel is None or rob is None:
+            return None
+
+        return CrossSectionManningsN(lob=lob, channel=channel, rob=rob, source="landcover")
+
+    @staticmethod
+    def _mannings_summary(mann_df: pd.DataFrame) -> Optional[CrossSectionManningsN]:
+        """Collapse a Manning's n breakpoint table to LOB/Channel/ROB values."""
+        if mann_df is None or mann_df.empty:
+            return None
+
+        lookup = {}
+        if "Subsection" in mann_df.columns:
+            for subsection, key in (("LOB", "lob"), ("Channel", "channel"), ("ROB", "rob")):
+                subset = mann_df[mann_df["Subsection"].astype(str).str.casefold() == subsection.casefold()]
+                if not subset.empty:
+                    lookup[key] = float(subset.iloc[0]["n_value"])
+        else:
+            values = mann_df["n_value"].tolist() if "n_value" in mann_df.columns else []
+            if len(values) >= 3:
+                lookup = {"lob": values[0], "channel": values[1], "rob": values[2]}
+
+        if {"lob", "channel", "rob"}.issubset(lookup):
+            return CrossSectionManningsN(
+                lob=float(lookup["lob"]),
+                channel=float(lookup["channel"]),
+                rob=float(lookup["rob"]),
+                source="neighbor",
+            )
+        return None
+
+    @staticmethod
+    def _mannings_from_neighbors(
+        geom_file: Optional[Union[str, Path]],
+        river: str,
+        reach: str,
+        upstream_rs: Optional[str],
+        downstream_rs: Optional[str],
+        upstream_mannings: Optional[Any],
+        downstream_mannings: Optional[Any],
+        ratio: float,
+    ) -> Optional[CrossSectionManningsN]:
+        """Interpolate Manning's n values from upstream/downstream cross sections."""
+        upstream = GeomCrossSection._normalize_mannings_input(upstream_mannings, None, None, None)
+        downstream = GeomCrossSection._normalize_mannings_input(downstream_mannings, None, None, None)
+
+        if upstream is None and isinstance(upstream_mannings, pd.DataFrame):
+            upstream = GeomCrossSection._mannings_summary(upstream_mannings)
+        if downstream is None and isinstance(downstream_mannings, pd.DataFrame):
+            downstream = GeomCrossSection._mannings_summary(downstream_mannings)
+
+        if upstream is None and geom_file is not None and upstream_rs is not None:
+            upstream = GeomCrossSection._mannings_summary(
+                GeomCrossSection.get_mannings_n(geom_file, river, reach, upstream_rs)
+            )
+        if downstream is None and geom_file is not None and downstream_rs is not None:
+            downstream = GeomCrossSection._mannings_summary(
+                GeomCrossSection.get_mannings_n(geom_file, river, reach, downstream_rs)
+            )
+
+        if upstream is None or downstream is None:
+            return None
+
+        ratio = float(ratio)
+        return CrossSectionManningsN(
+            lob=upstream.lob + ratio * (downstream.lob - upstream.lob),
+            channel=upstream.channel + ratio * (downstream.channel - upstream.channel),
+            rob=upstream.rob + ratio * (downstream.rob - upstream.rob),
+            source="neighbor",
+        )
+
+    @staticmethod
+    def _resolve_mannings_n(
+        strategy: str,
+        user_mannings: Optional[CrossSectionManningsN],
+        landcover_mannings: Optional[CrossSectionManningsN],
+        neighbor_mannings: Optional[CrossSectionManningsN],
+        default_channel: float,
+        default_overbank: float,
+        xs_id: str,
+        fallback_messages: List[str],
+    ) -> CrossSectionManningsN:
+        """Resolve Manning's n according to the requested strategy."""
+        strategy = (strategy or "auto").lower()
+        if strategy == "user":
+            ordered = [user_mannings, landcover_mannings, neighbor_mannings]
+        elif strategy in ("landcover", "land_cover"):
+            ordered = [landcover_mannings, neighbor_mannings, user_mannings]
+        elif strategy in ("neighbor", "adjacent", "interpolate"):
+            ordered = [neighbor_mannings, user_mannings, landcover_mannings]
+        elif strategy == "default":
+            ordered = []
+        else:
+            ordered = [landcover_mannings, neighbor_mannings, user_mannings]
+
+        for candidate in ordered:
+            if candidate is not None:
+                return candidate
+
+        GeomCrossSection._builder_error(
+            fallback_messages,
+            xs_id,
+            "Manning's n data missing; using default fallback "
+            f"MC={float(default_channel):g}, LOB=ROB={float(default_overbank):g}",
+        )
+        return CrossSectionManningsN(
+            lob=float(default_overbank),
+            channel=float(default_channel),
+            rob=float(default_overbank),
+            source="default",
+        )
+
+    @staticmethod
+    def _mannings_breakpoints(
+        profile_df: pd.DataFrame,
+        banks: CrossSectionBankStations,
+        mannings: CrossSectionManningsN,
+    ) -> pd.DataFrame:
+        """Build the three required HEC-RAS Manning's n breakpoints."""
+        station_min = float(profile_df["Station"].iloc[0])
+        return pd.DataFrame({
+            "Station": [station_min, banks.left_station, banks.right_station],
+            "n_value": [mannings.lob, mannings.channel, mannings.rob],
+            "Subsection": ["LOB", "Channel", "ROB"],
+            "Source": [mannings.source] * 3,
+        })
+
+    @staticmethod
+    def _insert_bank_station_elevations(
+        sta_elev_df: pd.DataFrame,
+        banks: CrossSectionBankStations,
+        tolerance: float = 0.005,
+    ) -> pd.DataFrame:
+        """Ensure resolved bank stations are exact profile points with resolved elevations."""
+        result_df = GeomCrossSection._prepare_station_elevation_df(sta_elev_df)
+
+        for bank_sta, bank_elev, label in (
+            (banks.left_station, banks.left_elevation, "left"),
+            (banks.right_station, banks.right_elevation, "right"),
+        ):
+            stations = result_df["Station"].to_numpy(dtype=float)
+            min_station = float(stations[0])
+            max_station = float(stations[-1])
+            if bank_sta < min_station - tolerance or bank_sta > max_station + tolerance:
+                raise ValueError(
+                    f"{label.title()} bank station ({bank_sta}) must be within "
+                    f"station/elevation range {min_station:g} to {max_station:g}"
+                )
+
+            diffs = np.abs(stations - float(bank_sta))
+            nearest_idx = int(np.argmin(diffs))
+            if diffs[nearest_idx] <= tolerance:
+                result_df.loc[nearest_idx, "Station"] = float(bank_sta)
+                result_df.loc[nearest_idx, "Elevation"] = float(bank_elev)
+            else:
+                result_df = pd.concat(
+                    [
+                        result_df,
+                        pd.DataFrame({
+                            "Station": [float(bank_sta)],
+                            "Elevation": [float(bank_elev)],
+                        }),
+                    ],
+                    ignore_index=True,
+                )
+                result_df = result_df.sort_values("Station").reset_index(drop=True)
+
+        return result_df
+
+    @staticmethod
+    def _reduce_station_elevation_points(
+        sta_elev_df: pd.DataFrame,
+        preserve_stations: Optional[Sequence[float]] = None,
+        max_points: int = MAX_XS_POINTS,
+    ) -> pd.DataFrame:
+        """
+        Reduce station/elevation points while preserving hydraulic control points.
+
+        The reduction is a Douglas-Peucker-style max-error selection by station.
+        It always keeps endpoints, supplied bank stations, the thalweg, and the
+        strongest slope-break candidates before filling remaining points by
+        largest vertical deviation from adjacent retained segments.
+        """
+        df = GeomCrossSection._prepare_station_elevation_df(sta_elev_df)
+        max_points = int(max_points)
+        if max_points < 2:
+            raise ValueError("max_points must be at least 2")
+        if max_points > GeomCrossSection.MAX_XS_POINTS:
+            raise ValueError(
+                f"max_points ({max_points}) exceeds HEC-RAS limit of "
+                f"{GeomCrossSection.MAX_XS_POINTS}"
+            )
+        if len(df) <= max_points:
+            return df.reset_index(drop=True)
+
+        stations = df["Station"].to_numpy(dtype=float)
+        elevations = df["Elevation"].to_numpy(dtype=float)
+        selected = {0, len(df) - 1, int(np.argmin(elevations))}
+
+        if preserve_stations:
+            for station in preserve_stations:
+                idx = int(np.argmin(np.abs(stations - float(station))))
+                selected.add(idx)
+
+        if len(df) > 2 and max_points > len(selected):
+            slopes = np.diff(elevations) / np.diff(stations)
+            finite = np.isfinite(slopes)
+            if np.any(finite) and len(slopes) > 1:
+                slope_change = np.abs(np.diff(np.where(finite, slopes, 0.0)))
+                slope_budget = max(1, min(50, max_points // 10, max_points - len(selected)))
+                for local_idx in np.argsort(slope_change)[::-1][:slope_budget]:
+                    selected.add(int(local_idx) + 1)
+                    if len(selected) >= max_points:
+                        break
+
+        if len(selected) > max_points:
+            critical = [0, len(df) - 1, int(np.argmin(elevations))]
+            if preserve_stations:
+                for station in preserve_stations:
+                    critical.append(int(np.argmin(np.abs(stations - float(station)))))
+            selected = set(dict.fromkeys(critical[:max_points]))
+
+        selected_list = sorted(selected)
+        while len(selected_list) < max_points:
+            best_error = -1.0
+            best_idx = None
+
+            for left_idx, right_idx in zip(selected_list[:-1], selected_list[1:]):
+                if right_idx - left_idx <= 1:
+                    continue
+                x0 = stations[left_idx]
+                x1 = stations[right_idx]
+                y0 = elevations[left_idx]
+                y1 = elevations[right_idx]
+                interior = np.arange(left_idx + 1, right_idx)
+                line_y = np.interp(stations[interior], [x0, x1], [y0, y1])
+                errors = np.abs(elevations[interior] - line_y)
+                local_pos = int(np.argmax(errors))
+                if float(errors[local_pos]) > best_error:
+                    best_error = float(errors[local_pos])
+                    best_idx = int(interior[local_pos])
+
+            if best_idx is None:
+                break
+            selected_list.append(best_idx)
+            selected_list = sorted(set(selected_list))
+
+        return df.iloc[selected_list].reset_index(drop=True)
+
+    @staticmethod
+    def _format_cross_section_entry(
+        river: str,
+        reach: str,
+        rs: str,
+        sta_elev_df: pd.DataFrame,
+        banks: CrossSectionBankStations,
+        mann_df: pd.DataFrame,
+        reach_lengths: CrossSectionReachLengths,
+        cut_line: Optional[Any] = None,
+        include_gis_cut_line: bool = True,
+    ) -> List[str]:
+        """Format a complete HEC-RAS Type 1 cross-section geometry block."""
+        lines = [
+            (
+                "Type RM Length L Ch R = 1 ,"
+                f"{rs},{reach_lengths.left:8.2f},{reach_lengths.channel:8.2f},"
+                f"{reach_lengths.right:8.2f}\n"
+            ),
+            GeomCrossSection._bank_station_line(banks.left_station, banks.right_station),
+        ]
+
+        if include_gis_cut_line and cut_line is not None:
+            points = GeomCrossSection._extract_xy_points(cut_line)
+            if points:
+                xy_values = []
+                for x_value, y_value in points:
+                    xy_values.extend([x_value, y_value])
+                lines.append(f"XS GIS Cut Line= {len(points)}\n")
+                lines.extend(
+                    GeomParser.format_fixed_width(
+                        xy_values,
+                        column_width=16,
+                        values_per_line=4,
+                        precision=2,
+                    )
+                )
+
+        sta_elev_values = []
+        for _, row in sta_elev_df.iterrows():
+            sta_elev_values.extend([float(row["Station"]), float(row["Elevation"])])
+        lines.append(f"#Sta/Elev= {len(sta_elev_df)}\n")
+        lines.extend(
+            GeomParser.format_fixed_width(
+                sta_elev_values,
+                column_width=GeomCrossSection.FIXED_WIDTH_COLUMN,
+                values_per_line=GeomCrossSection.VALUES_PER_LINE,
+                precision=2,
+            )
+        )
+
+        mann_values = []
+        for _, row in mann_df.iterrows():
+            mann_values.extend([float(row["Station"]), float(row["n_value"]), 0.0])
+        lines.append(f"#Mann= {len(mann_df)} , 0 , 0\n")
+        lines.extend(
+            GeomParser.format_fixed_width(
+                mann_values,
+                column_width=GeomCrossSection.FIXED_WIDTH_COLUMN,
+                values_per_line=GeomCrossSection.VALUES_PER_LINE,
+                precision=2,
+            )
+        )
+        return lines
+
     # ========== PUBLIC API METHODS ==========
+
+    @staticmethod
+    @log_call
+    def build_cross_section(
+        input_spec: Optional[CrossSectionBuildInput] = None,
+        **kwargs,
+    ) -> CrossSectionBuildResult:
+        """
+        Build a complete, valid HEC-RAS Type 1 cross-section entry.
+
+        The builder accepts either a :class:`CrossSectionBuildInput` dataclass
+        or flexible keyword arguments. It resolves station/elevation data, bank
+        stations/elevations, Manning's n values, and reach lengths, then returns
+        formatted geometry-file lines. Fallbacks always produce complete geometry
+        and are logged at ERROR level with the ``river/reach/RS`` identifier.
+
+        Station/elevation resolution:
+            1. ``station_elevation`` DataFrame when supplied.
+            2. Terrain profile from ``terrain_profile`` or
+               ``RasTerrainMod.get_terrain_profile(rasmap_path, geom_hdf_path)``.
+            3. Interpolation from adjacent cross sections using supplied
+               upstream/downstream profiles or ``geom_file`` + source RS values.
+
+        Bank station resolution:
+            1. Caller-specified station and elevation values.
+            2. Caller-specified stations with elevations from terrain.
+            3. River-centerline/cut-line intersection with default 20-unit
+               main-channel width.
+            4. Bank elevations interpolated from the station/elevation profile
+               when terrain is unavailable.
+
+        Manning's n resolution follows ``mannings_strategy``:
+            - ``auto``/``landcover``: land cover, neighbor interpolation, user,
+              defaults.
+            - ``neighbor``/``adjacent``: neighbor interpolation, user, land cover,
+              defaults.
+            - ``user``: user, land cover, neighbor, defaults.
+            - ``default``: logged defaults only.
+
+        Parameters:
+            input_spec: Optional dataclass or mapping of builder inputs.
+            **kwargs: Builder fields; see :class:`CrossSectionBuildInput`.
+
+        Returns:
+            CrossSectionBuildResult with resolved DataFrames and formatted lines.
+
+        Raises:
+            ValueError: If required geometry cannot be resolved or inputs are invalid.
+        """
+        values = GeomCrossSection._builder_kwargs(input_spec, kwargs)
+
+        river = str(values.get("river", "")).strip()
+        reach = str(values.get("reach", "")).strip()
+        rs = str(values.get("rs", "")).strip()
+        if not river or not reach or not rs:
+            raise ValueError("river, reach, and rs are required")
+
+        xs_id = GeomCrossSection._make_xs_id(river, reach, rs)
+        fallback_messages: List[str] = []
+
+        strategy = values.get("strategy")
+        station_strategy = values.get("station_elevation_strategy", "auto")
+        bank_strategy = values.get("bank_strategy", "auto")
+        mannings_strategy = values.get("mannings_strategy", "auto")
+        if strategy is not None:
+            strategy_l = str(strategy).lower()
+            if station_strategy == "auto" and strategy_l in ("user", "terrain", "adjacent"):
+                station_strategy = strategy_l
+            if bank_strategy == "auto" and strategy_l in ("user", "centerline", "auto"):
+                bank_strategy = strategy_l
+            if mannings_strategy == "auto" and strategy_l in (
+                "user",
+                "landcover",
+                "neighbor",
+                "adjacent",
+                "default",
+            ):
+                mannings_strategy = strategy_l
+
+        max_points = int(values.get("max_points", GeomCrossSection.MAX_XS_POINTS))
+        if max_points > GeomCrossSection.MAX_XS_POINTS:
+            raise ValueError(
+                f"max_points ({max_points}) exceeds HEC-RAS limit of "
+                f"{GeomCrossSection.MAX_XS_POINTS}"
+            )
+
+        explicit_profile = values.get("station_elevation")
+        if explicit_profile is not None:
+            profile_df = GeomCrossSection._prepare_builder_profile_df(
+                explicit_profile,
+                "station_elevation",
+            )
+        else:
+            profile_df = None
+
+        terrain_profile = GeomCrossSection._profile_from_terrain(
+            values.get("cut_line"),
+            values.get("terrain_profile"),
+            values.get("rasmap_path"),
+            values.get("geom_hdf_path"),
+            float(values.get("terrain_filter_tolerance", 0.01)),
+        )
+
+        station_strategy = str(station_strategy or "auto").lower()
+        if profile_df is None:
+            if station_strategy in ("terrain", "auto") and terrain_profile is not None:
+                profile_df = terrain_profile
+            else:
+                adjacent_profile = GeomCrossSection._profile_from_adjacent_sections(
+                    values.get("geom_file"),
+                    river,
+                    reach,
+                    values.get("upstream_rs"),
+                    values.get("downstream_rs"),
+                    values.get("upstream_profile"),
+                    values.get("downstream_profile"),
+                    float(values.get("interpolation_ratio", 0.5)),
+                    max_points=max_points,
+                )
+                if adjacent_profile is not None:
+                    profile_df = adjacent_profile
+                    GeomCrossSection._builder_error(
+                        fallback_messages,
+                        xs_id,
+                        "station/elevation terrain data missing; interpolated profile "
+                        "from adjacent cross sections",
+                    )
+
+        if profile_df is None:
+            raise ValueError(
+                "station/elevation could not be resolved from explicit data, terrain, "
+                "or adjacent cross sections"
+            )
+
+        force_centerline_banks = str(bank_strategy or "auto").lower() in (
+            "centerline",
+            "auto_centerline",
+        )
+        banks = GeomCrossSection._resolve_bank_stations(
+            profile_df=profile_df,
+            terrain_profile=terrain_profile,
+            cut_line=values.get("cut_line"),
+            river_centerline=values.get("river_centerline"),
+            bank_stations=None if force_centerline_banks else values.get("bank_stations"),
+            bank_left=None if force_centerline_banks else values.get("bank_left"),
+            bank_right=None if force_centerline_banks else values.get("bank_right"),
+            bank_left_elevation=None if force_centerline_banks else values.get("bank_left_elevation"),
+            bank_right_elevation=None if force_centerline_banks else values.get("bank_right_elevation"),
+            default_width=float(values.get("default_main_channel_width", 20.0)),
+            xs_id=xs_id,
+            fallback_messages=fallback_messages,
+        )
+
+        profile_with_banks = GeomCrossSection._insert_bank_station_elevations(profile_df, banks)
+        reduced_profile = GeomCrossSection._reduce_station_elevation_points(
+            profile_with_banks,
+            preserve_stations=[banks.left_station, banks.right_station],
+            max_points=max_points,
+        )
+
+        # The reduction keeps bank stations by index. Re-run exact insertion to
+        # guard against any floating-point drift from simplification.
+        reduced_profile = GeomCrossSection._insert_bank_station_elevations(
+            reduced_profile,
+            banks,
+        )
+        if len(reduced_profile) > max_points:
+            reduced_profile = GeomCrossSection._reduce_station_elevation_points(
+                reduced_profile,
+                preserve_stations=[banks.left_station, banks.right_station],
+                max_points=max_points,
+            )
+
+        user_mannings = GeomCrossSection._normalize_mannings_input(
+            values.get("mannings_n"),
+            values.get("n_lob"),
+            values.get("n_channel"),
+            values.get("n_rob"),
+        )
+
+        full_user_inputs = (
+            explicit_profile is not None
+            and values.get("reach_lengths") is not None
+            and user_mannings is not None
+            and values.get("bank_stations") is not None
+        )
+        if full_user_inputs and str(mannings_strategy).lower() == "auto":
+            mannings_strategy = "user"
+
+        landcover_mannings = GeomCrossSection._mannings_from_landcover(
+            values.get("landcover_samples"),
+            values.get("landcover_table"),
+            values.get("landcover_geom_file"),
+            values.get("landcover_sampler"),
+            values.get("cut_line"),
+            reduced_profile,
+            banks,
+        )
+        neighbor_mannings = GeomCrossSection._mannings_from_neighbors(
+            values.get("geom_file"),
+            river,
+            reach,
+            values.get("upstream_rs"),
+            values.get("downstream_rs"),
+            values.get("upstream_mannings"),
+            values.get("downstream_mannings"),
+            float(values.get("interpolation_ratio", 0.5)),
+        )
+        resolved_mannings = GeomCrossSection._resolve_mannings_n(
+            str(mannings_strategy),
+            user_mannings,
+            landcover_mannings,
+            neighbor_mannings,
+            float(values.get("default_n_channel", 0.06)),
+            float(values.get("default_n_overbank", 0.08)),
+            xs_id,
+            fallback_messages,
+        )
+        mann_df = GeomCrossSection._mannings_breakpoints(
+            reduced_profile,
+            banks,
+            resolved_mannings,
+        )
+
+        reach_lengths = GeomCrossSection._resolve_reach_lengths(
+            values.get("reach_lengths"),
+            values.get("length_left"),
+            values.get("length_channel"),
+            values.get("length_right"),
+            xs_id,
+            fallback_messages,
+        )
+
+        lines = GeomCrossSection._format_cross_section_entry(
+            river,
+            reach,
+            rs,
+            reduced_profile,
+            banks,
+            mann_df,
+            reach_lengths,
+            cut_line=values.get("cut_line"),
+            include_gis_cut_line=bool(values.get("include_gis_cut_line", True)),
+        )
+
+        return CrossSectionBuildResult(
+            river=river,
+            reach=reach,
+            rs=rs,
+            station_elevation=reduced_profile,
+            bank_stations=banks,
+            mannings_n=mann_df,
+            reach_lengths=reach_lengths,
+            lines=lines,
+            fallback_messages=fallback_messages,
+        )
 
     @staticmethod
     @log_call
@@ -446,6 +2206,385 @@ class GeomCrossSection:
 
     @staticmethod
     @log_call
+    def parse_blocked_obstructions(data_lines: List[str], expected_count: int) -> List[Any]:
+        """
+        Parse blocked obstruction fixed-width data into obstruction objects.
+
+        ``#Block Obstruct=`` data is stored in 8-character columns as
+        ``start_sta, end_sta, elevation`` triplets, with up to three
+        obstructions per line.
+
+        Parameters:
+            data_lines: Fixed-width data lines following ``#Block Obstruct=``.
+            expected_count: Obstruction count declared in the header.
+
+        Returns:
+            List of ``BlockedObstruction`` objects.
+        """
+        from ..fixit.obstructions import BlockedObstruction
+
+        expected_count = int(expected_count)
+        if expected_count <= 0:
+            return []
+
+        values = []
+        for line in data_lines:
+            for idx in range(0, len(line.rstrip("\n\r")), GeomCrossSection.FIXED_WIDTH_COLUMN):
+                token = line[idx:idx + GeomCrossSection.FIXED_WIDTH_COLUMN].strip()
+                if not token:
+                    continue
+                try:
+                    values.append(float(token))
+                except ValueError:
+                    logger.debug(f"Skipping non-numeric blocked obstruction token: {token!r}")
+
+        parsed_count = len(values) // 3
+        if parsed_count < expected_count:
+            logger.warning(
+                f"Expected {expected_count} blocked obstructions, parsed {parsed_count}"
+            )
+        elif parsed_count > expected_count:
+            logger.debug(
+                f"Parsed {parsed_count} blocked obstruction triplets; using header count "
+                f"{expected_count}"
+            )
+
+        obstructions = []
+        for idx in range(min(parsed_count, expected_count)):
+            value_idx = idx * 3
+            obstructions.append(
+                BlockedObstruction(
+                    start_sta=values[value_idx],
+                    end_sta=values[value_idx + 1],
+                    elevation=values[value_idx + 2],
+                )
+            )
+
+        return obstructions
+
+    @staticmethod
+    @log_call
+    def format_blocked_obstructions(obstructions: Any) -> List[str]:
+        """
+        Format blocked obstructions for a HEC-RAS geometry text file.
+
+        Values are written as 8-character fixed-width fields with 9 values per
+        line, matching three ``start_sta, end_sta, elevation`` triplets per
+        line. Lines include trailing newlines and are ready for ``writelines``.
+        """
+        normalized = GeomCrossSection._normalize_blocked_obstructions(obstructions)
+
+        values = []
+        for obs in normalized:
+            values.extend([obs.start_sta, obs.end_sta, obs.elevation])
+
+        lines = []
+        for idx in range(0, len(values), GeomCrossSection.BLOCKED_OBSTRUCTION_VALUES_PER_LINE):
+            row_values = values[idx:idx + GeomCrossSection.BLOCKED_OBSTRUCTION_VALUES_PER_LINE]
+            line = "".join(
+                GeomCrossSection._format_blocked_obstruction_value(value)
+                for value in row_values
+            )
+            lines.append(line + "\n")
+
+        return lines
+
+    @staticmethod
+    @log_call
+    def get_blocked_obstructions(
+        geom_number: Union[str, Number, Path],
+        xs_id: Optional[Any] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """
+        Read blocked obstruction triplets from one or all cross sections.
+
+        Parameters:
+            geom_number: Geometry number (``"01"`` or ``1``) or direct path to
+                a ``.g##`` text geometry file.
+            xs_id: Optional cross-section identifier. Accepts the ``xs_id``
+                returned by this method, a unique RS string, ``(river, reach,
+                rs)``, or a mapping with River/Reach/RS fields.
+            ras_object: Optional ``RasPrj`` instance for geometry-number
+                resolution.
+
+        Returns:
+            DataFrame with at least ``xs_id``, ``start_sta``, ``end_sta``, and
+            ``elevation`` columns. River, Reach, RS, and obstruction_index are
+            included for review and unambiguous round trips.
+        """
+        geom_file = GeomCrossSection._resolve_geom_text_path(
+            geom_number,
+            ras_object=ras_object,
+        )
+
+        with open(geom_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+
+        xs_df = GeomCrossSection.get_cross_sections(geom_file)
+        if xs_id is not None:
+            river, reach, rs = GeomCrossSection._resolve_xs_identifier(xs_id, xs_df)
+            xs_df = xs_df[
+                (xs_df["River"].astype(str) == river)
+                & (xs_df["Reach"].astype(str) == reach)
+                & (xs_df["RS"].astype(str) == rs)
+            ]
+
+        rows = []
+        for _, xs_row in xs_df.iterrows():
+            river = str(xs_row["River"])
+            reach = str(xs_row["Reach"])
+            rs = str(xs_row["RS"])
+            section_idx = GeomCrossSection._find_cross_section(lines, river, reach, rs)
+            if section_idx is None:
+                continue
+
+            block = GeomCrossSection._find_blocked_obstruction_block(lines, section_idx)
+            if block is None:
+                continue
+
+            _, data_start, data_end, count = block
+            data_lines = [line for line in lines[data_start:data_end] if line.strip()]
+            obstructions = GeomCrossSection.parse_blocked_obstructions(data_lines, count)
+            current_xs_id = GeomCrossSection._make_xs_id(river, reach, rs)
+
+            for obs_idx, obs in enumerate(obstructions):
+                rows.append({
+                    "xs_id": current_xs_id,
+                    "River": river,
+                    "Reach": reach,
+                    "RS": rs,
+                    "obstruction_index": obs_idx,
+                    "start_sta": obs.start_sta,
+                    "end_sta": obs.end_sta,
+                    "elevation": obs.elevation,
+                })
+
+        columns = [
+            "xs_id",
+            "River",
+            "Reach",
+            "RS",
+            "obstruction_index",
+            "start_sta",
+            "end_sta",
+            "elevation",
+        ]
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
+    @log_call
+    def set_blocked_obstructions(
+        geom_number: Union[str, Number, Path],
+        xs_id: Any,
+        obstructions: Any,
+        create_backup: bool = True,
+        ras_object=None,
+    ) -> Optional[Path]:
+        """
+        Write blocked obstruction triplets to a cross section.
+
+        Parameters:
+            geom_number: Geometry number (``"01"`` or ``1``) or direct path to
+                a ``.g##`` text geometry file.
+            xs_id: Cross-section identifier from ``get_blocked_obstructions()``,
+                a unique RS string, ``(river, reach, rs)``, or a mapping with
+                River/Reach/RS fields.
+            obstructions: DataFrame/list containing ``start_sta``, ``end_sta``,
+                and ``elevation`` values, or ``BlockedObstruction`` objects.
+            create_backup: Whether to create a ``.bak`` backup before writing.
+            ras_object: Optional ``RasPrj`` instance for geometry-number
+                resolution.
+
+        Returns:
+            Optional backup path if ``create_backup=True`` and the file changed.
+        """
+        geom_file = GeomCrossSection._resolve_geom_text_path(
+            geom_number,
+            ras_object=ras_object,
+        )
+        normalized = GeomCrossSection._normalize_blocked_obstructions(obstructions)
+
+        with open(geom_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+
+        xs_df = GeomCrossSection.get_cross_sections(geom_file)
+        river, reach, rs = GeomCrossSection._resolve_xs_identifier(xs_id, xs_df)
+        xs_idx = GeomCrossSection._find_cross_section(lines, river, reach, rs)
+        if xs_idx is None:
+            raise ValueError(f"Cross section not found: {river}/{reach}/RS {rs}")
+
+        block = GeomCrossSection._find_blocked_obstruction_block(lines, xs_idx)
+        new_count = len(normalized)
+
+        if block is None and new_count == 0:
+            logger.info(
+                f"No blocked obstruction block to clear for {river}/{reach}/RS {rs}"
+            )
+            return None
+
+        modified_lines = lines.copy()
+        if block is not None:
+            header_idx, _, data_end, _ = block
+            if new_count == 0:
+                modified_lines = modified_lines[:header_idx] + modified_lines[data_end:]
+            else:
+                new_lines = (
+                    [f"#Block Obstruct= {new_count}\n"]
+                    + GeomCrossSection.format_blocked_obstructions(normalized)
+                )
+                modified_lines = (
+                    modified_lines[:header_idx]
+                    + new_lines
+                    + modified_lines[data_end:]
+                )
+        else:
+            insert_idx = GeomCrossSection._blocked_obstruction_insert_index(
+                modified_lines,
+                xs_idx,
+            )
+            new_lines = (
+                [f"#Block Obstruct= {new_count}\n"]
+                + GeomCrossSection.format_blocked_obstructions(normalized)
+            )
+            modified_lines = (
+                modified_lines[:insert_idx]
+                + new_lines
+                + modified_lines[insert_idx:]
+            )
+
+        backup_path = GeomParser.safe_write_geometry(
+            geom_file,
+            modified_lines,
+            create_backup=create_backup,
+        )
+
+        logger.info(
+            f"Updated blocked obstructions for {river}/{reach}/RS {rs}: "
+            f"{new_count} obstructions written"
+        )
+        return backup_path
+
+    @staticmethod
+    @log_call
+    def validate_blocked_obstructions_hdf(
+        geom_number: Union[str, Number, Path],
+        hdf_path: Optional[Union[str, Path]] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """
+        Cross-check text ``#Block Obstruct=`` data against HDF block-mode flags.
+
+        The geometry HDF exposes ``Obstr Block Mode`` as a cross-section
+        attribute. That flag does not contain the obstruction triplets, so this
+        validation compares per-cross-section text obstruction presence/count
+        with whether the HDF flag indicates blocked-obstruction mode.
+
+        Parameters:
+            geom_number: Geometry number or direct ``.g##`` text path.
+            hdf_path: Optional explicit geometry HDF path. If omitted,
+                ``<geom_file>.hdf`` is used.
+            ras_object: Optional ``RasPrj`` instance for geometry-number
+                resolution.
+
+        Returns:
+            DataFrame with one row per text geometry cross section and a
+            ``matches_hdf`` boolean.
+        """
+        geom_file = GeomCrossSection._resolve_geom_text_path(
+            geom_number,
+            ras_object=ras_object,
+        )
+        if hdf_path is None:
+            hdf_file = Path(str(geom_file) + ".hdf")
+        else:
+            hdf_file = Path(hdf_path)
+        if not hdf_file.exists():
+            raise FileNotFoundError(f"Geometry HDF file not found: {hdf_file}")
+
+        xs_df = GeomCrossSection.get_cross_sections(geom_file)
+        validation = xs_df[["River", "Reach", "RS"]].copy()
+        validation["xs_id"] = validation.apply(
+            lambda row: GeomCrossSection._make_xs_id(row["River"], row["Reach"], row["RS"]),
+            axis=1,
+        )
+
+        obs_df = GeomCrossSection.get_blocked_obstructions(
+            geom_file,
+            ras_object=ras_object,
+        )
+        counts = (
+            obs_df.groupby("xs_id")
+            .size()
+            .rename("text_obstruction_count")
+            .reset_index()
+        )
+        validation = validation.merge(
+            counts,
+            on="xs_id",
+            how="left",
+        )
+        validation["text_obstruction_count"] = (
+            validation["text_obstruction_count"].fillna(0).astype(int)
+        )
+        validation["text_has_blocked_obstructions"] = (
+            validation["text_obstruction_count"] > 0
+        )
+
+        from ..hdf.HdfXsec import HdfXsec
+        hdf_df = HdfXsec.get_cross_sections(hdf_file, ras_object=ras_object)
+        if hdf_df.empty:
+            validation["hdf_obstr_block_mode"] = pd.NA
+            validation["hdf_has_blocked_obstructions"] = pd.NA
+            validation["matches_hdf"] = False
+            return validation[
+                [
+                    "xs_id",
+                    "River",
+                    "Reach",
+                    "RS",
+                    "text_obstruction_count",
+                    "text_has_blocked_obstructions",
+                    "hdf_obstr_block_mode",
+                    "hdf_has_blocked_obstructions",
+                    "matches_hdf",
+                ]
+            ]
+
+        hdf_validation = hdf_df[["River", "Reach", "RS", "Obstr Block Mode"]].copy()
+        hdf_validation["xs_id"] = hdf_validation.apply(
+            lambda row: GeomCrossSection._make_xs_id(row["River"], row["Reach"], row["RS"]),
+            axis=1,
+        )
+        hdf_validation = hdf_validation[["xs_id", "Obstr Block Mode"]].rename(
+            columns={"Obstr Block Mode": "hdf_obstr_block_mode"}
+        )
+
+        validation = validation.merge(hdf_validation, on="xs_id", how="left")
+        validation["hdf_has_blocked_obstructions"] = (
+            validation["hdf_obstr_block_mode"].fillna(0).astype(float) != 0
+        )
+        validation["matches_hdf"] = (
+            validation["text_has_blocked_obstructions"]
+            == validation["hdf_has_blocked_obstructions"]
+        )
+
+        return validation[
+            [
+                "xs_id",
+                "River",
+                "Reach",
+                "RS",
+                "text_obstruction_count",
+                "text_has_blocked_obstructions",
+                "hdf_obstr_block_mode",
+                "hdf_has_blocked_obstructions",
+                "matches_hdf",
+            ]
+        ]
+
+    @staticmethod
+    @log_call
     def get_station_elevation(geom_file: Union[str, Path],
                              river: str,
                              reach: str,
@@ -509,7 +2648,7 @@ class GeomCrossSection:
                         lines, j + 1, count, 'Station', 'Elevation'
                     )
 
-                    logger.info(
+                    logger.debug(
                         f"Extracted {len(df)} station/elevation pairs for "
                         f"{river}/{reach}/RS {rs}"
                     )
@@ -537,7 +2676,8 @@ class GeomCrossSection:
                              rs: str,
                              sta_elev_df: pd.DataFrame,
                              bank_left: Optional[float] = None,
-                             bank_right: Optional[float] = None):
+                             bank_right: Optional[float] = None,
+                             create_backup: bool = True) -> Optional[Path]:
         """
         Write station/elevation pairs to a cross section with automatic bank interpolation.
 
@@ -547,7 +2687,9 @@ class GeomCrossSection:
         CRITICAL REQUIREMENTS (HEC-RAS compatibility):
         - Bank stations MUST appear as exact points in station/elevation data
         - This method automatically interpolates elevations at bank locations
-        - Maximum 450 points per cross section (HEC-RAS hard limit)
+        - Existing points within 0.005 units of a bank station are snapped to
+          the exact bank value rather than inserting a near-duplicate point
+        - Maximum 500 points per cross section (HEC-RAS hard limit)
 
         Parameters:
             geom_file (Union[str, Path]): Path to geometry file
@@ -558,10 +2700,14 @@ class GeomCrossSection:
             bank_left (Optional[float]): Left bank station. If provided, updates bank in file.
                                          If None, reads existing banks and interpolates them.
             bank_right (Optional[float]): Right bank station. If provided, updates bank in file.
+            create_backup (bool): Whether to create a .bak backup before modification (default True).
+
+        Returns:
+            Optional[Path]: Backup path if create_backup=True, otherwise None.
 
         Raises:
-            FileNotFoundError: If geometry file doesn't exist
-            ValueError: If cross section not found, DataFrame invalid, or >450 points
+            FileNotFoundError: If geometry file does not exist
+            ValueError: If cross section not found, DataFrame invalid, or >500 points
             IOError: If file write fails
 
         Example:
@@ -589,22 +2735,21 @@ class GeomCrossSection:
         if len(sta_elev_df) == 0:
             raise ValueError("DataFrame cannot be empty")
 
-        # Validate banks if provided
-        if bank_left is not None and bank_right is not None:
-            if bank_left >= bank_right:
-                raise ValueError(f"Left bank ({bank_left}) must be < right bank ({bank_right})")
-
         # Validate initial point count (before interpolation)
         if len(sta_elev_df) > GeomCrossSection.MAX_XS_POINTS:
             raise ValueError(
-                f"Cross section has {len(sta_elev_df)} points, exceeds HEC-RAS limit of {GeomCrossSection.MAX_XS_POINTS} points.\n"
+                f"Cross section has {len(sta_elev_df)} points, exceeds HEC-RAS "
+                f"limit of {GeomCrossSection.MAX_XS_POINTS} points.\n"
                 f"Reduce point count by decimating or simplifying the cross section geometry."
             )
 
+        backup_path = None
+
         try:
             # Create backup
-            backup_path = GeomParser.create_backup(geom_file)
-            logger.info(f"Created backup: {backup_path}")
+            if create_backup:
+                backup_path = GeomParser.create_backup(geom_file)
+                logger.info(f"Created backup: {backup_path}")
 
             with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
@@ -630,6 +2775,20 @@ class GeomCrossSection:
 
             final_bank_left = bank_left if bank_left is not None else existing_bank_left
             final_bank_right = bank_right if bank_right is not None else existing_bank_right
+
+            if (bank_left is not None or bank_right is not None) and (
+                final_bank_left is None or final_bank_right is None
+            ):
+                raise ValueError(
+                    "Both bank_left and bank_right are required when no existing "
+                    "Bank Sta= line supplies the missing value"
+                )
+
+            if final_bank_left is not None and final_bank_right is not None:
+                if final_bank_left >= final_bank_right:
+                    raise ValueError(
+                        f"Left bank ({final_bank_left}) must be < right bank ({final_bank_right})"
+                    )
 
             # Interpolate at bank stations (HEC-RAS requirement)
             sta_elev_with_banks = GeomCrossSection._interpolate_at_banks(
@@ -665,7 +2824,9 @@ class GeomCrossSection:
                     old_total_values = GeomParser.interpret_count("#Sta/Elev", old_count)
 
                     # Calculate old data line count
-                    old_data_lines = (old_total_values + GeomCrossSection.VALUES_PER_LINE - 1) // GeomCrossSection.VALUES_PER_LINE
+                    old_data_lines = (
+                        old_total_values + GeomCrossSection.VALUES_PER_LINE - 1
+                    ) // GeomCrossSection.VALUES_PER_LINE
 
                     # Prepare new data (using bank-interpolated DataFrame)
                     new_count = len(sta_elev_with_banks)
@@ -684,54 +2845,56 @@ class GeomCrossSection:
                         precision=2
                     )
 
-                    # Update count line
-                    modified_lines[j] = f"#Sta/Elev= {new_count}\n"
+                    # Replace count and data lines as one block so longer
+                    # rewrites do not overwrite following geometry keywords.
+                    data_start = j + 1
+                    data_end = data_start + old_data_lines
+                    modified_lines = (
+                        modified_lines[:j]
+                        + [f"#Sta/Elev= {new_count}\n"]
+                        + new_data_lines
+                        + modified_lines[data_end:]
+                    )
 
-                    # Replace data lines
-                    # Remove old data lines
-                    for k in range(old_data_lines):
-                        if j + 1 + k < len(modified_lines):
-                            modified_lines[j + 1 + k] = None  # Mark for deletion
-
-                    # Insert new data lines
-                    for k, data_line in enumerate(new_data_lines):
-                        if j + 1 + k < len(modified_lines):
-                            modified_lines[j + 1 + k] = data_line
-                        else:
-                            # Append if needed
-                            modified_lines.append(data_line)
-
-                    # Clean up None entries
-                    modified_lines = [line for line in modified_lines if line is not None]
-
-                    # Update Bank Sta= line if new banks provided
-                    if bank_left is not None and bank_right is not None:
+                    # Update or insert Bank Sta= line when caller supplied bank values
+                    if bank_left is not None or bank_right is not None:
                         # Find Bank Sta= line in the modified lines
                         bank_sta_updated = False
                         for k in range(i, GeomCrossSection._find_xs_section_end(modified_lines, i)):
                             if modified_lines[k].startswith("Bank Sta="):
-                                # Update with new bank stations (format: no spaces after comma)
-                                modified_lines[k] = f"Bank Sta={bank_left:g},{bank_right:g}\n"
+                                modified_lines[k] = GeomCrossSection._bank_station_line(
+                                    final_bank_left, final_bank_right, modified_lines[k]
+                                )
                                 bank_sta_updated = True
-                                logger.debug(f"Updated Bank Sta= line: {bank_left:g},{bank_right:g}")
+                                logger.debug(
+                                    f"Updated Bank Sta= line: {final_bank_left:g},{final_bank_right:g}"
+                                )
                                 break
 
                         if not bank_sta_updated:
-                            logger.warning(f"Bank Sta= line not found for XS {rs}, banks not updated in file")
+                            GeomCrossSection._insert_xs_keyword_line(
+                                modified_lines,
+                                i,
+                                GeomCrossSection._bank_station_line(final_bank_left, final_bank_right),
+                                prefer_before=["#Sta/Elev=", "#Mann="]
+                            )
+                            logger.debug(
+                                f"Inserted Bank Sta= line: {final_bank_left:g},{final_bank_right:g}"
+                            )
 
                     # Write modified file
                     with open(geom_file, 'w', encoding='utf-8') as f:
                         f.writelines(modified_lines)
 
-                    logger.info(
+                    logger.debug(
                         f"Updated station/elevation for {river}/{reach}/RS {rs}: "
                         f"{new_count} pairs written"
                     )
 
                     if bank_left is not None and bank_right is not None:
-                        logger.info(f"Updated bank stations: {bank_left:g}, {bank_right:g}")
+                        logger.debug(f"Updated bank stations: {bank_left:g}, {bank_right:g}")
 
-                    return
+                    return backup_path
 
             raise ValueError(
                 f"#Sta/Elev data not found for {river}/{reach}/RS {rs}"
@@ -749,6 +2912,59 @@ class GeomCrossSection:
                 import shutil
                 shutil.copy2(backup_path, geom_file)
             raise IOError(f"Failed to write station/elevation: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def set_bank_stations(geom_file: Union[str, Path],
+                          river: str,
+                          reach: str,
+                          rs: str,
+                          bank_left: float,
+                          bank_right: float,
+                          create_backup: bool = True) -> Optional[Path]:
+        """
+        Set left and right bank stations for a cross section.
+
+        Updates or inserts the ``Bank Sta=`` line and rewrites the
+        ``#Sta/Elev`` block so both bank stations are exact station/elevation
+        points, as required by HEC-RAS. Missing bank points are linearly
+        interpolated from the existing station/elevation profile.
+
+        Parameters:
+            geom_file: Path to HEC-RAS geometry file
+            river: River name
+            reach: Reach name
+            rs: River station
+            bank_left: Left bank station
+            bank_right: Right bank station
+            create_backup: Whether to create a .bak backup before modification (default True)
+
+        Returns:
+            Optional[Path]: Backup path if create_backup=True, otherwise None.
+
+        Raises:
+            FileNotFoundError: If geometry file does not exist
+            ValueError: If cross section not found, bank stations are invalid,
+                        or bank interpolation would exceed the point limit
+            IOError: If file write fails
+        """
+        if bank_left >= bank_right:
+            raise ValueError(f"Left bank ({bank_left}) must be < right bank ({bank_right})")
+
+        sta_elev_df = GeomCrossSection.get_station_elevation(
+            geom_file, river, reach, rs
+        )
+
+        return GeomCrossSection.set_station_elevation(
+            geom_file,
+            river,
+            reach,
+            rs,
+            sta_elev_df,
+            bank_left=bank_left,
+            bank_right=bank_right,
+            create_backup=create_backup
+        )
 
     @staticmethod
     @log_call
@@ -798,10 +3014,10 @@ class GeomCrossSection:
 
             if banks:
                 left_bank, right_bank = banks
-                logger.info(f"Extracted bank stations for {river}/{reach}/RS {rs}: {left_bank}, {right_bank}")
+                logger.debug(f"Extracted bank stations for {river}/{reach}/RS {rs}: {left_bank}, {right_bank}")
                 return banks
             else:
-                logger.info(f"No bank stations found for {river}/{reach}/RS {rs}")
+                logger.debug(f"No bank stations found for {river}/{reach}/RS {rs}")
                 return None
 
         except FileNotFoundError:
@@ -865,14 +3081,14 @@ class GeomCrossSection:
                         expansion = float(values[0])
                         contraction = float(values[1])
 
-                        logger.info(
+                        logger.debug(
                             f"Extracted expansion/contraction for {river}/{reach}/RS {rs}: "
                             f"{expansion}, {contraction}"
                         )
                         return (expansion, contraction)
 
             # XS found but no Exp/Cntr= (use defaults)
-            logger.info(f"No Exp/Cntr found for {river}/{reach}/RS {rs}, using defaults")
+            logger.debug(f"No Exp/Cntr found for {river}/{reach}/RS {rs}, using defaults")
             return (0.3, 0.1)  # HEC-RAS defaults
 
         except FileNotFoundError:
@@ -882,6 +3098,577 @@ class GeomCrossSection:
         except Exception as e:
             logger.error(f"Error reading expansion/contraction: {str(e)}")
             raise IOError(f"Failed to read expansion/contraction: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def set_expansion_contraction(geom_file: Union[str, Path],
+                                  river: str,
+                                  reach: str,
+                                  rs: str,
+                                  expansion: float,
+                                  contraction: float,
+                                  create_backup: bool = True) -> Optional[Path]:
+        """
+        Set expansion and contraction coefficients for a cross section.
+
+        Updates an existing ``Exp/Cntr=`` line or inserts one into the target
+        cross-section block. Creates a ``.bak`` backup before modifying by
+        default.
+
+        Parameters:
+            geom_file: Path to HEC-RAS geometry file
+            river: River name
+            reach: Reach name
+            rs: River station
+            expansion: Expansion coefficient
+            contraction: Contraction coefficient
+            create_backup: Whether to create a .bak backup before modification (default True)
+
+        Returns:
+            Optional[Path]: Backup path if create_backup=True, otherwise None.
+
+        Raises:
+            FileNotFoundError: If geometry file does not exist
+            ValueError: If cross section not found or coefficients are invalid
+            IOError: If file write fails
+        """
+        geom_file = Path(geom_file)
+
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        expansion = float(expansion)
+        contraction = float(contraction)
+        if expansion < 0 or contraction < 0:
+            raise ValueError("Expansion and contraction coefficients must be non-negative")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            xs_idx = GeomCrossSection._find_cross_section(lines, river, reach, rs)
+            if xs_idx is None:
+                raise ValueError(f"Cross section not found: {river}/{reach}/RS {rs}")
+
+            modified_lines = lines.copy()
+            exp_idx = GeomCrossSection._find_keyword_index(modified_lines, xs_idx, "Exp/Cntr=")
+
+            if exp_idx is not None:
+                modified_lines[exp_idx] = GeomCrossSection._exp_cntr_line(
+                    expansion, contraction, modified_lines[exp_idx]
+                )
+            else:
+                GeomCrossSection._insert_xs_keyword_line(
+                    modified_lines,
+                    xs_idx,
+                    GeomCrossSection._exp_cntr_line(expansion, contraction),
+                    prefer_after=["Bank Sta="],
+                    prefer_before=["#Sta/Elev=", "#Mann="]
+                )
+
+            backup_path = GeomParser.safe_write_geometry(
+                geom_file,
+                modified_lines,
+                create_backup=create_backup
+            )
+
+            logger.info(
+                f"Updated expansion/contraction for {river}/{reach}/RS {rs}: "
+                f"{expansion:g}, {contraction:g}"
+            )
+            return backup_path
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing expansion/contraction: {str(e)}")
+            raise IOError(f"Failed to write expansion/contraction: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def get_levees(geom_number: Union[str, Path],
+                   river: Optional[str] = None,
+                   reach: Optional[str] = None,
+                   rs: Optional[str] = None,
+                   xs_id: Optional[str] = None,
+                   ras_object=None) -> pd.DataFrame:
+        """
+        Read left and right levee station-elevation points from cross sections.
+
+        Cross-section levees are stored in plain-text geometry files as a
+        single ``Levee=`` line with left and right triplets:
+        ``flag, station, elevation``. Active sides use flag ``-1``; inactive
+        sides use flag ``0`` and blank station/elevation fields.
+
+        Parameters:
+            geom_number: Geometry number or direct path to a .g## text file
+            river: Optional river filter
+            reach: Optional reach filter. If supplied, ``river`` is required.
+            rs: Optional river-station filter. If supplied, ``river`` and
+                ``reach`` are required.
+            xs_id: Optional exact ID from the returned ``xs_id`` column.
+            ras_object: Optional RasPrj instance for API consistency (unused)
+
+        Returns:
+            pd.DataFrame: Columns ``xs_id``, ``left_station``,
+            ``left_elevation``, ``right_station``, ``right_elevation``.
+            Matching cross sections without levees are included with NaN values.
+        """
+        geom_file = GeomCrossSection._resolve_geom_text_path(geom_number, ras_object=ras_object)
+
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+        if reach is not None and river is None:
+            raise ValueError("If reach is specified, river must also be specified")
+        if rs is not None and (river is None or reach is None):
+            raise ValueError("If rs is specified, river and reach must also be specified")
+
+        columns = [
+            'xs_id',
+            'River',
+            'Reach',
+            'RS',
+            'left_station',
+            'left_elevation',
+            'right_station',
+            'right_elevation'
+        ]
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            rows = []
+            current_river = None
+            current_reach = None
+
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith("River Reach="):
+                    values = GeomParser.extract_comma_list(line, "River Reach")
+                    if len(values) >= 2:
+                        current_river = values[0]
+                        current_reach = values[1]
+
+                elif line.startswith("Type RM Length L Ch R ="):
+                    value_str = GeomParser.extract_keyword_value(line, "Type RM Length L Ch R")
+                    values = [v.strip() for v in value_str.split(',')]
+                    if len(values) < 2 or current_river is None or current_reach is None:
+                        i += 1
+                        continue
+
+                    current_rs = values[1]
+                    current_xs_id = GeomCrossSection._make_xs_id(
+                        current_river,
+                        current_reach,
+                        current_rs
+                    )
+
+                    if river is not None and current_river != river:
+                        i += 1
+                        continue
+                    if reach is not None and current_reach != reach:
+                        i += 1
+                        continue
+                    if rs is not None and current_rs != rs:
+                        i += 1
+                        continue
+                    if xs_id is not None and current_xs_id != xs_id:
+                        i += 1
+                        continue
+
+                    levee_values = (math.nan, math.nan, math.nan, math.nan)
+                    section_end = GeomCrossSection._find_xs_section_end(lines, i)
+                    for j in range(i, section_end):
+                        if lines[j].startswith("Levee="):
+                            levee_values = GeomCrossSection._parse_levee_line(lines[j])
+                            break
+
+                    rows.append({
+                        'xs_id': current_xs_id,
+                        'River': current_river,
+                        'Reach': current_reach,
+                        'RS': current_rs,
+                        'left_station': levee_values[0],
+                        'left_elevation': levee_values[1],
+                        'right_station': levee_values[2],
+                        'right_elevation': levee_values[3],
+                    })
+
+                    i = section_end
+                    continue
+
+                i += 1
+
+            df = pd.DataFrame(rows, columns=columns)
+            logger.info(f"Read levee data for {len(df)} cross sections from {geom_file}")
+            return df
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error reading levees: {str(e)}")
+            raise IOError(f"Failed to read levees: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def set_levees(geom_number: Union[str, Path],
+                   xs_id: Optional[str] = None,
+                   left_station: Optional[float] = None,
+                   left_elevation: Optional[float] = None,
+                   right_station: Optional[float] = None,
+                   right_elevation: Optional[float] = None,
+                   *,
+                   river: Optional[str] = None,
+                   reach: Optional[str] = None,
+                   rs: Optional[str] = None,
+                   create_backup: bool = True,
+                   ras_object=None) -> Optional[Path]:
+        """
+        Write left and right levee station-elevation points for a cross section.
+
+        Updates an existing ``Levee=`` line or inserts one immediately after the
+        target cross section's ``#Mann=`` data block. Pass station/elevation
+        together for each side; omit both values for a side to write it as
+        inactive.
+
+        Parameters:
+            geom_number: Geometry number or direct path to a .g## text file
+            xs_id: Cross-section ID emitted by ``get_levees()``. Optional if
+                ``river``, ``reach``, and ``rs`` are provided.
+            left_station: Optional left levee station
+            left_elevation: Optional left levee elevation
+            right_station: Optional right levee station
+            right_elevation: Optional right levee elevation
+            river: Optional target river, used with ``reach`` and ``rs``
+            reach: Optional target reach
+            rs: Optional target river station
+            create_backup: Whether to create a .bak backup before modification
+            ras_object: Optional RasPrj instance for API consistency (unused)
+
+        Returns:
+            Optional[Path]: Backup path if ``create_backup=True``, otherwise None.
+        """
+        geom_file = GeomCrossSection._resolve_geom_text_path(geom_number, ras_object=ras_object)
+
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+        if xs_id is None and (river is None or reach is None or rs is None):
+            raise ValueError("Provide xs_id or all of river, reach, and rs")
+        if xs_id is not None and any(v is not None for v in (river, reach, rs)):
+            raise ValueError("Provide either xs_id or river/reach/rs, not both")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            xs_df = GeomCrossSection.get_cross_sections(geom_file)
+            if xs_id is not None:
+                target_river, target_reach, target_rs = GeomCrossSection._resolve_xs_identifier(xs_id, xs_df)
+            else:
+                target_river, target_reach, target_rs = river, reach, rs
+
+            xs_idx = GeomCrossSection._find_cross_section(lines, target_river, target_reach, target_rs)
+            if xs_idx is None:
+                raise ValueError(f"Cross section not found: {target_river}/{target_reach}/RS {target_rs}")
+
+            modified_lines = lines.copy()
+            levee_idx = GeomCrossSection._find_keyword_index(modified_lines, xs_idx, "Levee=")
+            new_line = GeomCrossSection._levee_line(
+                left_station=left_station,
+                left_elevation=left_elevation,
+                right_station=right_station,
+                right_elevation=right_elevation,
+                existing_line=modified_lines[levee_idx] if levee_idx is not None else None
+            )
+
+            if levee_idx is not None:
+                modified_lines[levee_idx] = new_line
+            else:
+                insert_idx = GeomCrossSection._find_mann_block_end(modified_lines, xs_idx)
+                if insert_idx is not None:
+                    modified_lines.insert(insert_idx, new_line)
+                else:
+                    GeomCrossSection._insert_xs_keyword_line(
+                        modified_lines,
+                        xs_idx,
+                        new_line,
+                        prefer_before=[
+                            "#XS Ineff=",
+                            "#Block Obstruct=",
+                            "Bank Sta=",
+                            "XS Rating Curve=",
+                            "XS HTab Starting El and Incr=",
+                            "XS HTab Horizontal Distribution=",
+                            "Exp/Cntr="
+                        ]
+                    )
+
+            backup_path = GeomParser.safe_write_geometry(
+                geom_file,
+                modified_lines,
+                create_backup=create_backup
+            )
+
+            logger.info(
+                f"Updated levees for {target_river}/{target_reach}/RS {target_rs}"
+            )
+            return backup_path
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing levees: {str(e)}")
+            raise IOError(f"Failed to write levees: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def interpolate_station_elevation(upstream_df: pd.DataFrame,
+                                      downstream_df: pd.DataFrame,
+                                      ratio: float = 0.5,
+                                      bank_left: Optional[float] = None,
+                                      bank_right: Optional[float] = None,
+                                      max_points: int = MAX_XS_POINTS) -> pd.DataFrame:
+        """
+        Interpolate a reviewable station/elevation profile between two cross sections.
+
+        The interpolation uses normalized lateral position so source cross
+        sections can have different station ranges and point spacing. The
+        returned DataFrame includes source station/elevation columns for review
+        and enforces the HEC-RAS cross-section point limit.
+
+        Parameters:
+            upstream_df: Upstream station/elevation DataFrame
+            downstream_df: Downstream station/elevation DataFrame
+            ratio: Fraction from upstream to downstream (0=upstream, 1=downstream)
+            bank_left: Optional left bank station to insert exactly
+            bank_right: Optional right bank station to insert exactly
+            max_points: Maximum output points, default HEC-RAS limit of 500
+
+        Returns:
+            pd.DataFrame: Reviewable interpolated profile with columns:
+                Station, Elevation, UpstreamStation, UpstreamElevation,
+                DownstreamStation, DownstreamElevation, InterpolationRatio,
+                SourceFraction, Source, IsBankPoint
+        """
+        ratio = float(ratio)
+        if ratio < 0.0 or ratio > 1.0:
+            raise ValueError("ratio must be between 0 and 1")
+        if bank_left is not None and bank_right is not None and bank_left >= bank_right:
+            raise ValueError(f"Left bank ({bank_left}) must be < right bank ({bank_right})")
+
+        max_points = int(max_points)
+        if max_points < 2:
+            raise ValueError("max_points must be at least 2")
+        if max_points > GeomCrossSection.MAX_XS_POINTS:
+            raise ValueError(
+                f"max_points ({max_points}) exceeds HEC-RAS limit of "
+                f"{GeomCrossSection.MAX_XS_POINTS}"
+            )
+
+        upstream = GeomCrossSection._prepare_station_elevation_df(upstream_df, "upstream_df")
+        downstream = GeomCrossSection._prepare_station_elevation_df(downstream_df, "downstream_df")
+
+        bank_values = []
+        for bank in (bank_left, bank_right):
+            if bank is not None and not any(
+                np.isclose(float(bank), existing, atol=0.005)
+                for existing in bank_values
+            ):
+                bank_values.append(float(bank))
+
+        base_limit = max_points - len(bank_values)
+        if base_limit < 2:
+            raise ValueError("max_points is too small for endpoint and bank-point requirements")
+
+        up_station = upstream['Station'].to_numpy(dtype=float)
+        up_elevation = upstream['Elevation'].to_numpy(dtype=float)
+        dn_station = downstream['Station'].to_numpy(dtype=float)
+        dn_elevation = downstream['Elevation'].to_numpy(dtype=float)
+        up_fraction = GeomCrossSection._station_fractions(up_station)
+        dn_fraction = GeomCrossSection._station_fractions(dn_station)
+
+        raw_fractions = np.unique(
+            np.concatenate((
+                np.array([0.0, 1.0]),
+                np.round(up_fraction, 12),
+                np.round(dn_fraction, 12)
+            ))
+        )
+        raw_fractions.sort()
+
+        if len(raw_fractions) > base_limit:
+            source_fractions = np.linspace(0.0, 1.0, base_limit)
+            source_labels = ["resampled"] * len(source_fractions)
+        else:
+            source_fractions = raw_fractions
+            up_set = {round(float(v), 12) for v in up_fraction}
+            dn_set = {round(float(v), 12) for v in dn_fraction}
+            source_labels = []
+            for value in source_fractions:
+                rounded = round(float(value), 12)
+                in_upstream = rounded in up_set
+                in_downstream = rounded in dn_set
+                if in_upstream and in_downstream:
+                    source_labels.append("both")
+                elif in_upstream:
+                    source_labels.append("upstream")
+                elif in_downstream:
+                    source_labels.append("downstream")
+                else:
+                    source_labels.append("resampled")
+
+        interp_up_station = np.interp(source_fractions, up_fraction, up_station)
+        interp_up_elevation = np.interp(source_fractions, up_fraction, up_elevation)
+        interp_dn_station = np.interp(source_fractions, dn_fraction, dn_station)
+        interp_dn_elevation = np.interp(source_fractions, dn_fraction, dn_elevation)
+
+        stations = interp_up_station + ratio * (interp_dn_station - interp_up_station)
+        elevations = interp_up_elevation + ratio * (interp_dn_elevation - interp_up_elevation)
+
+        result = pd.DataFrame({
+            'Station': stations,
+            'Elevation': elevations,
+            'UpstreamStation': interp_up_station,
+            'UpstreamElevation': interp_up_elevation,
+            'DownstreamStation': interp_dn_station,
+            'DownstreamElevation': interp_dn_elevation,
+            'InterpolationRatio': ratio,
+            'SourceFraction': source_fractions,
+            'Source': source_labels,
+            'IsBankPoint': False
+        })
+
+        result = result.sort_values('Station').reset_index(drop=True)
+
+        for bank_sta, label in ((bank_left, "left"), (bank_right, "right")):
+            if bank_sta is None:
+                continue
+
+            bank_sta = float(bank_sta)
+            stations_array = result['Station'].to_numpy(dtype=float)
+            min_station = float(stations_array[0])
+            max_station = float(stations_array[-1])
+            if bank_sta < min_station - 0.005 or bank_sta > max_station + 0.005:
+                raise ValueError(
+                    f"{label.title()} bank station ({bank_sta}) must be within "
+                    f"interpolated station range {min_station:g} to {max_station:g}"
+                )
+
+            diffs = np.abs(stations_array - bank_sta)
+            nearest_idx = int(np.argmin(diffs))
+            if diffs[nearest_idx] <= 0.005:
+                result.loc[nearest_idx, 'Station'] = bank_sta
+                result.loc[nearest_idx, 'IsBankPoint'] = True
+                continue
+
+            numeric_columns = [
+                'Elevation',
+                'UpstreamStation',
+                'UpstreamElevation',
+                'DownstreamStation',
+                'DownstreamElevation',
+                'SourceFraction'
+            ]
+            new_row = {
+                'Station': bank_sta,
+                'InterpolationRatio': ratio,
+                'Source': 'bank',
+                'IsBankPoint': True
+            }
+            for column in numeric_columns:
+                new_row[column] = float(np.interp(
+                    bank_sta,
+                    result['Station'].to_numpy(dtype=float),
+                    result[column].to_numpy(dtype=float)
+                ))
+
+            result = pd.concat([result, pd.DataFrame([new_row])], ignore_index=True)
+            result = result.sort_values('Station').reset_index(drop=True)
+
+        if len(result) > max_points:
+            raise ValueError(
+                f"Interpolated cross section has {len(result)} points, exceeds "
+                f"HEC-RAS limit of {max_points}"
+            )
+
+        return result
+
+    @staticmethod
+    @log_call
+    def interpolate_cross_section(geom_file: Union[str, Path],
+                                  river: str,
+                                  reach: str,
+                                  upstream_rs: str,
+                                  downstream_rs: str,
+                                  ratio: float = 0.5,
+                                  bank_left: Optional[float] = None,
+                                  bank_right: Optional[float] = None,
+                                  max_points: int = MAX_XS_POINTS,
+                                  interpolated_rs: Optional[str] = None) -> pd.DataFrame:
+        """
+        Read two cross sections from a geometry file and interpolate a reviewable profile.
+
+        If bank stations are not supplied, this helper linearly interpolates
+        them from the source cross sections when both source sections define
+        bank stations.
+        """
+        ratio = float(ratio)
+
+        upstream = GeomCrossSection.get_station_elevation(
+            geom_file, river, reach, upstream_rs
+        )
+        downstream = GeomCrossSection.get_station_elevation(
+            geom_file, river, reach, downstream_rs
+        )
+
+        final_bank_left = bank_left
+        final_bank_right = bank_right
+        upstream_banks = GeomCrossSection.get_bank_stations(
+            geom_file, river, reach, upstream_rs
+        )
+        downstream_banks = GeomCrossSection.get_bank_stations(
+            geom_file, river, reach, downstream_rs
+        )
+
+        if upstream_banks and downstream_banks:
+            if final_bank_left is None:
+                final_bank_left = (
+                    upstream_banks[0] + ratio * (downstream_banks[0] - upstream_banks[0])
+                )
+            if final_bank_right is None:
+                final_bank_right = (
+                    upstream_banks[1] + ratio * (downstream_banks[1] - upstream_banks[1])
+                )
+
+        result = GeomCrossSection.interpolate_station_elevation(
+            upstream,
+            downstream,
+            ratio=ratio,
+            bank_left=final_bank_left,
+            bank_right=final_bank_right,
+            max_points=max_points
+        )
+
+        result['River'] = river
+        result['Reach'] = reach
+        result['UpstreamRS'] = upstream_rs
+        result['DownstreamRS'] = downstream_rs
+        if interpolated_rs is not None:
+            result['InterpolatedRS'] = interpolated_rs
+        if final_bank_left is not None:
+            result['BankLeft'] = final_bank_left
+        if final_bank_right is not None:
+            result['BankRight'] = final_bank_right
+
+        return result
 
     @staticmethod
     @log_call
@@ -1004,6 +3791,367 @@ class GeomCrossSection:
         except Exception as e:
             logger.error(f"Error reading Manning's n: {str(e)}")
             raise IOError(f"Failed to read Manning's n: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def get_ineffective_flow(geom_file: Union[str, Path],
+                             river: str,
+                             reach: str,
+                             rs: str) -> Tuple[Optional[pd.DataFrame], Optional[int], Optional[List[bool]]]:
+        """
+        Read ineffective flow area data for a cross section.
+
+        Parses the ``#XS Ineff= N , F`` block, which contains N triplets of
+        (left_station, right_station, elevation) followed by a ``Permanent Ineff=``
+        boolean line.
+
+        Parameters:
+            geom_file: Path to HEC-RAS geometry file
+            river: River name
+            reach: Reach name
+            rs: River station
+
+        Returns:
+            Tuple of:
+                - DataFrame with columns left_station, right_station, elevation
+                  (or None if no ineffective areas defined)
+                - format_flag (int, 0 or -1)
+                - permanent_flags (list of bool, one per pair)
+
+        Example:
+            >>> df, fmt, flags = GeomCrossSection.get_ineffective_flow(
+            ...     "model.g01", "Hunting Bayou", "Mainstem", "65919"
+            ... )
+            >>> if df is not None:
+            ...     bad = df[df['right_station'] == 0]
+            ...     print(f"Found {len(bad)} pairs with right_station=0")
+        """
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        try:
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            xs_idx = GeomCrossSection._find_cross_section(lines, river, reach, rs)
+            if xs_idx is None:
+                raise ValueError(f"Cross section not found: {river}/{reach}/RS {rs}")
+
+            end_idx = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+
+            for j in range(xs_idx, end_idx):
+                if lines[j].startswith('#XS Ineff='):
+                    # Parse header: "#XS Ineff= N , F"
+                    value_str = GeomParser.extract_keyword_value(lines[j], '#XS Ineff')
+                    parts = [p.strip() for p in value_str.split(',')]
+                    count = int(parts[0])
+                    fmt_flag = int(parts[1]) if len(parts) > 1 else 0
+
+                    # Parse N*3 values (N triplets of left_sta, right_sta, elevation)
+                    total_values = count * 3
+                    values = GeomCrossSection._parse_data_block(lines, j + 1, total_values)
+
+                    if len(values) < total_values:
+                        logger.warning(
+                            f"Expected {total_values} ineff values, got {len(values)} "
+                            f"for {river}/{reach}/RS {rs}"
+                        )
+
+                    df = pd.DataFrame({
+                        'left_station': values[0::3],
+                        'right_station': values[1::3],
+                        'elevation': values[2::3]
+                    })
+
+                    # Read Permanent Ineff= boolean flags
+                    permanent_flags = [False] * count
+                    for k in range(j + 1, end_idx):
+                        if lines[k].startswith('Permanent Ineff='):
+                            if k + 1 < end_idx:
+                                flag_line = lines[k + 1].rstrip('\n')
+                                flags = []
+                                for m in range(0, len(flag_line), 8):
+                                    token = flag_line[m:m + 8].strip()
+                                    if token in ('T', 'F'):
+                                        flags.append(token == 'T')
+                                if flags:
+                                    permanent_flags = flags
+                            break
+
+                    logger.info(
+                        f"Read {count} ineffective flow pairs for {river}/{reach}/RS {rs}"
+                    )
+                    return df, fmt_flag, permanent_flags
+
+            # No #XS Ineff= found
+            return None, None, None
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error reading ineffective flow: {str(e)}")
+            raise IOError(f"Failed to read ineffective flow: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def set_ineffective_flow(geom_file: Union[str, Path],
+                             river: str,
+                             reach: str,
+                             rs: str,
+                             ineff_df: pd.DataFrame,
+                             fmt_flag: int = 0,
+                             permanent_flags: Optional[List[bool]] = None) -> None:
+        """
+        Write ineffective flow area data to a cross section.
+
+        Replaces the ``#XS Ineff=`` data block in the geometry file. The count
+        in the ``#XS Ineff=`` header is updated to match the length of
+        ``ineff_df``. Creates a ``.bak`` backup before modifying.
+
+        Parameters:
+            geom_file: Path to HEC-RAS geometry file
+            river: River name
+            reach: Reach name
+            rs: River station
+            ineff_df: DataFrame with columns left_station, right_station, elevation
+            fmt_flag: Format flag written to header (0 or -1). Preserves original if None.
+            permanent_flags: List of bool for each pair (default all False)
+
+        Raises:
+            FileNotFoundError: If geometry file not found
+            ValueError: If cross section or ineff block not found
+
+        Example:
+            >>> df, fmt, flags = GeomCrossSection.get_ineffective_flow(
+            ...     "model.g01", "Hunting Bayou", "Mainstem", "65919"
+            ... )
+            >>> # Fix right_station=0 -> rightmost station
+            >>> sta_elev = GeomCrossSection.get_station_elevation(
+            ...     "model.g01", "Hunting Bayou", "Mainstem", "65919"
+            ... )
+            >>> rightmost = sta_elev['Station'].max()
+            >>> df.loc[df['right_station'] == 0, 'right_station'] = rightmost
+            >>> GeomCrossSection.set_ineffective_flow(
+            ...     "model.g01", "Hunting Bayou", "Mainstem", "65919", df, fmt, flags
+            ... )
+        """
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        count = len(ineff_df)
+        if permanent_flags is None:
+            permanent_flags = [False] * count
+
+        try:
+            backup_path = GeomParser.create_backup(geom_file)
+            logger.info(f"Created backup: {backup_path}")
+
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            xs_idx = GeomCrossSection._find_cross_section(lines, river, reach, rs)
+            if xs_idx is None:
+                raise ValueError(f"Cross section not found: {river}/{reach}/RS {rs}")
+
+            end_idx = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+
+            for j in range(xs_idx, end_idx):
+                if lines[j].startswith('#XS Ineff='):
+                    # Get existing header to preserve count/flag info
+                    value_str = GeomParser.extract_keyword_value(lines[j], '#XS Ineff')
+                    parts = [p.strip() for p in value_str.split(',')]
+                    old_count = int(parts[0])
+                    orig_fmt_flag = int(parts[1]) if len(parts) > 1 else 0
+
+                    # Use provided fmt_flag (or preserve original)
+                    write_fmt_flag = fmt_flag if fmt_flag is not None else orig_fmt_flag
+
+                    # Calculate old and new data line counts
+                    old_data_lines = math.ceil(old_count * 3 / GeomCrossSection.VALUES_PER_LINE)
+
+                    # Build new value list: left_sta, right_sta, elev per row
+                    new_values = []
+                    for _, row in ineff_df.iterrows():
+                        new_values.extend([
+                            row['left_station'],
+                            row['right_station'],
+                            row['elevation']
+                        ])
+
+                    new_data_lines = GeomParser.format_fixed_width(
+                        new_values,
+                        column_width=GeomCrossSection.FIXED_WIDTH_COLUMN,
+                        values_per_line=GeomCrossSection.VALUES_PER_LINE,
+                        precision=2
+                    )
+
+                    # Format Permanent Ineff= boolean line (8-char per flag)
+                    perm_str = ''.join(
+                        f"{'       T' if p else '       F'}" for p in permanent_flags
+                    ) + '\n'
+
+                    modified_lines = lines.copy()
+
+                    # Update header line
+                    modified_lines[j] = f"#XS Ineff= {count} ,{write_fmt_flag} \n"
+
+                    # Mark old data lines for deletion
+                    for k in range(old_data_lines):
+                        if j + 1 + k < len(modified_lines):
+                            modified_lines[j + 1 + k] = None
+
+                    # Insert new data lines
+                    for k, data_line in enumerate(new_data_lines):
+                        if j + 1 + k < len(modified_lines):
+                            modified_lines[j + 1 + k] = data_line
+                        else:
+                            modified_lines.append(data_line)
+
+                    # Clean up None entries
+                    modified_lines = [ln for ln in modified_lines if ln is not None]
+
+                    # Update Permanent Ineff= data line
+                    end_idx2 = GeomCrossSection._find_xs_section_end(modified_lines, xs_idx)
+                    for k in range(xs_idx, end_idx2):
+                        if modified_lines[k].startswith('Permanent Ineff='):
+                            if k + 1 < end_idx2:
+                                modified_lines[k + 1] = perm_str
+                            break
+
+                    with open(geom_file, 'w', encoding='utf-8') as f:
+                        f.writelines(modified_lines)
+
+                    logger.info(
+                        f"Updated ineffective flow for {river}/{reach}/RS {rs}: "
+                        f"{count} pairs written"
+                    )
+                    return
+
+            raise ValueError(f"#XS Ineff block not found for {river}/{reach}/RS {rs}")
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing ineffective flow: {str(e)}")
+            raise IOError(f"Failed to write ineffective flow: {str(e)}")
+
+    @staticmethod
+    @log_call
+    def set_mannings_n(geom_file: Union[str, Path],
+                       river: str,
+                       reach: str,
+                       rs: str,
+                       mann_df: pd.DataFrame,
+                       format_flag: int = 0,
+                       change_flag: int = 0) -> None:
+        """
+        Write Manning's n data to a cross section.
+
+        Replaces the ``#Mann=`` data block in the geometry file with new
+        breakpoint data. Creates a ``.bak`` backup before modifying.
+
+        HEC-RAS enforces a hard limit of 20 Manning's n blocks per cross
+        section. Block counts of 21 or more are rejected at compute time
+        with a data_errors limit violation (verified empirically on HEC-RAS
+        6.6 across multiple example models).
+
+        Parameters:
+            geom_file: Path to HEC-RAS geometry file
+            river: River name
+            reach: Reach name
+            rs: River station
+            mann_df: DataFrame with 'Station' and 'n_value' columns.
+                     Rows define LOB/MC/ROB breakpoints in ascending station order.
+                     Maximum 20 rows (see MAX_MANNINGS_N_BLOCKS).
+            format_flag: Format flag for ``#Mann=`` header (0 or -1)
+            change_flag: Change flag for ``#Mann=`` header
+
+        Raises:
+            FileNotFoundError: If geometry file not found
+            ValueError: If cross section or ``#Mann=`` block not found,
+                        or if mann_df exceeds 20 rows
+
+        Example:
+            >>> import pandas as pd
+            >>> mann = pd.DataFrame({
+            ...     'Station': [18340.0, 19992.13, 20110.0],
+            ...     'n_value': [0.08, 0.05, 0.08]
+            ... })
+            >>> GeomCrossSection.set_mannings_n(
+            ...     "model.g01", "Hunting Bayou", "Mainstem", "65919", mann
+            ... )
+        """
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file}")
+
+        count = len(mann_df)
+        if count > GeomCrossSection.MAX_MANNINGS_N_BLOCKS:
+            raise ValueError(
+                f"Manning's n block count ({count}) exceeds HEC-RAS limit of "
+                f"{GeomCrossSection.MAX_MANNINGS_N_BLOCKS} per cross section"
+            )
+
+        try:
+            backup_path = GeomParser.create_backup(geom_file)
+            logger.info(f"Created backup: {backup_path}")
+
+            with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            xs_idx = GeomCrossSection._find_cross_section(lines, river, reach, rs)
+            if xs_idx is None:
+                raise ValueError(f"Cross section not found: {river}/{reach}/RS {rs}")
+
+            end_idx = GeomCrossSection._find_xs_section_end(lines, xs_idx)
+
+            for j in range(xs_idx, end_idx):
+                if lines[j].startswith('#Mann='):
+                    # Parse existing header to get old count
+                    value_str = GeomParser.extract_keyword_value(lines[j], '#Mann')
+                    parts = [p.strip() for p in value_str.split(',')]
+                    old_count = int(parts[0]) if parts[0] else 0
+
+                    old_data_end = GeomCrossSection._find_mann_data_end(
+                        lines,
+                        j,
+                        end_idx,
+                        old_count,
+                    )
+                    new_data_lines = GeomCrossSection._format_mannings_n_lines(mann_df)
+                    new_header = f"#Mann= {count} ,{format_flag} ,{change_flag} \n"
+
+                    modified_lines = (
+                        lines[:j]
+                        + [new_header]
+                        + new_data_lines
+                        + lines[old_data_end:]
+                    )
+
+                    with open(geom_file, 'w', encoding='utf-8') as f:
+                        f.writelines(modified_lines)
+
+                    logger.info(
+                        f"Updated Manning's n for {river}/{reach}/RS {rs}: "
+                        f"{count} breakpoints written"
+                    )
+                    return
+
+            raise ValueError(f"#Mann= block not found for {river}/{reach}/RS {rs}")
+
+        except FileNotFoundError:
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing Manning's n: {str(e)}")
+            raise IOError(f"Failed to write Manning's n: {str(e)}")
 
     @staticmethod
     @log_call
@@ -1774,6 +4922,10 @@ class GeomCrossSection:
 
             # Step 2: Get all cross sections using existing method
             xs_df = GeomCrossSection.get_cross_sections(geom_file)
+            # Filter to Type 1 (real cross sections) only - excludes lateral
+            # structures (Type 6), bridges, culverts, etc. which lack #Sta/Elev data
+            if 'Type' in xs_df.columns:
+                xs_df = xs_df[xs_df['Type'] == 1].reset_index(drop=True)
             logger.debug(f"Found {len(xs_df)} cross sections in geometry file")
 
             if len(xs_df) == 0:
@@ -2056,7 +5208,7 @@ class GeomCrossSection:
             >>>
             >>> # Extract and run example project
             >>> path = RasExamples.extract_project("Muncie", suffix="htab_opt")
-            >>> init_ras_project(path, "6.6")
+            >>> init_ras_project(path, "7.0")
             >>> RasCmdr.compute_plan("01")  # Run to get results
             >>>
             >>> # Optimize HTAB from results
@@ -2117,6 +5269,10 @@ class GeomCrossSection:
 
         # Step 1: Get all cross sections from geometry file
         xs_df = GeomCrossSection.get_cross_sections(geom_file)
+        # Filter to Type 1 (real cross sections) only - excludes lateral
+        # structures (Type 6), bridges, culverts, etc. which lack #Sta/Elev data
+        if 'Type' in xs_df.columns:
+            xs_df = xs_df[xs_df['Type'] == 1].reset_index(drop=True)
         total_xs_count = len(xs_df)
 
         if total_xs_count == 0:

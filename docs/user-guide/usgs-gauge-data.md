@@ -449,7 +449,7 @@ from ras_commander.usgs import (
 )
 
 # 1. Initialize project
-init_ras_project("C:/Projects/Potomac", "6.6")
+init_ras_project("C:/Projects/Potomac", "7.0")
 
 # 2. Find gauges in project area
 gauges = UsgsGaugeSpatial.find_gauges_in_project(
@@ -567,11 +567,11 @@ cached_data = RasUsgsFileIo.load_cached_gauge_data(
 
 Comprehensive workflow demonstrations:
 
-- [USGS Gauge Catalog](../notebooks/910_usgs_gauge_catalog.ipynb) - Catalog generation
-- [USGS Gauge Data Integration](../notebooks/911_usgs_gauge_data_integration.ipynb) - Complete workflow
-- [USGS Real-Time Monitoring](../notebooks/912_usgs_real_time_monitoring.ipynb) - Real-time data access
-- [BC from Live Gauge](../notebooks/913_bc_generation_from_live_gauge.ipynb) - Boundary condition generation
-- [Model Validation with USGS](../notebooks/914_model_validation_with_usgs.ipynb) - Validation workflow
+- [USGS Gauge Catalog](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/910_usgs_gauge_catalog.ipynb) - Catalog generation
+- [USGS Gauge Data Integration](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/911_usgs_gauge_data_integration.ipynb) - Complete workflow
+- [USGS Real-Time Monitoring](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/912_usgs_real_time_monitoring.ipynb) - Real-time data access
+- [BC from Live Gauge](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/913_bc_generation_from_live_gauge.ipynb) - Boundary condition generation
+- [Model Validation with USGS](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/922_model_validation_with_usgs.ipynb) - Validation workflow
 
 ## See Also
 

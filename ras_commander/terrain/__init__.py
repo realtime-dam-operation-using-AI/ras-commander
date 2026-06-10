@@ -5,10 +5,14 @@ This subpackage provides terrain capabilities for HEC-RAS projects:
 - Terrain HDF creation from rasters via RasProcess.exe CreateTerrain
 - VRT mosaic to single TIFF conversion via HEC-RAS GDAL tools
 - USGS 3DEP elevation data download from AWS
+- Terrain modification writing for channel, high-ground, and fill-surface layers
+- Polygon multipoint terrain modification writing for pond/wetland grading
 - Terrain modification analysis (cut/fill, no-net-fill) via RasMapperLib.dll
 
 Main Classes:
-    RasTerrain: Terrain HDF creation and VRT conversion (RasProcess.exe CLI)
+    RasTerrain: Terrain HDF creation, VRT conversion, XS interpolation surface
+        - compute_xs_interpolation_surface(): Delaunay TIN from XS bathymetry
+        - compute_bank_lines(): Generate bank lines from XS bank stations
         - create_terrain_hdf(): Create terrain HDF from input rasters
         - vrt_to_tiff(): Convert VRT to single TIFF with overviews
 
@@ -22,7 +26,14 @@ Main Classes:
         - compare_terrain_profiles(): Cut/fill analysis between terrains
         - compare_terrain_volumes(): No-net-fill compliance checking
         - compute_modified_terrain_raster(): Full-resolution GeoTIFF of modified terrain
-        Requires: pythonnet, HEC-RAS 6.6+, one-time setup_gdal_bridge() call
+        Requires: pythonnet, HEC-RAS 6.6+ with bundled GDAL
+
+    RasTerrainModWriter: Terrain modification HDF and .rasmap writer
+        - add_channel_modification(): add TakeLower channel cuts
+        - add_high_ground_modification(): add TakeHigher levee/road lines
+        - add_fill_surface_modification(): add SetValue fill surfaces
+        - add_modification_polygon(): add polygon multipoint modifications
+        - list_modifications(): inspect terrain modification sidecar groups
 
 Requirements:
     - HEC-RAS 6.3+ installed (for RasProcess.exe and GDAL tools)
@@ -40,7 +51,7 @@ Usage:
     )
 
     # Sample terrain with modifications (no GUI required)
-    RasTerrainMod.setup_gdal_bridge()  # one-time setup
+    RasTerrainMod.setup_gdal_bridge()  # optional explicit preflight
     profile = RasTerrainMod.get_terrain_profile(
         "project.rasmap", "project.g01.hdf",
         x_coords=[3400000, 3410000], y_coords=[612000, 612000]
@@ -53,10 +64,22 @@ See Also:
 
 from .RasTerrain import RasTerrain
 from .Usgs3depAws import Usgs3depAws
+from .RasTerrainModWriter import RasTerrainModification, RasTerrainModWriter
 
 # Conditional import - RasTerrainMod requires pythonnet (Windows only)
 try:
     from .RasTerrainMod import RasTerrainMod
-    __all__ = ['RasTerrain', 'Usgs3depAws', 'RasTerrainMod']
+    __all__ = [
+        'RasTerrain',
+        'Usgs3depAws',
+        'RasTerrainMod',
+        'RasTerrainModification',
+        'RasTerrainModWriter',
+    ]
 except ImportError:
-    __all__ = ['RasTerrain', 'Usgs3depAws']
+    __all__ = [
+        'RasTerrain',
+        'Usgs3depAws',
+        'RasTerrainModification',
+        'RasTerrainModWriter',
+    ]

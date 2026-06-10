@@ -85,13 +85,43 @@ class HdfBase:
             ValueError: If Plan Information is not found or start time cannot be parsed.
         
         Note:
-            Expects 'Plan Data/Plan Information' group with 'Simulation Start Time' attribute.
+            HEC-RAS 6.x stores 'Simulation Start Time' as a 'Plan Data/Plan Information'
+            attribute. HEC-RAS 5.0.x does not write that attribute; it instead stores
+            'Time Window' ("<start> to <end>"). This method falls back to 'Time Window'
+            and, finally, to the first unsteady output timestamp, so it works across
+            versions instead of raising on 5.0.x summary-output reads.
         """
+        def _decode(value):
+            return value.decode('utf-8') if isinstance(value, bytes) else str(value)
+
         plan_info = hdf_file.get("Plan Data/Plan Information")
         if plan_info is None:
             raise ValueError("Plan Information not found in HDF file")
+
+        # Primary (HEC-RAS 6.x): explicit 'Simulation Start Time' attribute.
         time_str = plan_info.attrs.get('Simulation Start Time')
-        return HdfUtils.parse_ras_datetime(time_str.decode('utf-8'))
+        if time_str is not None:
+            return HdfUtils.parse_ras_datetime(_decode(time_str))
+
+        # Fallback 1 (HEC-RAS 5.0.x): 'Time Window' = "<start> to <end>".
+        time_window = plan_info.attrs.get('Time Window')
+        if time_window is not None:
+            start_str = _decode(time_window).split(" to ")[0].strip()
+            if start_str:
+                return HdfUtils.parse_ras_datetime(start_str)
+
+        # Fallback 2 (version-agnostic): first unsteady output timestamp.
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        for ts_name, has_ms in (("Time Date Stamp", False), ("Time Date Stamp (ms)", True)):
+            ds = hdf_file.get(f"{base}/{ts_name}")
+            if ds is not None and ds.shape[0] > 0:
+                first = _decode(ds[0])
+                return HdfUtils.parse_ras_datetime_ms(first) if has_ms else HdfUtils.parse_ras_datetime(first)
+
+        raise ValueError(
+            "Could not determine simulation start time: no 'Simulation Start Time' or "
+            "'Time Window' attribute in Plan Information and no Unsteady Time Series timestamps."
+        )
 
     @staticmethod
     def get_unsteady_timestamps(hdf_file: h5py.File) -> List[datetime]:
@@ -150,7 +180,7 @@ class HdfBase:
             epsg = crs.to_epsg()
             if epsg:
                 epsg_str = f"EPSG:{epsg}"
-                logger.info(f"Converted WKT to {epsg_str} from {source}")
+                logger.debug(f"Converted WKT to {epsg_str} from {source}")
                 return epsg_str
 
             logger.debug(
@@ -179,7 +209,7 @@ class HdfBase:
                     return None
                 if isinstance(proj_wkt, (bytes, np.bytes_)):
                     proj_wkt = proj_wkt.decode("utf-8")
-                logger.info(f"Found projection in HDF file: {hdf_path}")
+                logger.debug(f"Found projection in HDF file: {hdf_path}")
                 return HdfBase._wkt_to_crs_string(
                     str(proj_wkt),
                     f"HDF file {hdf_path.name}",
@@ -195,7 +225,7 @@ class HdfBase:
         try:
             with open(prj_path, 'r', encoding='utf-8') as f:
                 wkt = f.read().strip()
-            logger.info(f"Found projection in projection file: {prj_path}")
+            logger.debug(f"Found projection in projection file: {prj_path}")
             return HdfBase._wkt_to_crs_string(
                 wkt,
                 f"projection file {prj_path.name}",
@@ -224,7 +254,7 @@ class HdfBase:
                 epsg = src.crs.to_epsg()
                 if epsg:
                     epsg_str = f"EPSG:{epsg}"
-                    logger.info(f"Found CRS {epsg_str} in raster: {raster_path}")
+                    logger.debug(f"Found CRS {epsg_str} in raster: {raster_path}")
                     return epsg_str
                 wkt = src.crs.to_wkt()
                 if wkt:

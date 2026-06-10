@@ -208,13 +208,14 @@ All callback methods are **optional** - implement only what you need. The protoc
 | `"501"`, `"503"`, `"505"`, `"506"` | 5.0.x | 2015-2019 |
 | `"60"` | 6.0 | 2020 |
 | `"63"` | 6.3 | 2021-2022 |
-| `"66"` | 6.6 | 2023+ |
+| `"66"` | 6.6 | 2023-2024 |
+| `"70"` | 7.0 | 2025+ |
 
 ##### RasControl vs RasCmdr
 
 | Aspect | RasControl | RasCmdr |
 |--------|------------|---------|
-| **HEC-RAS Versions** | 3.x - 6.x (COM) | 5.x+ (command line) |
+| **HEC-RAS Versions** | 3.x - 7.x (COM) | 5.x+ (command line) |
 | **Data Source** | Live COM extraction | HDF file results |
 | **Requires GUI** | Yes (HEC-RAS installed) | Yes (HEC-RAS installed) |
 | **Use Case** | Legacy models, validation | Modern automation |
@@ -284,14 +285,37 @@ The `get_comp_msgs()` method attempts to read computation messages from multiple
         - clone_plan
         - get_plan_path
         - get_results_path
+        - get_restart_output_settings
+        - set_restart_output_settings
         - set_geom
         - set_flow
         - set_num_cores
+        - get_2d_flow_options
+        - set_2d_flow_options
+        - set_2d_equation_set
+        - list_2d_flow_option_names
         - set_computation_interval
         - set_output_interval
         - set_description
         - get_value
         - set_value
+
+### RasFlowOptimization
+
+::: ras_commander.RasFlowOptimization
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members:
+        - copy_plan_with_optimization
+        - enable_plan
+        - set_settings
+        - get_settings
+        - disable_plan
+        - list_flow_hydrographs
+        - compute_plan_and_get_trials
+        - get_trial_results
+        - parse_compute_messages
 
 ### RasGeo
 
@@ -314,9 +338,33 @@ The `get_comp_msgs()` method attempts to read computation messages from multiple
       members:
         - clone_unsteady
         - get_unsteady_path
+        - get_restart_settings
         - set_flow_title
         - set_restart_settings
+        - get_initial_conditions
+        - set_initial_conditions
         - get_boundary_tables
+        - set_normal_depth_boundary
+        - set_flow_hydrograph_slope
+        - set_precipitation_hyetograph
+
+### RasSteady
+
+::: ras_commander.RasSteady
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members:
+        - read_flow_file
+        - write_flow_file
+        - create_flow_file
+        - update_flow_file
+        - validate_flow_file_data
+        - boundary
+        - known_water_surface
+        - normal_depth
+        - critical_depth
+        - rating_curve
 
 ## Utilities
 
@@ -427,13 +475,103 @@ indices = RasUtils.perform_kdtree_query(
       heading_level: 3
       members:
         - parse_rasmap
+        - list_terrain_layers
+        - list_terrain_display_settings
+        - get_terrain_display_settings
+        - set_terrain_display_settings
+        - list_land_classification_layers
+        - list_landcover_layers
+        - list_soils_layers
+        - list_infiltration_layers
+        - list_land_classification_polygons
+        - add_land_classification_polygon
+        - update_land_classification_polygon
+        - delete_land_classification_polygon
         - get_terrain_path
         - get_landcover_path
+        - associate_geometry_layers
+        - get_hdf_geometry_association
         - list_results_plans
         - list_calculated_layers
         - add_calculated_layer
         - remove_calculated_layer
         - add_wse_comparison_layers
+
+#### RASMapper Layer Discovery
+
+The layer-list methods read the `.rasmap` file and return one dataframe row per layer. Use these when a workflow needs discoverable layer names and resolved paths instead of the compact, list-valued `ras.rasmap_df` project summary.
+
+```python
+from ras_commander import RasMap
+
+terrain_layers = RasMap.list_terrain_layers(project_path)
+terrain_display = RasMap.list_terrain_display_settings(project_path)
+landcover_layers = RasMap.list_landcover_layers(project_path)
+soils_layers = RasMap.list_soils_layers(project_path)
+infiltration_layers = RasMap.list_infiltration_layers(project_path)
+```
+
+`list_land_classification_layers()` is the broad parser for RASMapper `Type="LandCoverLayer"` entries. The land-cover, soils, and infiltration methods are filtered convenience wrappers around that catalog.
+
+#### Classification Polygon Overrides
+
+`RasMap.add_land_classification_polygon()` authors the RAS Mapper `Classification Polygons` sidecar group used by land-cover, soils, and infiltration layers. It also upserts the affected `Raster Map` and `Variables` class rows when those datasets exist.
+
+```python
+from shapely.geometry import box
+from ras_commander import RasMap
+
+polygons = RasMap.add_land_classification_polygon(
+    "Land Classification/LandCover.hdf",
+    box(2083000, 370500, 2083500, 371000),
+    class_name="Parking Lot",
+    class_id=99,
+    variable_values={
+        "mannings_n": 0.105,
+        "percent_impervious": 95.0,
+    },
+)
+```
+
+Use `list_land_classification_polygons()`, `update_land_classification_polygon()`, and `delete_land_classification_polygon()` for extraction and maintenance. After editing sidecar polygons for an already-associated geometry, rerun preprocessing/property-table workflows so compiled geometry HDFs consume the new override.
+
+#### Terrain Display Settings
+
+`RasMap.list_terrain_display_settings()`, `RasMap.get_terrain_display_settings()`, and `RasMap.set_terrain_display_settings()` expose RASMapper terrain display controls persisted in `.rasmap` XML. They cover hillshade display and Z factor, contour display and interval, and terrain stitch-edge plot options such as `Plot stitch TIN edges`.
+
+```python
+RasMap.set_terrain_display_settings(
+    project_path,
+    terrain_name="TerrainWithChannel",
+    hillshade_enabled=True,
+    hillshade_z_factor=2.0,
+    contour_enabled=True,
+    contour_interval=5.0,
+    stitch_edges_enabled=True,
+)
+```
+
+CLB-272 owns these terrain display toggles. CLB-253 remains the separate terrain-modification gap for generating terrain changes such as channel modifications and interpolated cross-section terrain products.
+
+#### Geometry HDF Layer Associations
+
+`RasMap.get_hdf_geometry_association()` reads `/Geometry` association attributes from geometry HDFs and plan/result HDFs without mutation. `RasMap.associate_geometry_layers()` writes the geometry HDF attributes through Python-native `h5py`.
+
+```python
+association = RasMap.get_hdf_geometry_association("MyModel.g01.hdf")
+print(association["terrain_hdf_path"])
+
+RasMap.associate_geometry_layers(
+    project_path,
+    "MyModel.g01.hdf",
+    terrain_hdf_path="Terrain/ExistingTerrain.hdf",
+    landcover_hdf_path="Land Classification/LandCover.hdf",
+    infiltration_hdf_path="Land Classification/Infiltration.hdf",
+)
+```
+
+!!! warning "Compiled HDF only"
+    `associate_geometry_layers()` updates an existing `.g##.hdf`. It does not compile plain-text `.g##` geometry into HDF or create missing geometry datasets.
 
 ### RasProcess
 
@@ -446,12 +584,37 @@ indices = RasUtils.perform_kdtree_query(
         - get_plan_timestamps
         - store_maps
         - store_all_maps
+        - validate_geometry_association_cli
         - run_command
 
 #### RasProcess Details
 
 !!! info "RasProcess.exe CLI"
     RasProcess.exe is an undocumented command-line interface bundled with HEC-RAS that enables headless automation of RASMapper operations. The `RasProcess` class wraps this CLI for programmatic access.
+
+##### Geometry Association Validator
+
+`validate_geometry_association_cli()` runs the native `RasProcess.exe SetGeometryAssociation` command and compares the resulting `/Geometry` attributes against ras-commander's expected HEC-RAS-style attributes.
+
+```python
+from ras_commander import RasProcess
+
+result = RasProcess.validate_geometry_association_cli(
+    "MyModel.g01.hdf",
+    terrain_hdf_path="Terrain/ExistingTerrain.hdf",
+    landcover_hdf_path="Land Classification/LandCover.hdf",
+    ras_version="7.0",
+)
+
+print(result["passed"])
+print(result["return_code"])
+print(result["mismatches"])
+```
+
+The returned dictionary includes the native command arguments, return code, stdout/stderr, before/after attributes, expected attributes, mismatch list, and `passed`.
+
+!!! danger "In-place mutation"
+    This method mutates the supplied HDF. It exists as a native reference validator for disposable copies or intentional validation runs. Normal workflows should call `RasMap.associate_geometry_layers()`.
 
 ##### Supported Map Types
 
@@ -479,7 +642,7 @@ The `profile` parameter accepts:
 from ras_commander import init_ras_project, RasProcess
 
 # Initialize project
-init_ras_project("path/to/project", "6.6")
+init_ras_project("path/to/project", "7.0")
 
 # Generate default maps (WSE, Depth, Velocity)
 results = RasProcess.store_maps(

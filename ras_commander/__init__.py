@@ -14,18 +14,19 @@ try:
     __version__ = version("ras-commander")
 except PackageNotFoundError:
     # package is not installed
-    __version__ = "0.91.0"
+    __version__ = "0.97.0"
 
 # Set up logging
 setup_logging()
 
 # Core functionality
-from .RasPrj import RasPrj, init_ras_project, get_ras_exe, ras
+from .RasPrj import RasPrj, init_ras_project, get_ras_exe, ras, create_project_from_template
 from .RasPlan import RasPlan
 from .RasGeo import RasGeo  # DEPRECATED - use geom subpackage
 from .RasGeometry import RasGeometry  # DEPRECATED - use geom subpackage
 from .RasGeometryUtils import RasGeometryUtils  # DEPRECATED - use geom subpackage
 from .RasUnsteady import RasUnsteady
+from .RasSteady import RasSteady
 from .RasUtils import RasUtils
 from .RasExamples import RasExamples
 from .sources.federal import RasEbfeModels
@@ -33,16 +34,40 @@ from .sources.county import M3Model
 from .RasCmdr import RasCmdr
 from .RasCurrency import RasCurrency
 from .RasControl import RasControl
-from .ComputeResults import ComputeResult, ComputeParallelResult, RasControlResult, PreprocessResult
+from .ComputeResults import (
+    ComputeResult,
+    ComputeParallelResult,
+    RasControlResult,
+    PreprocessResult,
+    GeometryPreprocessResult,
+)
 from .RasPreprocess import RasPreprocess
 from .RasMap import RasMap
+from .RasDialogWatchdog import DialogWatchdog, DismissedDialog
+from .RasEncroachments import RasEncroachments
 from .RasMapValidation import RasMapValidation
 from .RasProcess import RasProcess, ProjectionInfo
 from .RasGuiAutomation import RasGuiAutomation
 from .RasScreenshot import RasScreenshot
 from .RasBreach import RasBreach
+from .RasFloodway import RasFloodway
 from .RasHydroCompare import RasHydroCompare
 from .RasModPuls import RasModPuls
+from .RasPermutation import RasPermutation, RangeSpec
+from .RasCalibrate import (
+    CalibrationPoint,
+    RasCalibrate,
+    compute_objective,
+    extract_modeled,
+    extract_steady_profile_modeled,
+    extract_steady_profile_observations,
+    make_composite_apply_fn,
+    make_infiltration_apply_fn,
+    make_mannings_apply_fn,
+    make_steady_profile_calibration_points,
+    make_xsec_mannings_apply_fn,
+)
+from .RasFlowOptimization import RasFlowOptimization
 
 # Validation framework - core validation infrastructure
 from .RasValidation import ValidationSeverity, ValidationResult, ValidationReport
@@ -59,17 +84,22 @@ from .RasBco import BcoMonitor
 
 # Geometry handling - imported from geom subpackage
 from .geom import (
-    GeomParser, GeomPreprocessor, GeomLandCover,
-    GeomCrossSection, GeomStorage, GeomLateral,
+    GeomParser, GeomPreprocessor, GeomLandCover, ManningsFromLandCover,
+    GeomCrossSection, CrossSectionBankStations, CrossSectionBuildInput,
+    CrossSectionBuildResult, CrossSectionManningsN, CrossSectionReachLengths,
+    GeomStorage, GeomLateral,
     GeomInlineWeir, GeomBridge, GeomCulvert,
+    GeomReferenceFeatures, GeomBcLines, GeomMesh,
+    MeshResult, BCConflict, BCFixResult,
 )
 
 # HDF handling - imported from hdf subpackage
 from .hdf import (
     HdfBase, HdfUtils, HdfPlan,
-    HdfMesh, HdfXsec, HdfBndry, HdfStruc, HdfHydraulicTables,
-    HdfResultsPlan, HdfResultsMesh, HdfResultsXsec, HdfResultsBreach,
-    HdfPipe, HdfPump, HdfInfiltration,
+    HdfMesh, HdfXsec, HdfBndry, HdfStruc, HdfStorageArea, HdfHydraulicTables,
+    HdfResultsPlan, HdfResultsMesh, HdfResultsQuery, HdfResultsXsec, HdfResultsBreach,
+    HdfResultsSediment,
+    HdfPipe, HdfPump, HdfInfiltration, HdfLandCover,
     HdfPlot, HdfResultsPlot,
     HdfFluvialPluvial, HdfBenefitAreas, HdfChannelCapacity, HdfResultsAnalysis,
     HdfProject,
@@ -101,7 +131,7 @@ _FIXIT_EXPORTS = {
 }
 
 # Terrain module - HEC-RAS terrain creation and manipulation
-_TERRAIN_EXPORTS = {'RasTerrain'}
+_TERRAIN_EXPORTS = {'RasTerrain', 'RasTerrainModification', 'RasTerrainModWriter'}
 
 # Results module - Compute message parsing and execution summary
 _RESULTS_EXPORTS = {'ResultsParser', 'ResultsSummary'}
@@ -144,17 +174,28 @@ def __getattr__(name):
 # Define __all__ to specify what should be imported when using "from ras_commander import *"
 __all__ = [
     # Core functionality
-    'RasPrj', 'init_ras_project', 'get_ras_exe', 'ras',
-    'RasPlan', 'RasUnsteady', 'RasUtils',
-    'ComputeResult', 'ComputeParallelResult', 'RasControlResult', 'PreprocessResult',
+    'RasPrj', 'init_ras_project', 'get_ras_exe', 'ras', 'create_project_from_template',
+    'RasPlan', 'RasUnsteady', 'RasSteady', 'RasUtils',
+    'ComputeResult', 'ComputeParallelResult', 'RasControlResult',
+    'PreprocessResult', 'GeometryPreprocessResult',
     'RasPreprocess',
-    'RasExamples', 'RasEbfeModels', 'M3Model', 'RasCmdr', 'RasControl', 'RasMap', 'RasProcess', 'ProjectionInfo', 'RasGuiAutomation', 'RasScreenshot', 'HdfFluvialPluvial',
-    'RasModPuls',
+    'RasExamples', 'RasEbfeModels', 'M3Model', 'RasCmdr', 'RasControl', 'RasMap', 'RasEncroachments', 'RasProcess', 'ProjectionInfo', 'RasGuiAutomation', 'RasScreenshot', 'HdfFluvialPluvial',
+    'RasFloodway', 'RasFlowOptimization', 'RasModPuls', 'RasPermutation', 'RangeSpec',
+    'CalibrationPoint', 'RasCalibrate',
+    'compute_objective', 'extract_modeled',
+    'extract_steady_profile_modeled', 'extract_steady_profile_observations',
+    'make_composite_apply_fn', 'make_infiltration_apply_fn',
+    'make_mannings_apply_fn', 'make_steady_profile_calibration_points',
+    'make_xsec_mannings_apply_fn',
 
     # Geometry handling (new in v0.86.0)
-    'GeomParser', 'GeomPreprocessor', 'GeomLandCover',
-    'GeomCrossSection', 'GeomStorage', 'GeomLateral',
+    'GeomParser', 'GeomPreprocessor', 'GeomLandCover', 'ManningsFromLandCover',
+    'GeomCrossSection', 'CrossSectionBankStations', 'CrossSectionBuildInput',
+    'CrossSectionBuildResult', 'CrossSectionManningsN', 'CrossSectionReachLengths',
+    'GeomStorage', 'GeomLateral',
     'GeomInlineWeir', 'GeomBridge', 'GeomCulvert',
+    'GeomReferenceFeatures', 'GeomBcLines', 'GeomMesh',
+    'MeshResult', 'BCConflict', 'BCFixResult',
 
     # Deprecated geometry classes (will be removed before v1.0)
     'RasGeo', 'RasGeometry', 'RasGeometryUtils',
@@ -176,8 +217,8 @@ __all__ = [
     # Fixit module - Automated geometry repair (lazy loaded)
     'RasFixit', 'FixResults', 'FixMessage', 'FixAction', 'BlockedObstruction',
 
-    # Terrain module - HEC-RAS terrain creation (lazy loaded)
-    'RasTerrain',
+    # Terrain module - HEC-RAS terrain creation and modification (lazy loaded)
+    'RasTerrain', 'RasTerrainModification', 'RasTerrainModWriter',
 
     # Results module - Compute message parsing and execution summary (lazy loaded)
     'ResultsParser', 'ResultsSummary',
@@ -191,13 +232,16 @@ __all__ = [
 
     # HDF handling
     'HdfBase', 'HdfBndry', 'HdfMesh', 'HdfPlan', 'HdfProject',
-    'HdfResultsMesh', 'HdfResultsPlan', 'HdfResultsXsec',
-    'HdfStruc', 'HdfUtils', 'HdfXsec', 'HdfPump',
-    'HdfPipe', 'HdfInfiltration', 'HdfHydraulicTables', 'HdfResultsBreach', 'RasBreach',
+    'HdfResultsMesh', 'HdfResultsPlan', 'HdfResultsQuery', 'HdfResultsXsec', 'HdfResultsSediment',
+    'HdfStruc', 'HdfStorageArea', 'HdfUtils', 'HdfXsec', 'HdfPump',
+    'HdfPipe', 'HdfInfiltration', 'HdfLandCover', 'HdfHydraulicTables', 'HdfResultsBreach', 'RasBreach',
     'HdfBenefitAreas', 'HdfChannelCapacity', 'HdfResultsAnalysis',
 
     # Plotting functionality
     'HdfPlot', 'HdfResultsPlot',
+
+    # Dialog watchdog (headless execution)
+    'DialogWatchdog', 'DismissedDialog',
 
     # Utilities
     'get_logger', 'log_call', 'standardize_input',
@@ -214,10 +258,8 @@ __all__ = [
     'BcoMonitor',
 ]
 
-# =============================================================================
-# BACKWARD COMPATIBILITY - DEPRECATED MODULE PATHS (DEPRECATED in v0.89.0)
-# =============================================================================
-# These aliases provide backward compatibility for old import paths.
+# ======================================================================# BACKWARD COMPATIBILITY - DEPRECATED MODULE PATHS (DEPRECATED in v0.89.0)
+# ======================================================================# These aliases provide backward compatibility for old import paths.
 # Users should migrate to new paths. Old paths will show DeprecationWarning.
 #
 # Migration:
@@ -226,8 +268,7 @@ __all__ = [
 #
 #   OLD: from ras_commander.validation_base import ValidationSeverity, ...
 #   NEW: from ras_commander.RasValidation import ValidationSeverity, ...
-# =============================================================================
-
+# ======================================================================
 import sys
 import warnings
 

@@ -45,34 +45,140 @@ FEMA's Estimated Base Flood Elevation (eBFE) database provides valuable Base Lev
 
 ## The Solution: RasEbfeModels
 
-The `RasEbfeModels` class solves this problem by applying **3 critical automated fixes** that transform broken eBFE archives into runnable HEC-RAS models.
+The `RasEbfeModels` class solves this problem by applying delivery-format
+normalization that transforms broken eBFE archives into runnable HEC-RAS models.
 
 ### Quick Start
 
 ```python
-from ras_commander.sources.federal import RasEbfeModels
+from ras_commander.sources import RasEbfeModels
 from ras_commander import init_ras_project
 from pathlib import Path
 
-# Organize broken eBFE model into runnable HEC-RAS project
-organized = RasEbfeModels.organize_upper_guadalupe(
-    Path(r"D:/downloads/12100201_UpperGuadalupe_Models_extracted"),
-    validate_dss=True  # Validates 10,248 DSS pathnames, corrects all paths
+# Download/cache, extract, and organize by model slug
+organized = RasEbfeModels.organize_model(
+    "upper-guadalupe",
+    download_root=Path(r"H:/Testing/eBFE Model Organization/Downloads"),
+    output_root=Path(r"H:/Testing/eBFE Model Organization/Organized"),
+    validate_dss=True
 )
 
 # Use immediately - no manual fixes needed
 init_ras_project(organized / "RAS Model/UPGU1", "6.5")
 
-# ✓ Opens without errors
-# ✓ No "DSS path needs correction" dialog
-# ✓ Terrain loads correctly
-# ✓ Pre-run results accessible
-# ✓ Ready for automation
+# Opens without errors
+# No "DSS path needs correction" dialog
+# Terrain and land cover load from local folders
+# Pre-run results are accessible from project folders
+# Ready for automation and preprocessor validation
 ```
 
 **Time**: 15 minutes vs 60-120 minutes manual fixes
 
-## The 3 Critical Fixes
+To inspect the built-in model catalog:
+
+```python
+from ras_commander.sources import RasEbfeModels
+
+RasEbfeModels.available_models()
+```
+
+!!! note "Current import paths"
+    Use `from ras_commander.sources import RasEbfeModels` for model-source
+    organizers. The `ras_commander.sources` package exports model sources only.
+    Coastal forecast helpers live under
+    `ras_commander.boundaries.CoastalBoundary`.
+
+Current built-in organizers include:
+
+| Slug | HUC8 | Delivery Notes |
+|---|---:|---|
+| `spring-creek` | 12040102 | Single 2D model with nested final archive. |
+| `north-galveston-bay` | 12040203 | Compound HMS plus nested 2D RAS delivery. |
+| `upper-guadalupe` | 12100201 | Four cascaded 2D watershed models. |
+| `eleven-point` | 11010011 | Small split-delivery 2D model archive; organized, path-audited, results-ready, and geometry-preprocessor validated with HEC-RAS 6.6. |
+| `spring-river` | 11010010 | Distinct Spring HUC model archive using `SpringRiver_11010010` naming to avoid confusion with `spring-creek` / `SpringCreek_12040102`. |
+| `lower-colorado-cummins` | 12090301 | 1D steady BLE reach-model collection. |
+| `rio-hondo` | 13060008 | 1D steady BLE reach-model collection. |
+| `amite` | 08070202 | Louisiana component delivery with terrain rebuild handling for CRS mismatches. |
+| `tickfaw` | 08070203 | Large Louisiana 2D model archive. |
+| `lake-maurepas` | 08070204 | Louisiana 2D model archive. |
+| `lower-brazos` | 12070104 | Very large component delivery; manifest-only by default. |
+
+## Delivery Validation Gate
+
+An organized eBFE model is not considered fully delivery-ready until it passes
+preprocessor validation. File organization and dataframe path checks confirm
+that the project is self-contained, but the key proof is running the geometry
+preprocessor and reviewing compute messages for missing terrain, land cover,
+projection, DSS, or file path errors.
+
+Use the reusable checklist in
+[`eBFE Delivery Validation`](user-guide/ebfe-delivery-validation.md) for the
+standard readiness gates:
+
+1. `organized`
+2. `hms_validated`
+3. `path_validated`
+4. `preprocessor_validated`
+5. `results_validated`
+6. `notebook_validated`
+
+For combined hms-commander plus ras-commander examples, `hms_validated` means
+that delivered HEC-HMS projects are copied under `HMS Model/` and their HMS
+file references resolve locally, then hms-commander can load the organized
+project without path repair. RAS-only deliveries should keep a
+`HMS Model/README.md` explaining whether hydrology is supplied by steady flow
+files, DSS inputs, gridded precipitation, or another documented source.
+
+Use `GeomPreprocessor.run_geometry_preprocessor()` as the assembly validation
+hook for both 1D steady and 2D/unsteady models. It enables detailed logging,
+runs the HEC-RAS geometry preprocessor through ras-commander, and reviews
+compute messages without requiring full unsteady calculations or floodplain
+mapping/post-processing as the delivery-format gate. For 1D steady BLE reach
+models, document terrain or land cover checks only when mapper layers exist.
+
+For repeatable end-to-end checks from the repository, use:
+
+```powershell
+.\.venv\Scripts\python scripts\ebfe_end_to_end_validation.py `
+  --models north-galveston-bay `
+  --download-root "H:\Testing\eBFE Model Organization\Downloads" `
+  --output-root "H:\Testing\eBFE Model Organization\Organized" `
+  --report-root "H:\Testing\eBFE Model Organization\Validation\ebfe_delivery" `
+  --run-preprocessor `
+  --max-wait 7200
+```
+
+The script uses `RasEbfeModels.organize_model()` for download/extraction and
+organization, then uses `GeomPreprocessor.run_geometry_preprocessor()` through
+the reusable batch validation flow.
+
+## Core Delivery Fixes
+
+Early eBFE organizers focused on three recurring breakages: separated outputs,
+terrain paths, and DSS paths. The current delivery format also standardizes
+projection and land-cover assets because those are required for reliable
+geometry-preprocessor validation.
+
+### Fix #0: Shared HDF Asset Reference Normalization
+
+Compiled geometry and plan/result HDFs can carry `/Geometry` attributes that
+point at terrain, land-cover, and infiltration sidecars. Recent organizer work
+standardizes those references across the normalized `Terrain/`, `Land Cover/`,
+and legacy `Land Classification/` folders.
+
+- If a delivered model already points at a legacy
+  `.\Land Classification\...` sidecar, ras-commander preserves that HDF
+  attribute and copies the required sidecars into the legacy folder instead of
+  forcing a rename.
+- If the organized project needs normalized terrain or land-cover references,
+  the organizer rewrites those HDF attributes to the local asset that actually
+  exists in the standardized project tree.
+
+This keeps geometry-HDF association checks aligned with the organized delivery
+format while still supporting legacy eBFE asset layouts that appear in the
+wild.
 
 ### Fix #1: Output/ Folder Integration
 
@@ -195,7 +301,7 @@ for hecras_file in hecras_files:
 
 **Usage**:
 ```python
-from ras_commander.sources.federal import RasEbfeModels
+from ras_commander.sources import RasEbfeModels
 from ras_commander import init_ras_project
 
 organized = RasEbfeModels.organize_spring_creek(
@@ -222,24 +328,26 @@ init_ras_project(organized / "RAS Model", "5.0.7")
 
 **Usage**:
 ```python
-from ras_commander.sources.federal import RasEbfeModels
+from ras_commander.sources import RasEbfeModels
 
 organized = RasEbfeModels.organize_north_galveston_bay(
     downloaded_folder,
-    extract_ras_nested=False,  # Manual extraction recommended
+    extract_ras_nested=True,
     validate_dss=True
 )
 
-# HMS model ready immediately
+# HMS and normalized RAS model folders are ready
 hms_project = organized / "HMS Model/NorthGalvestonBay/NorthGalvestonBay.hms"
+ras_project = organized / "RAS Model"
 ```
 
 **Fixes Applied**:
 - HMS/RAS separation
 - DSS path corrections (when RAS extracted)
-- Output/ and Terrain/ integration (when RAS extracted)
+- Output/, Terrain/, Land Cover/, and Projection/ integration
 
-**Note**: RAS model in large nested zip may require manual extraction via Windows Explorer
+**Note**: `extract_ras_nested=True` extracts and normalizes the nested
+RAS_Submittal archive in place.
 
 **Example Notebook**: `examples/951_ebfe_north_galveston_bay.ipynb`
 
@@ -253,10 +361,10 @@ hms_project = organized / "HMS Model/NorthGalvestonBay/NorthGalvestonBay.hms"
 
 **Usage**:
 ```python
-from ras_commander.sources.federal import RasEbfeModels
+from ras_commander.sources import RasEbfeModels
 from ras_commander import init_ras_project, RasCmdr, RasPrj
 
-# Organize (applies all 3 critical fixes × 4 models)
+# Organize (applies delivery normalization across all 4 models)
 organized = RasEbfeModels.organize_upper_guadalupe(
     downloaded_folder,
     validate_dss=True  # Validates 10,248 pathnames
@@ -265,17 +373,21 @@ organized = RasEbfeModels.organize_upper_guadalupe(
 # Execute cascade (upstream to downstream)
 for model in ['UPGU1', 'UPGU2', 'UPGU3', 'UPGU4']:
     ras_obj = RasPrj()
-    init_ras_project(organized / "RAS Model" / model / "Input", "6.5", ras_object=ras_obj)
+    init_ras_project(organized / "RAS Model" / model, "6.5", ras_object=ras_obj)
     RasCmdr.compute_plan("01", ras_object=ras_obj, num_cores=4)
 ```
 
 **Fixes Applied**:
 - 56 HDF files (~41 GB) moved into project folders
 - 4 Terrain folders (~15.7 GB) moved into project folders
-- 32 DSS paths corrected (validated existence first)
-- 4 .rasmap terrain paths corrected (verified actual location)
+- DSS assets copied into per-project `DSS Inputs/` folders and references rewritten
+- Land cover copied into per-project `Land Cover/` folders
+- Projection copied or generated under per-project `Projection/` folders
+- `.rasmap` terrain, land cover, and projection paths rewritten to local folders
 
-**Validated**: Tested in HEC-RAS, opens without errors ✓
+**Validated**: UPGU1, UPGU2, and UPGU3 passed geometry-preprocessor validation
+with a 1-hour timeout. UPGU4 produced preprocessor artifacts but exceeded the
+1-hour cap and remains an explicit long-runtime validation item.
 
 **Example Notebook**: `examples/952_ebfe_upper_guadalupe_cascade.ipynb`
 
@@ -338,7 +450,8 @@ def organize_north_galveston_bay(
 **Parameters**:
 - `downloaded_folder`: Path to extracted 12040203_NorthGalvestonBay_Models folder
 - `output_folder`: Output location (default: ./ebfe_organized/NorthGalvestonBay_12040203/)
-- `extract_ras_nested`: Attempt auto-extraction of RAS_Submittal.zip (may fail, default: False)
+- `extract_ras_nested`: Extract and normalize RAS_Submittal.zip when True.
+  `RasEbfeModels.organize_model("north-galveston-bay")` enables this by default.
 - `validate_dss`: Run DSS validation checks (default: True)
 
 **Returns**: Path to organized model
@@ -346,9 +459,9 @@ def organize_north_galveston_bay(
 **Fixes Applied**:
 1. Separates HMS from RAS content
 2. Organizes 7 storm frequencies + sensitivity analysis
-3. Handles nested 6.1 GB RAS zip (manual or auto)
+3. Handles nested 6.1 GB RAS zip extraction
 4. Corrects DSS paths when RAS extracted
-5. Moves Output/ and Terrain/ when RAS extracted
+5. Moves Output/, Terrain/, Land Cover/, and Projection/ assets into the project
 6. Creates agent/model_log.md
 
 **Output Structure**:
@@ -382,13 +495,14 @@ def organize_upper_guadalupe(
 
 **Returns**: Path to organized model with 4 runnable cascaded HEC-RAS projects
 
-**Fixes Applied** (× 4 models):
+**Fixes Applied** (x 4 models):
 1. Moves 56 HDF files (~41 GB) INTO project folders
 2. Moves 4 Terrain folders (~15.7 GB) INTO project folders
-3. Corrects 32 DSS paths (validates existence first)
-4. Corrects 4 .rasmap terrain paths (verifies actual location)
-5. Validates 10,248 DSS pathnames (100% success)
-6. Creates comprehensive agent/model_log.md
+3. Copies DSS assets into per-project `DSS Inputs/` folders and rewrites references
+4. Copies land-cover assets into per-project `Land Cover/` folders
+5. Copies or creates project CRS files under per-project `Projection/` folders
+6. Rewrites `.rasmap` terrain, land cover, and projection references
+7. Creates comprehensive agent/model_log.md
 
 **Output Structure**:
 ```
@@ -404,7 +518,7 @@ UpperGuadalupe_12100201/
 ```python
 for model in ['UPGU1', 'UPGU2', 'UPGU3', 'UPGU4']:
     ras_obj = RasPrj()
-    init_ras_project(organized / "RAS Model" / model / "Input", "6.5", ras_object=ras_obj)
+    init_ras_project(organized / "RAS Model" / model, "6.5", ras_object=ras_obj)
     RasCmdr.compute_plan("01", ras_object=ras_obj, num_cores=4)
     # Upstream results feed downstream via DSS
 ```
@@ -420,9 +534,11 @@ All organized models use the same structure:
 │   └── {Model}/
 │       ├── *.prj, *.g##, *.p##, *.u##
 │       ├── *.hdf (pre-run results, moved from Output/)
-│       ├── *.dss (DSS paths corrected)
+│       ├── DSS Inputs/ (DSS paths corrected)
+│       ├── Projection/ (project CRS copied or generated)
 │       ├── *.rasmap (terrain paths corrected)
-│       └── Terrain/ (moved here, where HEC-RAS expects it)
+│       ├── Terrain/ (moved here, where HEC-RAS expects it)
+│       └── Land Cover/ (local land cover and sidecar assets)
 ├── Spatial Data/       # GIS data, shapefiles
 ├── Documentation/      # BLE reports, inventories
 └── agent/
@@ -434,7 +550,7 @@ All organized models use the same structure:
 **Every organized model MUST have** `agent/model_log.md` documenting:
 - Organization actions taken
 - Files classified and moved (HMS/RAS/Spatial/Docs)
-- **Critical fixes applied** (Output/, Terrain/, DSS paths)
+- **Critical fixes applied** (Output/, DSS Inputs/, Projection/, Terrain/, Land Cover/)
 - Number of corrections made
 - DSS validation results
 - Compute test instructions
@@ -529,6 +645,40 @@ Complete working examples demonstrating each model:
 - Cascade structure and execution
 - Emphasis: "This library exists to solve this exact problem"
 
+### 953_ebfe_rio_hondo_steady_collection.ipynb
+
+**Demonstrates**:
+- Organizing and validating the Rio Hondo 1D steady BLE reach-model collection.
+- Sequential steady-plan validation for 253 projects.
+- Reading generated HDF compute messages after successful steady-plan execution.
+- Distinguishing 1D steady result generation from 2D preprocessor validation.
+
+### 954_ebfe_lake_maurepas_validation.ipynb
+
+**Demonstrates**:
+- Organizing Pattern 3 single-archive Louisiana 2D model delivery.
+- Validating the delivered Lake Maurepas HEC-HMS project from `HMS Model/` with hms-commander.
+- Confirming local projection, terrain, land-cover, and RASMapper assets.
+- Reusing saved ras-commander geometry-preprocessor evidence for plan 02.
+- Documenting a preprocessor-valid model where full hydraulic result HDFs are absent from the source archive.
+
+### 955_ebfe_tickfaw_validation.ipynb
+
+**Demonstrates**:
+- Organizing Pattern 3 single-archive Louisiana 2D model delivery with results.
+- Confirming local projection, terrain, land-cover, and RASMapper assets.
+- Reusing saved ras-commander geometry-preprocessor evidence for plan 13.
+- Verifying that all seven plan result HDF paths resolve inside the organized RAS project folder.
+
+### 957_ebfe_spring_river_validation.ipynb
+
+**Demonstrates**:
+- Organizing the distinct Spring River HUC 11010010 delivery without confusing it with Spring Creek.
+- Confirming local projection, terrain, land-cover, legacy land-classification compatibility assets, DSS inputs, and RASMapper references.
+- Executing a fresh HEC-RAS 6.1 geometry-preprocessor validation for plan 01 / geometry 01.
+- Archiving the fresh preprocessor HDF before restoring the delivered full-result `Spring_BLE.p01.hdf`.
+- Verifying that all seven plan result HDF paths resolve inside the organized RAS project folder.
+
 ## Organizing New Models
 
 For eBFE models not included in RasEbfeModels, use the **ebfe_organize_models agent skill**:
@@ -556,7 +706,7 @@ For eBFE models not included in RasEbfeModels, use the **ebfe_organize_models ag
 | Model | Manual Fix Time | With RasEbfeModels | Savings |
 |-------|----------------|-------------------|---------|
 | Spring Creek | 30-45 min | 5-10 min | 20-35 min |
-| North Galveston Bay | 45-90 min | 10-15 min (HMS only) | 30-75 min |
+| North Galveston Bay | 45-90 min | 10-15 min plus nested zip extraction | 30-75 min |
 | Upper Guadalupe | 60-120 min | 15-20 min | 45-100 min |
 
 **Additional Benefit**: Enables automation (no GUI popups)
@@ -582,16 +732,34 @@ RasCmdr.compute_plan("01", num_cores=4)  # Runs to completion
 
 ## Testing and Validation
 
-### Tested in HEC-RAS
+### End-to-End Evidence
 
-**Model**: UPGU1 (Upper Guadalupe)
-**Test**: Opened in HEC-RAS 6.5 GUI
-**Result**: ✓ Opens without errors, no "DSS path needs correction" dialog
+Current validation is tracked in the repository-level
+`VALIDATION_MATRIX.md`, with generated audit reports under the H: workspace:
+`H:\Testing\eBFE Model Organization\Validation\ebfe_delivery`.
+
+- Lower Colorado-Cummins sample: geometry preprocessor passed.
+- Rio Hondo: 253 1D steady reach projects passed sequential geometry preprocessor validation, and 253/253 steady plans computed successfully in `steady_plan_validation_20260424_160022.json`.
+- Spring Creek: 2D geometry preprocessor passed.
+- North Galveston Bay: nested download/extract/organize path passed geometry preprocessor validation; delivered HMS project loads through hms-commander.
+- Upper Guadalupe: UPGU1, UPGU2, and UPGU3 passed; UPGU4 requires the 7200-second validation record because its geometry preprocessor can exceed one hour.
+- Eleven Point: organized from the split `Input.zip`, `Terrain.zip`, and `Land_Cover.zip` delivery; path-audited with zero issues, seven local plan HDFs, and a passing ras-commander geometry-preprocessor run using HEC-RAS 6.6.
+- Spring River: cataloged separately from Spring Creek as `spring-river` / `SpringRiver_11010010`; downloaded, organized, path-audited with zero issues, preprocessor-valid in HEC-RAS 6.1, and results-ready with seven local plan HDFs. The validation notebook preserves the legacy `Land Classification` compatibility copy referenced by `Spring_BLE.g01.hdf`, archives fresh preprocessor evidence, and restores the delivered full-result plan HDF; see `examples/957_ebfe_spring_river_validation.ipynb`.
+- Lower Brazos: LB_MA01, LB_MA02, and LB_MA03 are downloaded, extracted, organized, path-audited with zero issues, and results-ready with 61 local plan HDFs in the latest audit. LB_MA02 passed ras-commander geometry-preprocessor validation in 3846.3 seconds; LB_MA01 exceeded the 7200-second timeout with no compute messages, and LB_MA03 returned without producing compute messages, so Lower Brazos remains partially preprocessor-validated.
+- Amite: full E2E organization completed for five RAS projects. WA1, WA2,
+  WA3, and WA5 passed geometry preprocessor validation; WA4 is blocked by a
+  `RasGeomWriter` / `ERROR: Incorrect Type in ./Projection. (Expected String)`
+  failure and requires manual terrain rebuild or repair inside RASMapper.
+- Tickfaw: organized, path-audited, preprocessor-valid, and results-ready with seven local hydraulic plan HDFs; see `examples/955_ebfe_tickfaw_validation.ipynb`.
+- Lake Maurepas: organized, HMS-validated through hms-commander, path-audited, and preprocessor-valid; source archive scan found no RAS plan-result HDFs, so it is not yet a results-ready demo; see `examples/954_ebfe_lake_maurepas_validation.ipynb`.
 
 ### Notebook Testing
 
-**Subagent**: notebook-runner (tested all 3 notebooks)
-**Results**: 2 passing, 1 needs minor fixes (non-blocking)
+Current eBFE notebooks `950`-`957` execute against the shared
+`H:\Testing\eBFE Model Organization` workspace by default, with
+`RAS_COMMANDER_EBFE_ROOT` available for overrides. Stored notebook outputs were
+refreshed after delivery-format updates, and notebook QA confirmed no error
+outputs in the eBFE notebook set.
 
 ### DSS Validation Scale
 
@@ -634,10 +802,11 @@ RasCmdr.compute_plan("01", num_cores=4)  # Runs to completion
 
 ## See Also
 
-- **Critical Fixes Documentation**: `feature_dev_notes/eBFE_Integration/CRITICAL_FIXES.md`
-- **Implementation Details**: `feature_dev_notes/eBFE_Integration/IMPLEMENTATION_COMPLETE.md`
-- **Pattern Research**: `feature_dev_notes/eBFE_Integration/RESEARCH_FINDINGS.md`
-- **Agent Skill**: `.claude/skills/ebfe_organize_models/SKILL.md`
+- [eBFE Delivery Validation](user-guide/ebfe-delivery-validation.md)
+- `VALIDATION_MATRIX.md`
+- [950_ebfe_spring_creek.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/950_ebfe_spring_creek.ipynb)
+- [955_ebfe_tickfaw_validation.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/955_ebfe_tickfaw_validation.ipynb)
+- [957_ebfe_spring_river_validation.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/957_ebfe_spring_river_validation.ipynb)
 
 ---
 

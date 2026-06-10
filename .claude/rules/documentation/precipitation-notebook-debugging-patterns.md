@@ -132,7 +132,7 @@ RasCmdr.compute_parallel(
 
 # Or for multiple projects: Sequential by project, parallel within project
 for aep_name, project_info in storm_projects.items():
-    init_ras_project(project_info['path'], "6.6")
+    init_ras_project(project_info['path'], "7.0")
     RasCmdr.compute_parallel(plans_to_run=plan_numbers, max_workers=4)
 ```
 
@@ -320,7 +320,7 @@ total = hyeto['cumulative_depth'].iloc[-1]
 - All 4 methods demonstrated
 - DataFrame API usage throughout
 
-**Notebook 721**: `examples/721_Precipitation_Hyetograph_Comparison.ipynb`
+**Notebook 721**: `examples/721_precipitation_hyetograph_comparison.ipynb`
 - Multi-method multi-AEP workflow
 - Parallel execution pattern
 - Pre-execution validation cells

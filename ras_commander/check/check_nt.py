@@ -352,6 +352,9 @@ class CheckNt:
         messages = []
         summary_data = []
 
+        if thresholds is None:
+            thresholds = get_default_thresholds()
+
         geom_file = Path(geom_file)
 
         if not geom_file.exists():
@@ -373,9 +376,13 @@ class CheckNt:
         try:
             # Get all cross sections from geometry file
             xs_df = GeomCrossSection.get_cross_sections(geom_file)
+            # Filter to Type 1 (real cross sections) only - excludes lateral
+            # structures (Type 6), bridges, culverts, etc. which lack #Sta/Elev data
+            if 'Type' in xs_df.columns:
+                xs_df = xs_df[xs_df['Type'] == 1].reset_index(drop=True)
 
             if xs_df.empty:
-                logger.info(f"No cross sections found in {geom_file.name}")
+                logger.debug(f"No cross sections found in {geom_file.name}")
                 results.messages = messages
                 return results
 
@@ -646,7 +653,7 @@ class CheckNt:
                 structure_rows.extend(weirs_df.to_dict('records'))
 
             if not structure_rows:
-                logger.info(f"No bridges/structures found in {geom_file.name}")
+                logger.debug(f"No bridges/structures found in {geom_file.name}")
                 results.messages = messages
                 return results
 
@@ -762,6 +769,105 @@ class CheckNt:
                 message=f"Failed to check structure HTAB parameters: {e}"
             )
             results.messages.append(msg)
+
+        return results
+
+    # =========================================================================
+    # Subgrid Sampling Options Check (2D Flow Areas)
+    # =========================================================================
+
+    @staticmethod
+    @log_call
+    def check_subgrid_sampling(
+        geom_file: Union[str, Path],
+        thresholds: Optional[ValidationThresholds] = None
+    ) -> CheckResults:
+        """
+        Check whether 2D flow areas have subgrid sampling options enabled.
+
+        For HEC-RAS 6.x models with 2D flow areas, recommends enabling:
+        - Spatially Varied Manning's n on Faces
+        - Composite Classification Values in Cells
+
+        These settings significantly improve hydraulic accuracy by using
+        land-cover-based roughness at each face and weighted composite
+        classification within each cell, rather than a single default value.
+
+        Reference:
+            https://www.hec.usace.army.mil/confluence/rasdocs/d2sd/ras2dsedtr/latest/numerical-methods/subgrid-concept
+
+        Args:
+            geom_file: Path to geometry file (.g##) - NOT HDF file
+            thresholds: Custom ValidationThresholds (uses defaults if None)
+
+        Returns:
+            CheckResults with subgrid sampling suggestion messages
+        """
+        from ..geom.GeomStorage import GeomStorage
+
+        results = CheckResults()
+        messages = []
+
+        geom_file = Path(geom_file)
+        if not geom_file.exists():
+            logger.warning(f"Geometry file not found for subgrid check: {geom_file}")
+            return results
+
+        try:
+            settings = GeomStorage.get_2d_flow_area_settings(geom_file)
+
+            if settings.empty:
+                logger.debug("No 2D flow areas found - subgrid sampling check skipped")
+                return results
+
+            for _, row in settings.iterrows():
+                flow_area = row['name']
+                spatial = row['spatially_varied_mann_on_faces']
+                composite = row['composite_classification']
+
+                if spatial and composite:
+                    # Both enabled - good
+                    msg = CheckMessage(
+                        message_id="NT_SG_03",
+                        severity=Severity.INFO,
+                        check_type="NT",
+                        structure=flow_area,
+                        message=format_message("NT_SG_03", flow_area=flow_area),
+                        help_text=get_help_text("NT_SG_03")
+                    )
+                    messages.append(msg)
+                else:
+                    if not spatial:
+                        msg = CheckMessage(
+                            message_id="NT_SG_01",
+                            severity=Severity.WARNING,
+                            check_type="NT",
+                            structure=flow_area,
+                            message=format_message("NT_SG_01", flow_area=flow_area),
+                            help_text=get_help_text("NT_SG_01")
+                        )
+                        messages.append(msg)
+
+                    if not composite:
+                        msg = CheckMessage(
+                            message_id="NT_SG_02",
+                            severity=Severity.WARNING,
+                            check_type="NT",
+                            structure=flow_area,
+                            message=format_message("NT_SG_02", flow_area=flow_area),
+                            help_text=get_help_text("NT_SG_02")
+                        )
+                        messages.append(msg)
+
+            results.messages = messages
+
+            logger.info(
+                f"Subgrid sampling check: {len(settings)} 2D flow areas, "
+                f"{len([m for m in messages if m.severity == Severity.WARNING])} suggestions"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to check subgrid sampling options: {e}")
 
         return results
 

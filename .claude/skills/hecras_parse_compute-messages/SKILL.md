@@ -1,5 +1,9 @@
 ---
 name: hecras_parse_compute-messages
+shared_corpus: true
+harness_scope: shared
+source_owner: gpt-cmdr
+security_review: internal
 description: |
   Parse HEC-RAS compute output from HDF files to extract execution status,
   diagnostic messages, and performance metrics. Converts raw computation
@@ -31,7 +35,7 @@ When the user asks about execution status or compute messages, use these pattern
 from ras_commander import init_ras_project, HdfResultsPlan
 
 # Initialize project
-init_ras_project("path/to/project", "6.6")
+init_ras_project("path/to/project", "7.0")
 
 # Extract compute messages (handles HDF + .txt fallback automatically)
 messages = HdfResultsPlan.get_compute_messages("01")
@@ -304,7 +308,7 @@ def analyze_plan_execution(project_path: str, ras_version: str, plan_number: str
     return report
 
 # Usage
-report = analyze_plan_execution("path/to/project", "6.6", "01")
+report = analyze_plan_execution("path/to/project", "7.0", "01")
 ```
 
 ---
