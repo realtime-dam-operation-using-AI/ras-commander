@@ -19,6 +19,18 @@ This file is the canonical local instruction file for `docs/`.
 - `docs/cognitive-infrastructure/` is generated from `.claude/` inventory and helper scripts. Prefer editing the source inputs or generator rather than hand-maintaining generated summaries.
 - `docs/examples/` should stay aligned with notebook numbering and real notebook behavior.
 
+## Citation And Recognition
+
+- Preserve `docs/cite.md` as the canonical citation, sharing, contribution, and
+  support page at https://rascommander.info/ras/cite/.
+- Keep the citation page and the short agent-facing recognition guidance in the
+  generated `llms.txt` corpus.
+- Preserve the subtle citation, upstream-contribution, and technical-assistance
+  links in the documentation footer.
+- Keep contributor and prior-work recognition aligned with
+  `docs/about/acknowledgments.md`; do not replace it with incomplete duplicate
+  lists on other pages.
+
 ## Build Rules
 
 - Validate docs with `mkdocs build --strict` when documentation structure changes.
@@ -26,5 +38,11 @@ This file is the canonical local instruction file for `docs/`.
 
 ## Style
 
+- Follow [the concise writing guide](../.claude/references/writing/technical-writing-guide.md) and
+  [extended writing standard](../.claude/references/writing/technical-writing-standard.md).
+- Use the relevant official HEC document/version for HEC's documented methods and terminology;
+  keep references passive and maintain RAS Commander's independent third-party voice.
+- State supported library capabilities and original observations confidently using project evidence.
+  Match explanation to the audience; do not require HEC endorsement or unnecessary hedging.
 - Keep docs concrete and path-accurate.
 - Prefer relative repository references that stay valid in MkDocs.

@@ -1,5 +1,5 @@
 """
-RasFloodway - Authoring helpers for steady-flow floodway encroachments.
+RasFloodway - Experimental authoring helpers for steady-flow floodway encroachments.
 
 This module handles the plain-text HEC-RAS plan and steady-flow records needed
 to configure Method 1-5 floodway encroachment trials without GUI steps.
@@ -14,17 +14,27 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
+from ._ras_text import _write_ras_text
 from .Decorators import log_call
 from .LoggingConfig import get_logger
 from .RasPlan import RasPlan
 from .RasPrj import ras
+from .RasSteady import RasSteady
 
 logger = get_logger(__name__)
 
 
 class RasFloodway:
     """
-    Static namespace for steady-flow floodway encroachment authoring.
+    Experimental steady-flow floodway encroachment authoring.
+
+    Not qualified for production authoring. Native fixed-width parsing is
+    regression-tested against official Example 6 records, including blank
+    values between profiles; this does not qualify the authoring workflow.
+    The delegated floodway checker also has incomplete HDF encroachment coverage.
+    Work only on disposable copies and independently inspect authored records
+    and computed profiles. Notebook 223 was withdrawn pending qualification;
+    see the floodway-check guide for the unresolved scope.
 
     Encroachment records live in plan files as an ``Encroach Param`` header
     followed by river/reach/node records. Each node data line stores triplets of
@@ -87,6 +97,13 @@ class RasFloodway:
         -------
         pandas.DataFrame
             One row per node/profile encroachment triplet.
+            ``line_number`` is the 1-based node-header line.
+
+        Raises
+        ------
+        ValueError
+            If a numeric field, method, or profile-slot count is malformed.
+            The error identifies the 1-based values line and node identity.
         """
         plan_path = RasFloodway._resolve_plan_path(plan_number_or_path, ras_object)
         lines = RasFloodway._read_lines(plan_path)
@@ -113,7 +130,13 @@ class RasFloodway:
             node = stripped.split("=", 1)[1].strip()
             value_line = lines[i + 1] if i + 1 < len(lines) else ""
             expected_slots = RasFloodway._expected_profile_slots(encroach_param)
-            slots = RasFloodway._parse_node_slots(value_line, expected_slots)
+            try:
+                slots = RasFloodway._parse_node_slots(value_line, expected_slots)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid encroachment record in {plan_path} at line {i + 2} "
+                    f"({current_river}/{current_reach}/{node}): {exc}"
+                ) from exc
 
             for slot_index, slot in enumerate(slots):
                 method = slot[0]
@@ -180,6 +203,7 @@ class RasFloodway:
         encroach_param: Optional[Sequence[Any]] = None,
         profile_count: Optional[int] = None,
         ras_object=None,
+        _log_summary: bool = True,
     ) -> pd.DataFrame:
         """
         Write Method 1-5 encroachment records into a HEC-RAS plan file.
@@ -215,6 +239,21 @@ class RasFloodway:
             lines = lines[:start] + block + lines[end:]
 
         RasFloodway._write_lines(plan_path, lines)
+        record_count = len(normalised)
+        nodes = {(record["river"], record["reach"], record["node"]) for record in normalised}
+        methods = ", ".join(str(method) for method in sorted({record["method"] for record in normalised}))
+        if _log_summary:
+            logger.info(
+                "Updated floodway encroachments in %s: %s %s across %s %s, %s, methods %s",
+                plan_path.name,
+                record_count,
+                "record" if record_count == 1 else "records",
+                len(nodes),
+                "node" if len(nodes) == 1 else "nodes",
+                RasFloodway._format_profile_summary(record["profile_number"] for record in normalised),
+                methods,
+            )
+        logger.debug("Full floodway plan path: %s", plan_path)
         RasFloodway._refresh_ras_object(ras_object)
         return RasFloodway.parse_encroachments(plan_path)
 
@@ -245,7 +284,8 @@ class RasFloodway:
         Parameters
         ----------
         method : int
-            Encroachment method, typically 4 or 5 for iterative trial setup.
+            Method 4 or 5 for target-surcharge trial setup. Use
+            ``set_encroachments`` for explicit Method 1 station pairs.
         targets : sequence of numbers
             Target surcharge values written into encroachment triplets.
         base_profile : int or str
@@ -257,8 +297,11 @@ class RasFloodway:
         energy_targets : sequence, optional
             Method 5 secondary values.
         """
-        if method not in {1, 2, 3, 4, 5}:
-            raise ValueError("method must be between 1 and 5")
+        if isinstance(method, bool) or method not in {4, 5}:
+            raise ValueError(
+                "create_trial_profiles supports target-surcharge methods 4 and 5; "
+                "use set_encroachments for explicit method-specific values"
+            )
         targets = RasFloodway._as_number_list(targets, "targets")
         if not targets:
             raise ValueError("targets must contain at least one value")
@@ -267,6 +310,31 @@ class RasFloodway:
 
         plan_path = RasFloodway._resolve_plan_path(plan_number_or_path, ras_object)
         flow_path = RasFloodway._resolve_flow_path(flow_number_or_path, plan_path, ras_object)
+
+        # Validate the existing block and infer locations before mutating the
+        # flow file: strict parsing failures must leave both inputs unchanged.
+        RasFloodway._find_encroachment_block(RasFloodway._read_lines(plan_path))
+        locations = locations or encroachments
+        if locations is None:
+            locations = RasFloodway._infer_encroachment_locations(plan_path, flow_path)
+
+        # Validate method values and identities before profile expansion writes
+        # the flow file. In particular, a malformed Method 5 energy vector must
+        # not leave a newly appended flow profile behind after failure.
+        if energy_targets is not None and method != 5:
+            raise ValueError("energy_targets are only supported for Method 5")
+        preview_records = RasFloodway._build_trial_encroachments(
+            locations, method, targets, list(range(2, len(targets) + 2)),
+            energy_targets,
+        )
+        if not preview_records:
+            raise ValueError("No encroachment locations supplied or inferred")
+        preview_records = RasFloodway._normalise_encroachment_records(preview_records)
+        RasFloodway._format_encroachment_block(
+            preview_records,
+            profile_count=len(targets) + 1,
+            encroach_param=(-1, 0, 0, len(targets) + 1),
+        )
 
         flow_info = RasFloodway._expand_steady_flow_profiles(
             flow_path=flow_path,
@@ -278,9 +346,6 @@ class RasFloodway:
         )
 
         target_profile_numbers = flow_info["new_profile_numbers"]
-        locations = locations or encroachments
-        if locations is None:
-            locations = RasFloodway._infer_encroachment_locations(plan_path, flow_path)
 
         records = RasFloodway._build_trial_encroachments(
             locations=locations,
@@ -297,6 +362,7 @@ class RasFloodway:
             encroach_param=encroach_param,
             profile_count=flow_info["new_profile_count"],
             ras_object=ras_object,
+            _log_summary=False,
         )
 
         trial_metadata = RasFloodway._format_trial_metadata(
@@ -307,6 +373,17 @@ class RasFloodway:
             metadata=metadata,
         )
         RasFloodway._write_plan_description_after_encroachments(plan_path, trial_metadata)
+        logger.info(
+            "Created Method %s floodway trial profiles in %s using %s: %s profiles, %s targets, %s locations",
+            method,
+            plan_path.name,
+            flow_path.name,
+            len(target_profile_numbers),
+            len(targets),
+            len(locations),
+        )
+        logger.debug("Full floodway trial plan path: %s", plan_path)
+        logger.debug("Full floodway trial flow path: %s", flow_path)
 
         return {
             "plan_path": plan_path,
@@ -432,7 +509,9 @@ class RasFloodway:
         ras_obj = ras_object or ras
         plan_path = RasPlan.get_plan_path(plan_number_or_path, ras_obj)
         if plan_path is None or not Path(plan_path).exists():
-            raise FileNotFoundError(f"Plan file not found: {plan_number_or_path}")
+            raise FileNotFoundError(
+                RasFloodway._format_missing_plan_error(plan_number_or_path, plan_path, ras_obj)
+            )
         return Path(plan_path)
 
     @staticmethod
@@ -449,18 +528,27 @@ class RasFloodway:
             ras_obj = ras_object or ras
             flow_path = RasPlan.get_flow_path(flow_number_or_path, ras_obj)
             if flow_path is None or not Path(flow_path).exists():
-                raise FileNotFoundError(f"Steady flow file not found: {flow_number_or_path}")
+                raise FileNotFoundError(
+                    RasFloodway._format_missing_flow_error(flow_number_or_path, flow_path, ras_obj)
+                )
             return Path(flow_path)
 
+        flow_ref = None
+        candidate = None
         for line in RasFloodway._read_lines(plan_path):
-            if line.strip().startswith("Flow File=f"):
+            if line.strip().startswith("Flow File="):
                 flow_ref = line.split("=", 1)[1].strip()
+                if not flow_ref.lower().startswith("f"):
+                    break
                 project_name = RasFloodway._project_name_from_plan_path(plan_path)
                 candidate = plan_path.parent / f"{project_name}.{flow_ref}"
                 if candidate.exists():
                     return candidate
+                break
 
-        raise FileNotFoundError(f"Could not resolve steady flow file from plan: {plan_path}")
+        raise FileNotFoundError(
+            RasFloodway._format_missing_plan_flow_error(plan_path, flow_ref, candidate)
+        )
 
     @staticmethod
     def _project_name_from_plan_path(plan_path: Path) -> str:
@@ -470,14 +558,91 @@ class RasFloodway:
         return plan_path.stem
 
     @staticmethod
+    def _format_missing_plan_error(plan_number_or_path: Any, resolved_path: Optional[Path], ras_obj) -> str:
+        message = [f"Plan file not found: {plan_number_or_path}"]
+        context = RasFloodway._ras_project_context(ras_obj)
+        if context:
+            message.append(context)
+        if resolved_path is not None:
+            message.append(f"Resolved path: {Path(resolved_path)}")
+        available = RasFloodway._available_component_numbers(ras_obj, "plan_df", "get_plan_entries", "plan_number")
+        if available:
+            message.append(f"Available plans: {available}")
+        return ". ".join(message)
+
+    @staticmethod
+    def _format_missing_flow_error(flow_number_or_path: Any, resolved_path: Optional[Path], ras_obj) -> str:
+        message = [f"Steady flow file not found: {flow_number_or_path}"]
+        context = RasFloodway._ras_project_context(ras_obj)
+        if context:
+            message.append(context)
+        if resolved_path is not None:
+            message.append(f"Resolved path: {Path(resolved_path)}")
+        available = RasFloodway._available_component_numbers(ras_obj, "flow_df", "get_flow_entries", "flow_number")
+        if available:
+            message.append(f"Available steady flows: {available}")
+        return ". ".join(message)
+
+    @staticmethod
+    def _format_missing_plan_flow_error(plan_path: Path, flow_ref: Optional[str], candidate: Optional[Path]) -> str:
+        if flow_ref is None:
+            return f"Could not resolve steady flow file from plan: {plan_path}. No Flow File=f## record was found."
+        if not flow_ref.lower().startswith("f"):
+            return (
+                f"Could not resolve steady flow file from plan: {plan_path}. "
+                f"Plan references non-steady Flow File={flow_ref}."
+            )
+        return (
+            f"Could not resolve steady flow file from plan: {plan_path}. "
+            f"Plan references Flow File={flow_ref}, but expected file was not found: {candidate}"
+        )
+
+    @staticmethod
+    def _ras_project_context(ras_obj) -> str:
+        project_name = getattr(ras_obj, "project_name", None)
+        project_folder = getattr(ras_obj, "project_folder", None)
+        if project_name and project_folder:
+            return f"Project: {project_name} in {project_folder}"
+        if project_name:
+            return f"Project: {project_name}"
+        if project_folder:
+            return f"Project folder: {project_folder}"
+        return ""
+
+    @staticmethod
+    def _available_component_numbers(ras_obj, df_attr: str, getter: str, number_column: str) -> str:
+        df = getattr(ras_obj, df_attr, None)
+        if (df is None or getattr(df, "empty", True)) and hasattr(ras_obj, getter):
+            try:
+                df = getattr(ras_obj, getter)()
+            except Exception:
+                logger.debug("Could not refresh %s while formatting missing file error", df_attr, exc_info=True)
+                df = None
+        if df is None or getattr(df, "empty", True) or number_column not in df.columns:
+            return ""
+        values = [str(value) for value in df[number_column].dropna().tolist()]
+        return ", ".join(values)
+
+    @staticmethod
+    def _format_profile_summary(profile_numbers) -> str:
+        values = sorted({int(profile) for profile in profile_numbers})
+        if not values:
+            return "profiles none"
+        if len(values) == 1:
+            return f"profile {values[0]}"
+        expected = list(range(values[0], values[-1] + 1))
+        if values == expected:
+            return f"profiles {values[0]}-{values[-1]}"
+        return "profiles " + ", ".join(str(value) for value in values)
+
+    @staticmethod
     def _read_lines(path: Path) -> List[str]:
         with open(path, "r", encoding="utf-8", errors="replace") as file:
             return file.readlines()
 
     @staticmethod
     def _write_lines(path: Path, lines: List[str]) -> None:
-        with open(path, "w", encoding="utf-8") as file:
-            file.writelines(lines)
+        _write_ras_text(path, "".join(lines), encoding="utf-8")
 
     @staticmethod
     def _parse_encroach_param(line: str) -> List[Optional[float]]:
@@ -494,15 +659,63 @@ class RasFloodway:
 
     @staticmethod
     def _parse_node_slots(value_line: str, expected_slots: int = 0) -> List[List[Optional[float]]]:
-        values = RasFloodway._parse_value_tokens(value_line)
+        """Read native eight-character fields without shifting blank values.
+
+        Compact records are accepted only as complete, single-space-delimited
+        triplets with no leading/trailing padding. Native-looking malformed
+        records must not fall back to whitespace parsing.
+        """
+        raw = value_line.rstrip("\r\n")
+        width = RasSteady.FIXED_WIDTH_FIELD_WIDTH
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        compact = re.fullmatch(rf"{number}(?: {number})+", raw)
+        if compact and len(raw.split(" ")) % 3 == 0:
+            fields = raw.split(" ")
+        else:
+            if len(raw) % width:
+                # Some readers remove trailing blank fields, but a partial
+                # nonblank fixed-width field cannot be positioned reliably.
+                remainder = raw[len(raw) // width * width:]
+                if remainder.strip():
+                    raise ValueError("incomplete eight-character field")
+                raw = raw[:len(raw) // width * width]
+            fields = [raw[i:i + width].strip() for i in range(0, len(raw), width)]
+
+        # Trailing padding is not an additional profile; interior blanks still
+        # retain their positions, and the header supplies omitted trailing slots.
+        while fields and not fields[-1]:
+            fields.pop()
+        values = []
+        for index, field in enumerate(fields):
+            if not field:
+                values.append(None)
+                continue
+            try:
+                value = float(field)
+            except ValueError as exc:
+                raise ValueError(f"invalid numeric field {index + 1}: {field!r}") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite numeric field {index + 1}: {field!r}")
+            values.append(value)
         inferred_slots = math.ceil(len(values) / 3) if values else 0
+        if expected_slots and inferred_slots > expected_slots:
+            raise ValueError(
+                f"record has {inferred_slots} profile slots; header allows {expected_slots}"
+            )
         slot_count = max(expected_slots, inferred_slots)
         slots = []
         for slot_index in range(slot_count):
             start = slot_index * 3
             group = values[start:start + 3]
             group = group + [None] * max(0, 3 - len(group))
-            method = int(group[0]) if group[0] is not None else None
+            method = group[0]
+            if method is None:
+                if any(value is not None for value in group[1:]):
+                    raise ValueError(f"profile slot {slot_index + 1} has values but no method")
+            elif not method.is_integer() or not 0 <= method <= 5:
+                raise ValueError(f"invalid method {method} in profile slot {slot_index + 1}")
+            else:
+                method = int(method)
             slots.append([method, group[1], group[2]])
         return slots
 
@@ -749,10 +962,26 @@ class RasFloodway:
             if not stripped:
                 end += 1
                 continue
-            if stripped.startswith(("Encroach River=", "Encroach Reach=", "Encroach Node=")):
-                end += 1
+            if stripped.startswith("Encroach Node="):
+                if end + 1 >= len(lines):
+                    raise ValueError(f"Missing encroachment values after line {end + 1}")
+                try:
+                    RasFloodway._parse_node_slots(
+                        lines[end + 1],
+                        RasFloodway._expected_profile_slots(
+                            RasFloodway._parse_encroach_param(lines[start])
+                        ),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid encroachment values at line {end + 2} "
+                        f"({stripped}): {exc}"
+                    ) from exc
+                # Consume the native values line as a record, including adjacent
+                # full-width fields that cannot be split on whitespace.
+                end += 2
                 continue
-            if RasFloodway._looks_like_encroachment_value_line(lines[end]):
+            if stripped.startswith(("Encroach River=", "Encroach Reach=")):
                 end += 1
                 continue
             break
@@ -1010,7 +1239,8 @@ class RasFloodway:
                 new_wse = base_wse + starting_wse_deltas[target_index]
             else:
                 new_wse = base_wse
-            cloned[i] = f"Dn Known WS={RasFloodway._format_compact_value(new_wse)}\n"
+            known_ws = RasSteady._format_fixed_width_field(new_wse).strip()
+            cloned[i] = f"Dn Known WS={known_ws}\n"
 
         return cloned
 
@@ -1131,7 +1361,12 @@ class RasFloodway:
 
     @staticmethod
     def _format_fixed_values(values: Sequence[Any]) -> str:
-        return "".join(f"{RasFloodway._format_compact_value(value):>8}" for value in values)
+        return "".join(
+            " " * RasSteady.FIXED_WIDTH_FIELD_WIDTH
+            if value is None
+            else RasSteady._format_fixed_width_field(value)
+            for value in values
+        )
 
     @staticmethod
     def _format_compact_value(value: Any) -> str:
@@ -1160,4 +1395,9 @@ class RasFloodway:
                 try:
                     setattr(ras_obj, attr, getattr(ras_obj, getter)())
                 except Exception:
+                    logger.warning(
+                        "Could not refresh ras_object.%s using %s; in-memory project tables may be stale",
+                        attr,
+                        getter,
+                    )
                     logger.debug("Could not refresh %s on ras_object", attr, exc_info=True)

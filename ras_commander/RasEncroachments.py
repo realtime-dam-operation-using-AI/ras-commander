@@ -18,11 +18,13 @@ import numpy as np
 import pandas as pd
 
 from .Decorators import log_call
+from .fast_hdf import read_attr, read_typed
 from .LoggingConfig import get_logger
 from .RasPlan import RasPlan
 from .RasPrj import ras
 from .RasUtils import RasUtils
 from . import _land_classification_helper as _lch
+from .fast_hdf import h5py_until_qualified
 
 logger = get_logger(__name__)
 
@@ -54,7 +56,14 @@ _POLYGON_POINTS_ATTRS = {
 
 
 class RasEncroachments:
-    """Static helpers for 2D floodway encroachment authoring."""
+    """Experimental helpers for 2D floodway GIS-input authoring.
+
+    Input readback is distinct from solver application. In the withdrawn
+    notebook 311, the HEC-RAS 6.6 run returned completion booleans but no native
+    unsteady encroachment result arrays and zero maximum-WSE differences.
+    Hydraulic application of these authored inputs remains unqualified; see
+    the floodway-check guide. The GIS authoring APIs remain available.
+    """
 
     @staticmethod
     @log_call
@@ -78,7 +87,12 @@ class RasEncroachments:
         ]
         hdf_path = _plan_gis_hdf_path(plan_path)
         _write_feature_table(hdf_path, _REGIONS_GROUP, normalized, "regions")
-        logger.info("Wrote %s 2D encroachment region(s) to %s", len(normalized), hdf_path)
+        logger.info(
+            "Wrote %s 2D encroachment region(s) to %s",
+            len(normalized),
+            hdf_path.name,
+        )
+        logger.debug("2D encroachment regions GIS HDF path: %s", hdf_path)
         return RasEncroachments.list_2d_encroachment_regions(plan_path)
 
     @staticmethod
@@ -127,7 +141,12 @@ class RasEncroachments:
         ]
         hdf_path = _plan_gis_hdf_path(plan_path)
         _write_feature_table(hdf_path, _ZONES_GROUP, normalized, "zones")
-        logger.info("Wrote %s 2D encroachment zone(s) to %s", len(normalized), hdf_path)
+        logger.info(
+            "Wrote %s 2D encroachment zone(s) to %s",
+            len(normalized),
+            hdf_path.name,
+        )
+        logger.debug("2D encroachment zones GIS HDF path: %s", hdf_path)
         return RasEncroachments.list_2d_encroachment_zones(plan_path)
 
     @staticmethod
@@ -191,7 +210,8 @@ class RasEncroachments:
             if additional_fill is not None:
                 group.attrs["Additional Fill"] = np.float32(additional_fill)
 
-        logger.info("Updated 2D encroachment plan settings in %s", hdf_path)
+        logger.info("Updated 2D encroachment plan settings in %s", hdf_path.name)
+        logger.debug("2D encroachment settings GIS HDF path: %s", hdf_path)
         return RasEncroachments.get_2d_encroachment_plan_settings(plan_path)
 
     @staticmethod
@@ -221,14 +241,14 @@ class RasEncroachments:
             group = hdf[_ENCROACHMENTS_GROUP]
             if "Base Plan Filename" in group.attrs:
                 settings["base_plan_filename"] = _decode_hdf_string(
-                    group.attrs["Base Plan Filename"]
+                    read_attr(group, "Base Plan Filename")
                 )
             if "Maximum Target Rise" in group.attrs:
-                settings["maximum_target_rise"] = float(group.attrs["Maximum Target Rise"])
+                settings["maximum_target_rise"] = float(read_attr(group, "Maximum Target Rise"))
             if "Fill Slope" in group.attrs:
-                settings["fill_slope"] = float(group.attrs["Fill Slope"])
+                settings["fill_slope"] = float(read_attr(group, "Fill Slope"))
             if "Additional Fill" in group.attrs:
-                settings["additional_fill"] = float(group.attrs["Additional Fill"])
+                settings["additional_fill"] = float(read_attr(group, "Additional Fill"))
         return settings
 
     @staticmethod
@@ -273,7 +293,12 @@ class RasEncroachments:
         ras_object=None,
     ) -> Dict[str, Any]:
         """
-        Create or configure a 2D floodway encroachment plan from structured input.
+        Create or configure experimental 2D floodway GIS inputs.
+
+        This authors files and layers; it does not establish that the solver
+        applies the encroachment. The retained notebook 311 run had no native
+        encroachment result arrays and all compared maximum-WSE differences
+        were zero. Independently qualify solver application before study use.
 
         When ``new_plan_shortid`` or ``new_title`` is supplied, ``template_plan``
         is cloned with :meth:`RasPlan.clone_plan` before authoring the companion
@@ -383,8 +408,29 @@ def _resolve_plan_path(
     ras_obj.check_initialized()
     plan_path = RasPlan.get_plan_path(plan_number_or_path, ras_object=ras_obj)
     if plan_path is None or not Path(plan_path).exists():
-        raise FileNotFoundError(f"Plan file not found for plan: {plan_number_or_path}")
+        available_plans = _available_plan_numbers(ras_obj)
+        project_name = getattr(ras_obj, "project_name", "unknown project")
+        project_folder = getattr(ras_obj, "project_folder", "unknown folder")
+        raise FileNotFoundError(
+            f"Plan file not found for plan {plan_number_or_path!r} in "
+            f"{project_name} ({project_folder}); available plan numbers: {available_plans}"
+        )
     return RasUtils.safe_resolve(Path(plan_path))
+
+
+def _available_plan_numbers(ras_object) -> str:
+    try:
+        plan_df = getattr(ras_object, "plan_df", None)
+        if plan_df is None or "plan_number" not in plan_df.columns:
+            return "none"
+        plan_numbers = [
+            RasUtils.normalize_ras_number(value)
+            for value in plan_df["plan_number"].dropna().astype(str).tolist()
+        ]
+        return ", ".join(plan_numbers) if plan_numbers else "none"
+    except Exception as exc:
+        logger.debug("Could not list available plan numbers: %s", exc)
+        return "unknown"
 
 
 def _plan_number_from_path(plan_path: Path) -> str:
@@ -639,6 +685,7 @@ def _build_attribute_array(records: Sequence[Dict[str, Any]], feature_kind: str)
     raise ValueError(f"Unsupported feature kind: {feature_kind}")
 
 
+@h5py_until_qualified
 def _read_feature_table(
     hdf_path: Optional[Path],
     group_path: str,
@@ -654,10 +701,10 @@ def _read_feature_table(
         if not all(name in group for name in ("Attributes", "Polygon Info", "Polygon Parts", "Polygon Points")):
             return []
 
-        attrs = group["Attributes"][:]
-        polygon_info = group["Polygon Info"][:]
-        polygon_parts = group["Polygon Parts"][:]
-        polygon_points = group["Polygon Points"][:]
+        attrs = read_typed(group["Attributes"], slice(None))
+        polygon_info = read_typed(group["Polygon Info"], slice(None))
+        polygon_parts = read_typed(group["Polygon Parts"], slice(None))
+        polygon_points = read_typed(group["Polygon Points"], slice(None))
 
         records = []
         for fid, row in enumerate(attrs):
@@ -714,7 +761,13 @@ def _base_plan_filename_attr(
 ) -> str:
     try:
         base_plan_path = _resolve_plan_path(base_plan, ras_object=ras_object)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Could not resolve base plan %r relative to %s; storing raw value: %s",
+            base_plan,
+            plan_path,
+            exc,
+        )
         return str(base_plan)
     return _lch.to_rasmap_relative_path(plan_path.parent, base_plan_path)
 

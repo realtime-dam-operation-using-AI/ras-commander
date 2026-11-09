@@ -1,7 +1,7 @@
 """
 RasMap - Parses HEC-RAS mapper configuration files (.rasmap)
 
-This module provides functionality to extract and organize information from 
+This module provides functionality to extract and organize information from
 HEC-RAS mapper configuration files, including paths to terrain, soil, and land cover data.
 It also includes functions to automate the post-processing of stored maps.
 
@@ -35,9 +35,7 @@ List of Functions in RasMap:
 - list_geometry_layers(): List top-level geometries and child geometry elements
 - list_geometry_features(): List HDF geometry features inside a layer
 - list_land_classification_polygons(): List sidecar classification polygon overrides
-- add_land_classification_polygon(): Add sidecar classification polygon override
-- update_land_classification_polygon(): Update sidecar classification polygon override
-- delete_land_classification_polygon(): Delete sidecar classification polygon override
+- add/update/delete_land_classification_polygon(): Native RASMapper sidecar polygon CRUD
 - set_geometry_layer_visibility(): Toggle child geometry elements such as mesh, XS, and structures
 - list_result_layers(): List RASMapper result plan and child layers
 - set_result_layer_visibility(): Toggle result plan and result child layers
@@ -71,34 +69,105 @@ List of Functions in RasMap:
 - add_wse_comparison_layers(): Batch add WSE comparison layers for existing/proposed plan pairs
 """
 
+import copy
 import os
+import json
 import re
 import subprocess
 import warnings
 import xml.etree.ElementTree as ET
+from datetime import datetime
+from numbers import Number
 from pathlib import Path
 import pandas as pd
 import shutil
-from typing import Union, Optional, Dict, List, Any, Sequence, Tuple, TYPE_CHECKING
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
-import numpy as np
-
+from ._ras_text import _write_ras_xml
 from .RasPrj import ras
 from .RasPlan import RasPlan
-from .RasCmdr import RasCmdr
 from .RasUtils import RasUtils
-from .RasGuiAutomation import RasGuiAutomation
 from .LoggingConfig import get_logger
 from .Decorators import log_call
 from ._native_helper import (
     normalize_store_map_render_mode,
     run_store_all_maps_helper,
 )
+from ._execution_types import BenefitAreaConfig, StoreMapPerformanceOptions
+from ._rasmap_schema import create_rasmap_dataframe, expected_rasmap_path
 
 if TYPE_CHECKING:
     from geopandas import GeoDataFrame
 
 logger = get_logger(__name__)
+
+_GEOMETRY_ASSOCIATION_LAYER_KEYS = {
+    "terrain": "terrain_hdf_path",
+    "landcover": "landcover_hdf_path",
+    "infiltration": "infiltration_hdf_path",
+    "sediment_soils": "sediment_soils_hdf_path",
+}
+_GEOMETRY_ASSOCIATION_COLUMNS = [
+    "geom_number",
+    "geom_path",
+    "geom_hdf_path",
+    "geom_hdf_exists",
+    "plan_numbers",
+    "has_2d_mesh",
+    "has_spatial_mannings",
+    *[
+        column
+        for layer in _GEOMETRY_ASSOCIATION_LAYER_KEYS
+        for column in (
+            f"{layer}_associated",
+            f"{layer}_raw_filename",
+            f"{layer}_layer_name",
+            f"{layer}_hdf_path",
+            f"{layer}_path_exists",
+        )
+    ],
+    "inspection_status",
+    "inspection_error",
+]
+
+
+def _geometry_has_spatial_mannings_authoring(geom_path: Path) -> bool:
+    """Return whether geometry text contains non-empty spatial-n authoring."""
+    try:
+        content = geom_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if re.search(r"(?m)^LCMann Region (?:Name|Table|Polygon)=", content):
+        return True
+    return any(
+        int(match.group(1)) > 0
+        for match in re.finditer(r"(?m)^LCMann Table=\s*(\d+)\s*$", content)
+    )
+
+
+def _resolve_native_hecras_version(
+    hecras_version: Optional[str],
+    ras_object: Any,
+) -> str:
+    """Resolve native interop version without selecting an arbitrary install."""
+    project = ras_object if ras_object is not None else ras
+    version = hecras_version or getattr(project, "ras_version", None)
+    if not version:
+        raise ValueError(
+            "hecras_version is required when no initialized ras_object "
+            "provides ras_version."
+        )
+    return str(version)
 
 
 def _resolve_optional_ras_project_path(
@@ -106,9 +175,13 @@ def _resolve_optional_ras_project_path(
     ras_object=None,
 ) -> Union[str, Path]:
     """Resolve either an explicit project path or the active RasPrj object."""
-    if ras_object is None and ras_project_path is not None and hasattr(
-        ras_project_path,
-        "check_initialized",
+    if (
+        ras_object is None
+        and ras_project_path is not None
+        and hasattr(
+            ras_project_path,
+            "check_initialized",
+        )
     ):
         ras_object = ras_project_path
         ras_project_path = None
@@ -127,9 +200,9 @@ def _sanitize_vbnet_identifier(name: str) -> str:
     Replaces dots, spaces, hyphens, and other non-alphanumeric characters with underscores.
     Prepends '_' if the result starts with a digit.
     """
-    sanitized = re.sub(r'[^A-Za-z0-9_]', '_', name)
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", name)
     if sanitized and sanitized[0].isdigit():
-        sanitized = '_' + sanitized
+        sanitized = "_" + sanitized
     return sanitized
 
 
@@ -260,85 +333,146 @@ End Namespace
 class RasMap:
     """
     Class for parsing and accessing information from HEC-RAS mapper configuration files (.rasmap).
-    
+
     This class provides methods to extract paths to terrain, soil, land cover data,
     and various project settings from the .rasmap file associated with a HEC-RAS project.
     It also includes functionality to automate the post-processing of stored maps.
     """
-    
+
     @staticmethod
     @log_call
     def parse_rasmap(rasmap_path: Union[str, Path], ras_object=None) -> pd.DataFrame:
         """
         Parse a .rasmap file and extract relevant information.
-        
+
         Args:
             rasmap_path (Union[str, Path]): Path to the .rasmap file.
-            ras_object: Optional RAS object instance.
-            
+            ras_object (RasPrj, optional): Optional RAS object instance. Retained for API
+                compatibility; parsing does not require project state.
+
         Returns:
-            pd.DataFrame: DataFrame containing extracted information from the .rasmap file.
+            pd.DataFrame: A single-row frame containing extracted information
+                and explicit parse provenance.
         """
         rasmap_path = Path(rasmap_path)
-        from . import _land_classification_helper as _lch
 
-        if not rasmap_path.exists():
-            logger.error(f"RASMapper file not found: {rasmap_path}")
-            return _lch.empty_rasmap_dataframe()
-        
         try:
-            data = _lch.empty_rasmap_dataframe().to_dict(orient="list")
-            
-            # Read the file content
-            with open(rasmap_path, 'r', encoding='utf-8') as f:
-                xml_content = f.read()
-            
-            # Check if it's a valid XML file
-            if not xml_content.strip().startswith('<'):
-                logger.error(f"File does not appear to be valid XML: {rasmap_path}")
-                return pd.DataFrame(data)
-            
-            # Parse the XML file
+            if not rasmap_path.exists():
+                logger.error(f"RASMapper file not found: {rasmap_path}")
+                return create_rasmap_dataframe(
+                    rasmap_path=rasmap_path,
+                    rasmap_status="absent",
+                )
+
             try:
-                tree = ET.parse(rasmap_path)
-                root = tree.getroot()
+                root = ET.fromstring(rasmap_path.read_bytes())
             except ET.ParseError as e:
                 logger.error(f"Error parsing XML in {rasmap_path}: {e}")
-                return _lch.empty_rasmap_dataframe()
-            
+                return create_rasmap_dataframe(
+                    rasmap_path=rasmap_path,
+                    rasmap_status="failed",
+                    rasmap_error=f"ParseError: {e}",
+                )
+
+            root_name = root.tag.rsplit("}", 1)[-1]
+            if root_name != "RASMapper":
+                message = (
+                    "ValueError: Expected RASMapper root element, "
+                    f"found {root.tag!r}"
+                )
+                logger.error("Invalid RASMapper document %s: %s", rasmap_path, message)
+                return create_rasmap_dataframe(
+                    rasmap_path=rasmap_path,
+                    rasmap_status="failed",
+                    rasmap_error=message,
+                )
+
+            from . import _land_classification_helper as _lch
+            from . import _rasmap_layer_helper as _mlh
+
+            map_layers = _mlh.top_level_map_layers(root)
+            data = create_rasmap_dataframe(
+                rasmap_path=rasmap_path,
+                rasmap_status="parsed",
+            ).to_dict(orient="list")
+            field_errors: Dict[str, str] = {}
+
+            def record_field_error(
+                columns: Union[str, Sequence[str]],
+                description: str,
+                exc: Exception,
+            ) -> None:
+                affected_columns = [columns] if isinstance(columns, str) else columns
+                message = f"{type(exc).__name__}: {exc}"
+                for column in affected_columns:
+                    previous = field_errors.get(column)
+                    field_errors[column] = (
+                        f"{previous}; {message}" if previous else message
+                    )
+                logger.warning("Error extracting %s: %s", description, message)
+
             # Extract projection path
             try:
                 projection_elem = root.find(".//RASProjectionFilename")
-                if projection_elem is not None and 'Filename' in projection_elem.attrib:
+                if projection_elem is not None and "Filename" in projection_elem.attrib:
                     projection_path = _lch.resolve_rasmap_relative_path(
                         rasmap_path.parent,
-                        projection_elem.attrib['Filename'],
+                        projection_elem.attrib["Filename"],
                     )
-                    data['projection_path'][0] = (
+                    data["projection_path"][0] = (
                         str(projection_path) if projection_path is not None else None
                     )
             except Exception as e:
-                logger.warning(f"Error extracting projection path: {e}")
-            
+                record_field_error("projection_path", "projection path", e)
+
             # Extract profile lines path
             try:
-                profile_lines_elem = root.find(".//Features/Layer[@Name='Profile Lines']")
-                if profile_lines_elem is not None and 'Filename' in profile_lines_elem.attrib:
+                profile_lines_elem = root.find(
+                    ".//Features/Layer[@Name='Profile Lines']"
+                )
+                if (
+                    profile_lines_elem is not None
+                    and "Filename" in profile_lines_elem.attrib
+                ):
                     profile_lines_path = _lch.resolve_rasmap_relative_path(
                         rasmap_path.parent,
-                        profile_lines_elem.attrib['Filename'],
+                        profile_lines_elem.attrib["Filename"],
                     )
                     if profile_lines_path is not None:
-                        data['profile_lines_path'][0].append(str(profile_lines_path))
+                        data["profile_lines_path"][0].append(str(profile_lines_path))
             except Exception as e:
-                logger.warning(f"Error extracting profile lines path: {e}")
-            
+                record_field_error("profile_lines_path", "profile lines path", e)
+
+            land_columns = (
+                "soil_layer_path",
+                "infiltration_hdf_path",
+                "landcover_hdf_path",
+            )
             try:
-                land_layers = RasMap.list_land_classification_layers(
-                    rasmap_path,
-                    ras_object=ras_object,
-                )
-                if not land_layers.empty:
+                land_records = []
+                for layer in map_layers:
+                    if layer.attrib.get("Type") not in _mlh.LAND_CLASSIFICATION_LAYER_TYPES:
+                        continue
+                    try:
+                        if not layer.attrib.get("Filename", "").strip():
+                            raise ValueError(
+                                "Land-classification declaration is missing Filename"
+                            )
+                        land_records.append(
+                            _lch.build_land_classification_record(
+                                layer,
+                                rasmap_path.parent,
+                            )
+                        )
+                    except Exception as e:
+                        record_field_error(
+                            land_columns,
+                            "land-classification layer declaration",
+                            e,
+                        )
+
+                if land_records:
+                    land_layers = pd.DataFrame(land_records)
                     for kind, target_column in (
                         ("soils", "soil_layer_path"),
                         ("infiltration", "infiltration_hdf_path"),
@@ -349,58 +483,121 @@ class RasMap:
                             for path in land_layers.loc[
                                 land_layers["classification_kind"] == kind,
                                 "resolved_path",
-                            ].dropna().tolist()
+                            ]
+                            .dropna()
+                            .tolist()
                         ]
                         data[target_column][0] = paths
             except Exception as e:
-                logger.warning(f"Error extracting land-classification layer paths: {e}")
-            
+                record_field_error(
+                    land_columns,
+                    "land-classification layer paths",
+                    e,
+                )
+
             # Extract terrain HDF paths
             try:
                 terrain_layers = root.findall(".//Terrains/Layer")
+                terrain_paths = []
                 for layer in terrain_layers:
-                    if 'Filename' in layer.attrib:
+                    try:
+                        filename = layer.attrib.get("Filename", "")
+                        if not filename.strip():
+                            raise ValueError(
+                                "Terrain layer declaration is missing Filename"
+                            )
                         terrain_path = _lch.resolve_rasmap_relative_path(
                             rasmap_path.parent,
-                            layer.attrib['Filename'],
+                            filename,
                         )
                         if terrain_path is not None:
-                            data['terrain_hdf_path'][0].append(str(terrain_path))
+                            terrain_paths.append(str(terrain_path))
+                    except Exception as e:
+                        record_field_error(
+                            "terrain_hdf_path",
+                            "terrain layer declaration",
+                            e,
+                        )
+                data["terrain_hdf_path"][0] = terrain_paths
             except Exception as e:
-                logger.warning(f"Error extracting terrain HDF paths: {e}")
+                record_field_error("terrain_hdf_path", "terrain HDF paths", e)
 
             try:
-                reference_layers = RasMap.list_reference_map_layers(
-                    rasmap_path,
-                    ras_object=ras_object,
-                )
-                if not reference_layers.empty:
-                    data["reference_map_layer_names"][0] = (
-                        reference_layers["name"].dropna().tolist()
-                    )
-                    data["reference_map_layer_path"][0] = [
-                        str(path)
-                        for path in reference_layers["resolved_path"].dropna().tolist()
-                    ]
+                reference_names = []
+                reference_paths = []
+                for layer in map_layers:
+                    if layer.attrib.get("Type") not in _mlh.REFERENCE_MAP_LAYER_TYPES:
+                        continue
+                    reference_names.append(layer.attrib.get("Name", ""))
+                    filename = layer.attrib.get("Filename", "")
+                    if not filename.strip():
+                        record_field_error(
+                            "reference_map_layer_path",
+                            "reference map layer declaration",
+                            ValueError(
+                                "Reference map layer declaration is missing Filename"
+                            ),
+                        )
+                        continue
+                    try:
+                        resolved_path = _lch.resolve_rasmap_relative_path(
+                            rasmap_path.parent,
+                            filename,
+                        )
+                        if resolved_path is not None:
+                            reference_paths.append(str(resolved_path))
+                    except Exception as e:
+                        record_field_error(
+                            "reference_map_layer_path",
+                            "reference map layer declaration",
+                            e,
+                        )
+                data["reference_map_layer_names"][0] = reference_names
+                data["reference_map_layer_path"][0] = reference_paths
             except Exception as e:
-                logger.warning(f"Error extracting reference map layers: {e}")
+                record_field_error(
+                    ("reference_map_layer_names", "reference_map_layer_path"),
+                    "reference map layers",
+                    e,
+                )
 
             try:
-                basemap_layers = RasMap.list_basemap_layers(
-                    rasmap_path,
-                    ras_object=ras_object,
-                )
-                if not basemap_layers.empty:
-                    data["basemap_layer_names"][0] = (
-                        basemap_layers["name"].dropna().tolist()
-                    )
-                    data["basemap_layer_path"][0] = [
-                        str(path)
-                        for path in basemap_layers["resolved_path"].dropna().tolist()
-                    ]
+                basemap_names = []
+                basemap_paths = []
+                for layer in map_layers:
+                    if layer.attrib.get("Type") != _mlh.BASEMAP_LAYER_TYPE:
+                        continue
+                    basemap_names.append(layer.attrib.get("Name", ""))
+                    filename = layer.attrib.get("Filename", "")
+                    if not filename.strip():
+                        record_field_error(
+                            "basemap_layer_path",
+                            "basemap layer declaration",
+                            ValueError("Basemap layer declaration is missing Filename"),
+                        )
+                        continue
+                    try:
+                        resolved_path = _lch.resolve_rasmap_relative_path(
+                            rasmap_path.parent,
+                            filename,
+                        )
+                        if resolved_path is not None:
+                            basemap_paths.append(str(resolved_path))
+                    except Exception as e:
+                        record_field_error(
+                            "basemap_layer_path",
+                            "basemap layer declaration",
+                            e,
+                        )
+                data["basemap_layer_names"][0] = basemap_names
+                data["basemap_layer_path"][0] = basemap_paths
             except Exception as e:
-                logger.warning(f"Error extracting basemap layers: {e}")
-            
+                record_field_error(
+                    ("basemap_layer_names", "basemap_layer_path"),
+                    "basemap layers",
+                    e,
+                )
+
             # Extract current settings
             current_settings = {}
             try:
@@ -411,25 +608,42 @@ class RasMap:
                     if project_settings_elem is not None:
                         for child in project_settings_elem:
                             current_settings[child.tag] = child.text
-                    
+
                     # Extract Folders
                     folders_elem = settings_elem.find("Folders")
                     if folders_elem is not None:
                         for child in folders_elem:
                             current_settings[child.tag] = child.text
-                            
-                data['current_settings'][0] = current_settings
+
+                data["current_settings"][0] = current_settings
             except Exception as e:
-                logger.warning(f"Error extracting current settings: {e}")
-            
-            # Create DataFrame
+                record_field_error("current_settings", "current settings", e)
+
+            data["rasmap_field_errors"][0] = field_errors
+            data["rasmap_status"][0] = (
+                "parsed_with_errors" if field_errors else "parsed"
+            )
             df = pd.DataFrame(data)
-            logger.info(f"Successfully parsed RASMapper file: {rasmap_path}")
+            logger.debug(
+                "Parsed RASMapper file: %s (status=%s, terrains=%d, "
+                "reference_layers=%d, basemaps=%d)",
+                rasmap_path.name,
+                data["rasmap_status"][0],
+                len(data.get("terrain_hdf_path", [[]])[0] or []),
+                len(data.get("reference_map_layer_names", [[]])[0] or []),
+                len(data.get("basemap_layer_names", [[]])[0] or []),
+            )
             return df
-            
+
         except Exception as e:
-            logger.error(f"Unexpected error processing RASMapper file {rasmap_path}: {e}")
-            return _lch.empty_rasmap_dataframe()
+            logger.error(
+                f"Unexpected error processing RASMapper file {rasmap_path}: {e}"
+            )
+            return create_rasmap_dataframe(
+                rasmap_path=rasmap_path,
+                rasmap_status="failed",
+                rasmap_error=f"{type(e).__name__}: {e}",
+            )
 
     @staticmethod
     @log_call
@@ -440,13 +654,14 @@ class RasMap:
         """
         List semantic land-classification layers from a project .rasmap file.
 
-        Classifies each ``Type="LandCoverLayer"`` entry as ``landcover``,
-        ``soils``, ``infiltration``, or ``unknown`` using filename and selected
-        parameter semantics rather than exact display names.
+        Classifies each modern ``Type="LandCoverLayer"`` and legacy
+        ``Type="LandCover"`` entry as ``landcover``, ``soils``,
+        ``infiltration``, or ``unknown`` using filename and selected parameter
+        semantics rather than exact display names.
 
         Args:
             ras_project_path: Project folder, .prj file, or .rasmap file.
-            ras_object: Optional RasPrj object. Present for API consistency.
+            ras_object (RasPrj, optional): Optional RasPrj object. Present for API consistency.
 
         Returns:
             DataFrame with one row per LandCoverLayer entry.
@@ -480,13 +695,11 @@ class RasMap:
             logger.error(f"Error parsing .rasmap XML: {e}")
             return pd.DataFrame(columns=columns)
 
-        map_layers = root.find("MapLayers")
-        if map_layers is None:
-            return pd.DataFrame(columns=columns)
+        from . import _rasmap_layer_helper as _mlh
 
         records = []
-        for layer in map_layers.findall("Layer"):
-            if layer.attrib.get("Type") != "LandCoverLayer":
+        for layer in _mlh.top_level_map_layers(root):
+            if layer.attrib.get("Type") not in _mlh.LAND_CLASSIFICATION_LAYER_TYPES:
                 continue
             records.append(
                 _lch.build_land_classification_record(
@@ -502,6 +715,98 @@ class RasMap:
 
     @staticmethod
     @log_call
+    def remove_terrain_layers(rasmap_path: str | Path) -> list[str]:
+        """Remove all terrain registrations from a cloned Mapper file.
+
+        Mutates only the supplied XML; never deletes HDF/TIFF files or changes
+        geometry-HDF associations. The caller must register its replacement
+        terrain and explicitly associate every geometry before native execution.
+        No units or coordinates are converted.
+
+        Args:
+            rasmap_path: Explicit Mapper XML in a versioned child clone.
+
+        Returns:
+            Names of removed terrain registrations, in document order.
+
+        Raises:
+            xml.etree.ElementTree.ParseError: Malformed Mapper XML.
+        """
+        from ._terrain_registration import remove_terrain_layers
+
+        return remove_terrain_layers(rasmap_path)
+
+    @staticmethod
+    def create_terrain_sampling_map(
+        source_mapper: str | Path, terrain_hdf: str | Path,
+        projection_prj: str | Path, output_mapper: str | Path,
+        geometry_hdf: str | Path | None = None,
+    ) -> str:
+        """Create a new export-only Mapper with one unchanged native terrain layer.
+
+        Resolves a unique terrain basename from source registrations, including
+        stale delivered directory spellings. Reads source files without mutation;
+        writes only the new Mapper. Returns its native terrain name. Grid, CRS,
+        vertical units and modification enable flags remain unchanged.
+        Optional geometry_hdf registers a caller-owned geometry copy for native
+        profile sampling; it defaults to no geometry registration.
+        """
+        from ._terrain_registration import create_terrain_sampling_map
+        return create_terrain_sampling_map(source_mapper, terrain_hdf, projection_prj, output_mapper, geometry_hdf)
+
+    @staticmethod
+    def relocate_rasmap_assets(rasmap_path: str | Path, assets: list[Path]) -> list[dict]:
+        """Rebind uniquely named copied assets relatively in a caller-owned Mapper.
+
+        Mutates only the supplied clone's Filename attributes. Duplicate asset
+        basenames are rejected before writing. Does not alter grids, CRS, native
+        terrain names, result-map parameters or vertical units.
+        """
+        from ._terrain_registration import relocate_rasmap_assets
+        return relocate_rasmap_assets(rasmap_path, assets)
+
+    @staticmethod
+    def audit_terrain_associations(rasmap_path: str | Path, geometry_hdfs: list[Path]) -> dict:
+        """Read terrain, classification, projection and geometry links after relocation.
+
+        Returns pass/hold with every material path, its existence/relative state,
+        and stale result-map terrain names. No files, grids, CRS or units change.
+        Requires a nonempty geometry list; every geometry terrain association
+        must resolve to one registered native terrain HDF.
+        Unrelated display layers and omitted parent result files are outside scope.
+        """
+        from ._terrain_registration import audit_terrain_associations
+        return audit_terrain_associations(rasmap_path, geometry_hdfs)
+
+    @staticmethod
+    @log_call
+    def reassign_result_map_terrains(
+        rasmap_path: str | Path, terrain_names: Dict[str, str]
+    ) -> List[Dict[str, str]]:
+        """Replace named terrain references in a caller-owned Mapper clone.
+
+        Updates result-map ``MapParameters.Terrain`` and calculated-layer
+        ``Terrain.Name`` references using an explicit old-to-new name mapping.
+        Every destination name must already be registered. Other result-map
+        settings, geometry associations, terrain registrations and native HDFs
+        are unchanged. No CRS, units or elevations are transformed.
+
+        Args:
+            rasmap_path: Writable cloned .rasmap file; never pass a source project.
+            terrain_names: Exact, case-sensitive old-to-new terrain names.
+
+        Returns:
+            Change records with plan_name, element, attribute, old_terrain_name
+            and new_terrain_name. Empty when no references need replacement.
+            Writes only the supplied Mapper file, atomically after validation.
+            Use set_geometry_association separately for geometry HDF terrain links.
+        """
+        from ._terrain_registration import reassign_result_map_terrains
+
+        return reassign_result_map_terrains(rasmap_path, terrain_names)
+
+    @staticmethod
+    @log_call
     def list_terrain_layers(
         ras_project_path: Union[str, Path],
         ras_object=None,
@@ -511,7 +816,7 @@ class RasMap:
 
         Args:
             ras_project_path: Project folder, .prj file, or .rasmap file.
-            ras_object: Optional RasPrj object. Present for API consistency.
+            ras_object (RasPrj, optional): Optional RasPrj object. Present for API consistency.
 
         Returns:
             DataFrame with one row per ``Terrains/Layer`` entry.
@@ -619,7 +924,7 @@ class RasMap:
 
         Args:
             layer_hdf_path: Land-cover, soils, or infiltration sidecar HDF.
-            ras_object: Optional RasPrj object. Present for API consistency.
+            ras_object (RasPrj, optional): Optional RasPrj object. Present for API consistency.
 
         Returns:
             GeoDataFrame with ``polygon_index``, ``class_name``, and geometry.
@@ -635,27 +940,37 @@ class RasMap:
         polygon: Any,
         class_name: str,
         class_id: Optional[int] = None,
-        variable_values: Optional[dict[str, Any]] = None,
+        variable_values: Optional[Mapping[str, Any]] = None,
         backup: bool = True,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> "GeoDataFrame":
-        """
-        Add a classification polygon override to a land-cover, soils, or infiltration HDF.
+        """Add one land-cover classification polygon through native RasMapperLib.
 
-        The method writes the RAS Mapper ``/Classification Polygons`` group and
-        upserts the affected ``/Raster Map`` and/or ``/Variables`` class rows.
-        Existing compiled geometry HDFs should be preprocessed again before
-        simulation so HEC-RAS consumes the new override.
+        The class must already exist in the native land-cover sidecar; this
+        method does not create or remap raster classifications. HEC-RAS 6.x
+        and 7.0.x ``LC Type=LandCover`` sidecars are supported. HEC-RAS 5.x
+        callers should use the durable geometry Manning-region APIs instead.
+        A GeoSeries/GeoDataFrame must declare the same CRS as the sidecar.
+        Raw Shapely/GeoJSON coordinates are assumed to already use the sidecar
+        CRS. One-member, hole-free ``MultiPolygon`` input is normalized. True
+        multipart input and interior rings are rejected before mutation because
+        HEC-RAS 6.0 through 7.0.1 classification resampling cannot honor them.
+        The returned GeoDataFrame exposes ``classification_hdf_path``,
+        ``backup_path``, ``recompute_required``, and ``class_update`` in
+        ``.attrs``.
         """
-        from . import _land_classification_helper as _lch
+        from . import _land_classification_polygon_native as _lcpn
 
-        return _lch.add_land_classification_polygon(
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
+        return _lcpn.add_land_classification_polygon(
             layer_hdf_path=layer_hdf_path,
             polygon=polygon,
             class_name=class_name,
             class_id=class_id,
             variable_values=variable_values,
             backup=backup,
+            hecras_version=version,
         )
 
     @staticmethod
@@ -666,19 +981,21 @@ class RasMap:
         polygon: Optional[Any] = None,
         class_name: Optional[str] = None,
         class_id: Optional[int] = None,
-        variable_values: Optional[dict[str, Any]] = None,
+        variable_values: Optional[Mapping[str, Any]] = None,
         backup: bool = True,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> "GeoDataFrame":
-        """
-        Update a classification polygon's geometry, class name, or class values.
+        """Update one native 6.x/7.0.x land-cover polygon using an existing class.
 
-        ``polygon_index`` is the zero-based index returned by
-        :meth:`list_land_classification_polygons`.
+        Polygon and CRS validation follow
+        :meth:`add_land_classification_polygon`. The returned GeoDataFrame
+        exposes durable backup and recomputation metadata in ``.attrs``.
         """
-        from . import _land_classification_helper as _lch
+        from . import _land_classification_polygon_native as _lcpn
 
-        return _lch.update_land_classification_polygon(
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
+        return _lcpn.update_land_classification_polygon(
             layer_hdf_path=layer_hdf_path,
             polygon_index=polygon_index,
             polygon=polygon,
@@ -686,6 +1003,7 @@ class RasMap:
             class_id=class_id,
             variable_values=variable_values,
             backup=backup,
+            hecras_version=version,
         )
 
     @staticmethod
@@ -696,23 +1014,26 @@ class RasMap:
         class_name: Optional[str] = None,
         remove_unused_class: bool = False,
         backup: bool = True,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> "GeoDataFrame":
-        """
-        Delete classification polygon overrides by index or class name.
+        """Delete native 6.x/7.0.x land-cover classification polygons.
 
-        By default this removes only the polygon records. Set
-        ``remove_unused_class=True`` to also remove class rows from ``Raster Map``
-        and ``Variables`` when no remaining polygon uses that class.
+        The returned GeoDataFrame exposes durable backup, recomputation, and
+        removed-class metadata in ``.attrs``. ``remove_unused_class=True``
+        fails closed because the public native API cannot safely remove a
+        class; rebuild the sidecar classification table instead.
         """
-        from . import _land_classification_helper as _lch
+        from . import _land_classification_polygon_native as _lcpn
 
-        return _lch.delete_land_classification_polygon(
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
+        return _lcpn.delete_land_classification_polygon(
             layer_hdf_path=layer_hdf_path,
             polygon_index=polygon_index,
             class_name=class_name,
             remove_unused_class=remove_unused_class,
             backup=backup,
+            hecras_version=version,
         )
 
     @staticmethod
@@ -726,14 +1047,31 @@ class RasMap:
         output_hdf_path: Optional[Union[str, Path]] = None,
         restrict_to_extent: Optional[Any] = None,
         layer_name: str = "LandCover",
+        buffer_distance: float = 0.0,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> Path:
         """
         Create and register a land-cover classification layer for a RAS project.
+
+        ``restrict_to_extent`` may be a valid Shapely ``Polygon``, a
+        ``MultiPolygon`` containing exactly one non-empty polygonal part, a
+        one-effective-geometry GeoSeries/GeoDataFrame, a four-value bounds
+        tuple/list, a bounds dict/object, or ``RasMapperLib.Extent``.
+        ``buffer_distance`` is applied before raster bounds are derived, in
+        project CRS units, and defaults to ``0.0``. Callers are responsible for
+        supplying geometry in the project CRS. Empty, invalid, non-polygon, and
+        true multipart geometry inputs raise ``ValueError``.
+
+        HEC-RAS authors the output TIFF and HDF through RasMapperLib. Version
+        5.x uses its byte-class legacy schema in a 32-bit helper process;
+        versions 6.x and newer use ``LandCoverComputable`` followed by
+        ``LandCoverLayer.Save()`` for native V2 normalization.
         """
         ras_project_path = Path(ras_project_path)
         source_path = Path(source_path)
         output_hdf_path = Path(output_hdf_path) if output_hdf_path is not None else None
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
         from . import _land_classification_helper as _lch
 
         return _lch.add_landcover_layer(
@@ -745,6 +1083,8 @@ class RasMap:
             output_hdf_path=output_hdf_path,
             restrict_to_extent=restrict_to_extent,
             layer_name=layer_name,
+            buffer_distance=buffer_distance,
+            hecras_version=version,
         )
 
     @staticmethod
@@ -755,14 +1095,26 @@ class RasMap:
         cell_size: float,
         output_hdf_path: Optional[Union[str, Path]] = None,
         restrict_to_extent: Optional[Any] = None,
+        buffer_distance: float = 0.0,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> Path:
         """
         Create and register a soils layer from direct GSSURGO input.
+
+        For restricted extents, read whole polygons intersecting the buffered,
+        grid-aligned bounds. Rasterize in tiles of at most 10 million cells;
+        all tiles share one mapping and feed one native soils-layer computation.
+
+        ``restrict_to_extent`` accepts the same polygon and legacy bounds inputs
+        as :meth:`add_landcover_layer`. ``buffer_distance`` is applied in project
+        CRS units before raster bounds are derived and defaults to ``0.0``.
+        Multipart, empty, invalid, and non-polygon geometry inputs fail closed.
         """
         ras_project_path = Path(ras_project_path)
         gssurgo_path = Path(gssurgo_path)
         output_hdf_path = Path(output_hdf_path) if output_hdf_path is not None else None
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
         from . import _land_classification_helper as _lch
 
         return _lch.add_soils_layer(
@@ -771,6 +1123,8 @@ class RasMap:
             cell_size=cell_size,
             output_hdf_path=output_hdf_path,
             restrict_to_extent=restrict_to_extent,
+            buffer_distance=buffer_distance,
+            hecras_version=version,
         )
 
     @staticmethod
@@ -782,6 +1136,7 @@ class RasMap:
         soil_layer_path: Optional[Union[str, Path]] = None,
         output_hdf_path: Optional[Union[str, Path]] = None,
         scs_reset_time_hours: Optional[float] = None,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> Path:
         """
@@ -793,6 +1148,7 @@ class RasMap:
         )
         soil_layer_path = Path(soil_layer_path) if soil_layer_path is not None else None
         output_hdf_path = Path(output_hdf_path) if output_hdf_path is not None else None
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
         from . import _land_classification_helper as _lch
 
         return _lch.add_infiltration_layer(
@@ -802,6 +1158,7 @@ class RasMap:
             soil_layer_path=soil_layer_path,
             output_hdf_path=output_hdf_path,
             scs_reset_time_hours=scs_reset_time_hours,
+            hecras_version=version,
         )
 
     @staticmethod
@@ -814,19 +1171,21 @@ class RasMap:
         infiltration_hdf_path: Optional[Union[str, Path]] = None,
         terrain_hdf_path: Optional[Union[str, Path]] = None,
         sediment_soils_hdf_path: Optional[Union[str, Path]] = None,
+        hecras_version: Optional[str] = None,
         ras_object=None,
     ) -> Path:
         """
         Associate terrain / classification layers to a compiled geometry HDF.
 
-        This public workflow writes HEC-RAS ``/Geometry`` association
-        attributes directly with h5py. Use
-        ``RasProcess.validate_geometry_association_cli()`` only as an optional
-        native-reference validator on disposable or intentionally mutated HDFs.
+        This workflow delegates association writes to the selected HEC-RAS
+        RasMapperLib generation. It does not hand-write ``/Geometry``
+        attributes.
 
-        ``soil_layer_path`` is retained for compatibility with the
-        land-classification workflow. Use ``sediment_soils_hdf_path`` for the
-        HEC-RAS ``SedimentSoilsFilename`` geometry association.
+        ``soil_layer_path`` is a deprecated compatibility parameter through
+        v1.1.x. Hydrologic soils are not a geometry association: pass them to
+        :meth:`add_infiltration_layer`, then associate its
+        ``infiltration_hdf_path``. Use ``sediment_soils_hdf_path`` only for the
+        distinct HEC-RAS ``SedimentSoilsFilename`` bed-material association.
         """
         ras_project_path = Path(ras_project_path)
         geom_file = Path(geom_file)
@@ -845,6 +1204,7 @@ class RasMap:
             if sediment_soils_hdf_path is not None
             else None
         )
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
         from . import _land_classification_helper as _lch
 
         return _lch.associate_geometry_layers(
@@ -855,13 +1215,14 @@ class RasMap:
             infiltration_hdf_path=infiltration_hdf_path,
             terrain_hdf_path=terrain_hdf_path,
             sediment_soils_hdf_path=sediment_soils_hdf_path,
+            hecras_version=version,
             ras_object=ras_object,
         )
 
     @staticmethod
     @log_call
     def set_geometry_association(
-        geom_number: Union[str, Path],
+        geom_number: Union[str, Number, Path],
         terrain_hdf_path: Optional[Union[str, Path]] = None,
         landcover_hdf_path: Optional[Union[str, Path]] = None,
         infiltration_hdf_path: Optional[Union[str, Path]] = None,
@@ -888,8 +1249,107 @@ class RasMap:
 
     @staticmethod
     @log_call
+    def plan_geometry_area_association_sync(
+        geometry_hdf: str | Path, mesh_names: Sequence[str] | None = None,
+    ) -> dict:
+        """Inspect stale area links against current geometry-wide sidecars.
+
+        Synchronize filenames and existing optional layer-name attributes.
+        Preserve absent area layer names: native geometry save can omit them
+        even when the geometry-wide association names the layer.
+
+        Args:
+            geometry_hdf: Owned compiled geometry-only HDF path (str or Path).
+            mesh_names: Selected exact area names, or all compiled areas.
+
+        Returns:
+            Read-only identity-bound plan of filename/layer changes. Current
+            geometry links must exist. Area-only links are preserved when no
+            geometry-wide filename is declared. A stale area layer name is
+            removed when the current geometry declares a filename without one.
+            Coordinates, CRS, calibration/override tables and mesh data are
+            unchanged; this API does not run native preprocessing.
+
+        Raises:
+            ValueError: Invalid area selection or geometry HDF.
+            FileNotFoundError: Geometry or current associated input is absent.
+            RuntimeError: Geometry changes during inspection.
+        """
+        from ._area_association_sync import _plan
+
+        return _plan(geometry_hdf, mesh_names)
+
+    @staticmethod
+    @log_call
+    def apply_geometry_area_association_sync(plan: dict) -> dict:
+        """Apply a reviewed area-link plan atomically with a numbered backup.
+
+        Args:
+            plan: Unchanged plan from plan_geometry_area_association_sync.
+
+        Returns:
+            Plan plus applied/unchanged status and final identity. An applied
+            change includes its backup path; unchanged files need no backup.
+            Only selected area filename/layer attributes change. Staged readback
+            must match the plan before replacement; native completion follows.
+
+        Raises:
+            ValueError: Invalid plan or selected geometry.
+            RuntimeError: Input identity or recomputed plan differs.
+            OSError: Backup or atomic replacement fails.
+        """
+        from ._area_association_sync import _apply
+
+        return _apply(plan)
+
+    @staticmethod
+    @log_call
+    def clear_geometry_infiltration(geometry_hdf: str | Path) -> Path:
+        """Clear infiltration association metadata on a cloned .gNN.hdf.
+
+        Args:
+            geometry_hdf: Compiled clone geometry path, as str or Path.
+
+        Returns:
+            Path: Resolved edited geometry path. An absent link is a no-op.
+
+        Raises:
+            ValueError: The filename is not .gNN.hdf, or /Geometry is not a
+                directly linked group owned by the supplied HDF.
+            FileNotFoundError: The supplied HDF does not exist.
+            PermissionError: The supplied HDF is not writable, or the current
+                POSIX user cannot preserve its set-ID mode.
+            KeyError: The HDF has no /Geometry object.
+            OSError: Reading, backing up, editing, validating, or cleanup of
+                the HDF fails.
+            RuntimeError: Infiltration attributes remain after editing, or
+                byte restoration fails (the error identifies the backup).
+
+        Notes:
+            Mutates only infiltration filename, layer name and date attributes.
+            Terrain, roughness, CRS and units are unchanged. Rebuild native
+            property tables afterward; existing infiltration tables are stale.
+            A byte-exact sibling backup is flushed before editing in place.
+            Deletion or validation failures restore and flush the original
+            bytes into the same file object. ACLs, owner, mode, hard links and
+            file identity are preserved; the file is never replaced or renamed.
+            An absent association leaves the file byte-identical. The directory
+            must allow backup creation and removal. Use exclusive access.
+            A process crash between editing and restoration leaves a sibling
+            named .<stem>-infiltration-backup-*.hdf.bak for recovery. Restore
+            its bytes into the original file without replacing that file.
+            If restoration itself fails, the backup is retained and its path
+            is reported. This is exception rollback, not crash atomicity.
+            Never call on a delivered source geometry.
+        """
+        from ._geometry_association import clear_geometry_infiltration
+
+        return clear_geometry_infiltration(geometry_hdf)
+
+    @staticmethod
+    @log_call
     def get_geometry_association(
-        geom_number: Union[str, Path],
+        geom_number: Union[str, Number, Path],
         hecras_dir: Optional[Union[str, Path]] = None,
         ras_object=None,
         resolve_paths: bool = True,
@@ -908,6 +1368,250 @@ class RasMap:
 
     @staticmethod
     @log_call
+    def list_geometry_associations(
+        geom_number: Optional[Union[str, Number]] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Inventory live compiled-HDF associations for project geometries.
+
+        A layer registered in ``.rasmap`` is not necessarily associated with a
+        compiled geometry. This method reads each ``.g##.hdf`` directly and
+        returns one row per geometry, with every referencing plan collected in
+        ``plan_numbers``. It does not cache association state on ``geom_df`` or
+        ``plan_df``.
+
+        Args:
+            geom_number: Optional geometry number to select. When omitted, all
+                project geometries are inspected.
+            ras_object (RasPrj, optional): Optional initialized :class:`RasPrj` instance.
+
+        Returns:
+            DataFrame described by the ``geometry_associations`` schema.
+        """
+        from ._geometry_association import read_geometry_association
+
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        geom_df = getattr(ras_obj, "geom_df", None)
+        if geom_df is None:
+            geom_df = ras_obj.get_geom_entries()
+        selected = geom_df.copy()
+
+        if geom_number is not None:
+            normalized = RasUtils.normalize_ras_number(geom_number)
+            selected = selected.loc[
+                selected["geom_number"].astype(str).str.zfill(2).eq(normalized)
+            ]
+            if selected.empty:
+                available = sorted(
+                    geom_df["geom_number"].astype(str).str.zfill(2).tolist()
+                )
+                raise ValueError(
+                    f"Geometry {normalized!r} was not found. Available: {available}"
+                )
+
+        plans_by_geometry: dict[str, list[str]] = {}
+        plan_df = getattr(ras_obj, "plan_df", None)
+        if plan_df is not None:
+            for _, plan_row in plan_df.iterrows():
+                raw_geometry = plan_row.get("geometry_number")
+                if pd.isna(raw_geometry) or str(raw_geometry).strip() == "":
+                    raw_geometry = plan_row.get("Geom File")
+                if pd.isna(raw_geometry) or str(raw_geometry).strip() == "":
+                    continue
+                try:
+                    geometry_key = RasUtils.normalize_ras_number(raw_geometry)
+                    plan_key = RasUtils.normalize_ras_number(
+                        plan_row.get("plan_number")
+                    )
+                except (TypeError, ValueError):
+                    continue
+                plans_by_geometry.setdefault(geometry_key, []).append(plan_key)
+
+        records = []
+        for _, geom_row in selected.iterrows():
+            geometry_key = RasUtils.normalize_ras_number(
+                geom_row.get("geom_number")
+            )
+            geom_path = Path(str(geom_row.get("full_path")))
+            raw_hdf_path = geom_row.get("hdf_path")
+            geom_hdf_path = (
+                Path(str(raw_hdf_path))
+                if raw_hdf_path is not None and not pd.isna(raw_hdf_path)
+                else Path(str(geom_path) + ".hdf")
+            )
+            raw_has_2d = geom_row.get("has_2d_mesh")
+            has_2d_mesh = (
+                None if pd.isna(raw_has_2d) else bool(raw_has_2d)
+            )
+            record = {
+                "geom_number": geometry_key,
+                "geom_path": str(geom_path),
+                "geom_hdf_path": str(geom_hdf_path),
+                "geom_hdf_exists": geom_hdf_path.exists(),
+                "plan_numbers": tuple(
+                    sorted(set(plans_by_geometry.get(geometry_key, [])))
+                ),
+                "has_2d_mesh": has_2d_mesh,
+                "has_spatial_mannings": _geometry_has_spatial_mannings_authoring(
+                    geom_path
+                ),
+                "inspection_status": "missing_hdf",
+                "inspection_error": (
+                    None
+                    if geom_hdf_path.exists()
+                    else f"Geometry HDF not found: {geom_hdf_path}"
+                ),
+            }
+            for layer in _GEOMETRY_ASSOCIATION_LAYER_KEYS:
+                record.update(
+                    {
+                        f"{layer}_associated": False,
+                        f"{layer}_raw_filename": None,
+                        f"{layer}_layer_name": None,
+                        f"{layer}_hdf_path": None,
+                        f"{layer}_path_exists": False,
+                    }
+                )
+
+            if geom_hdf_path.exists():
+                try:
+                    association = read_geometry_association(
+                        geom_hdf_path,
+                        resolve_paths=True,
+                    )
+                    for layer, path_key in _GEOMETRY_ASSOCIATION_LAYER_KEYS.items():
+                        raw_key = path_key.replace(
+                            "_hdf_path",
+                            "_raw_filename",
+                        )
+                        layer_key = path_key.replace(
+                            "_hdf_path",
+                            "_layer_name",
+                        )
+                        associated_path = association.get(path_key)
+                        raw_filename = association.get(raw_key)
+                        record.update(
+                            {
+                                f"{layer}_associated": bool(
+                                    raw_filename or associated_path
+                                ),
+                                f"{layer}_raw_filename": raw_filename,
+                                f"{layer}_layer_name": association.get(layer_key),
+                                f"{layer}_hdf_path": associated_path,
+                                f"{layer}_path_exists": bool(
+                                    associated_path
+                                    and Path(associated_path).exists()
+                                ),
+                            }
+                        )
+                    record["inspection_status"] = "available"
+                    record["inspection_error"] = None
+                except Exception as exc:
+                    from .fast_hdf import reraise_required
+
+                    reraise_required(exc)
+                    record["inspection_status"] = "failed"
+                    record["inspection_error"] = str(exc)
+            records.append(record)
+
+        return pd.DataFrame.from_records(
+            records,
+            columns=_GEOMETRY_ASSOCIATION_COLUMNS,
+        )
+
+    @staticmethod
+    @log_call
+    def validate_geometry_associations(
+        geom_number: Optional[Union[str, Number]] = None,
+        required_layers: Sequence[str] = ("terrain", "landcover"),
+        require_existing_paths: bool = True,
+        raise_on_failure: bool = True,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Validate required compiled-geometry layer associations.
+
+        ``.rasmap`` registration is deliberately not accepted as proof of an
+        association. Use this before property-table generation, then inspect a
+        temporary plan HDF before compute and the final plan HDF afterward.
+        """
+        aliases = {
+            "land_cover": "landcover",
+            "mannings": "landcover",
+            "mannings_n": "landcover",
+            "sediment": "sediment_soils",
+        }
+        if isinstance(required_layers, str):
+            required_layers = (required_layers,)
+        normalized_layers = tuple(
+            aliases.get(str(layer).strip().lower(), str(layer).strip().lower())
+            for layer in required_layers
+        )
+        unknown = sorted(
+            set(normalized_layers) - set(_GEOMETRY_ASSOCIATION_LAYER_KEYS)
+        )
+        if unknown:
+            raise ValueError(
+                "Unsupported required_layers: "
+                + ", ".join(unknown)
+                + ". Expected terrain, landcover, infiltration, or "
+                "sediment_soils."
+            )
+
+        report = RasMap.list_geometry_associations(
+            geom_number=geom_number,
+            ras_object=ras_object,
+        ).copy()
+        missing_values = []
+        broken_values = []
+        passed_values = []
+        reason_values = []
+        for row in report.itertuples(index=False):
+            missing = tuple(
+                layer
+                for layer in normalized_layers
+                if not bool(getattr(row, f"{layer}_associated"))
+            )
+            broken = tuple(
+                layer
+                for layer in normalized_layers
+                if bool(getattr(row, f"{layer}_associated"))
+                and not bool(getattr(row, f"{layer}_path_exists"))
+            ) if require_existing_paths else ()
+            reasons = []
+            if row.inspection_status != "available":
+                reasons.append(row.inspection_error or row.inspection_status)
+            if missing:
+                reasons.append("missing required layers: " + ", ".join(missing))
+            if broken:
+                reasons.append("broken association paths: " + ", ".join(broken))
+            missing_values.append(missing)
+            broken_values.append(broken)
+            passed_values.append(not reasons)
+            reason_values.append("; ".join(reasons))
+
+        report["missing_required_layers"] = missing_values
+        report["broken_association_layers"] = broken_values
+        report["passed"] = passed_values
+        report["failure_reason"] = reason_values
+
+        if raise_on_failure and (
+            report.empty or not bool(report["passed"].all())
+        ):
+            details = (
+                "; ".join(
+                    f"g{row.geom_number}: {row.failure_reason}"
+                    for row in report.itertuples(index=False)
+                    if not row.passed
+                )
+                if not report.empty
+                else "no project geometries were found"
+            )
+            raise RuntimeError(f"Geometry association validation failed: {details}")
+        return report
+
+    @staticmethod
+    @log_call
     def get_hdf_geometry_association(
         hdf_path: Union[str, Path],
         resolve_paths: bool = True,
@@ -919,7 +1623,11 @@ class RasMap:
 
         This is read-only and intended for QA/QC workflows that need to audit
         terrain, land-cover, infiltration, or sediment bed-material links
-        already stored in HEC-RAS HDF artifacts.
+        already stored in HEC-RAS HDF artifacts. When
+        ``include_2d_area_attrs=True``, the
+        ``two_d_area_terrain_associations`` list contains one record per named
+        2D flow-area group. Optional terrain fields are ``None`` when HEC-RAS
+        has not populated an area-level association.
         """
         from ._geometry_association import read_geometry_association
 
@@ -934,67 +1642,93 @@ class RasMap:
     def recompute_property_tables(
         ras_project_path: Union[str, Path],
         geom_file: Union[str, Path],
+        hecras_version: Optional[str] = None,
+        audit_mannings: bool = False,
         ras_object=None,
     ) -> Path:
         """
-        Recompute geometry preprocessing and property tables for a compiled geometry.
+        Recompute property tables with the selected native RASMapper version.
+
+        Completion is required for every geometry. When 2D flow areas are
+        present, the native cell-volume and face-area table pairs must also be
+        nonempty before this method returns. A complete 1D-only geometry has
+        no 2D-array postcondition.
+
+        Set ``audit_mannings=True`` to require materially diverse, associated
+        final Manning values after the native command.
+
+        Modern native computation runs in an isolated process using the
+        selected HEC-RAS installation's bundled HDF5 DLLs, with a 1,800-second
+        timeout. Mutates the supplied geometry HDF in its existing CRS/units;
+        use a disposable model copy. Process success does not replace the
+        complete-geometry/table-pair checks or hydraulic QA.
         """
         ras_project_path = Path(ras_project_path)
         geom_file = Path(geom_file)
+        version = _resolve_native_hecras_version(hecras_version, ras_object)
         from . import _land_classification_helper as _lch
 
         return _lch.recompute_property_tables(
             ras_project_path,
             geom_file,
             ras_object=ras_object,
+            hecras_version=version,
+            audit_mannings=audit_mannings,
         )
-    
+
     @staticmethod
     @log_call
     def get_rasmap_path(ras_object=None) -> Optional[Path]:
         """
         Get the path to the .rasmap file based on the current project.
-        
+
         Args:
-            ras_object: Optional RAS object instance.
-            
+            ras_object (RasPrj, optional): Optional RAS object instance.
+
         Returns:
             Optional[Path]: Path to the .rasmap file if found, None otherwise.
         """
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
-        
+
         project_name = ras_obj.project_name
         project_folder = ras_obj.project_folder
-        rasmap_path = project_folder / f"{project_name}.rasmap"
-        
+        rasmap_path = expected_rasmap_path(project_folder, project_name)
+
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return None
-        
+
         return rasmap_path
-    
+
     @staticmethod
     @log_call
     def initialize_rasmap_df(ras_object=None) -> pd.DataFrame:
         """
         Initialize the rasmap_df as part of project initialization.
-        
+
         Args:
-            ras_object: Optional RAS object instance.
-            
+            ras_object (RasPrj, optional): Optional RAS object instance.
+
         Returns:
             pd.DataFrame: DataFrame containing information from the .rasmap file.
         """
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
-        from . import _land_classification_helper as _lch
-        
+
         rasmap_path = RasMap.get_rasmap_path(ras_obj)
         if rasmap_path is None:
-            logger.warning("No .rasmap file found for this project. Creating empty rasmap_df.")
-            return _lch.empty_rasmap_dataframe()
-        
+            logger.debug(
+                "No .rasmap file found for this project. Creating empty rasmap_df."
+            )
+            return create_rasmap_dataframe(
+                rasmap_path=expected_rasmap_path(
+                    ras_obj.project_folder,
+                    ras_obj.project_name,
+                ),
+                rasmap_status="absent",
+            )
+
         return RasMap.parse_rasmap(rasmap_path, ras_obj)
 
     @staticmethod
@@ -1021,15 +1755,26 @@ class RasMap:
             tree = ET.parse(rasmap_path)
             root = tree.getroot()
         except ET.ParseError as e:
-            raise ValueError(f"Failed to parse the RASMAP file. Ensure it is a valid XML file. Error: {e}")
+            raise ValueError(
+                f"Failed to parse the RASMAP file. Ensure it is a valid XML file. Error: {e}"
+            )
 
-        terrains_element = root.find('Terrains')
+        terrains_element = root.find("Terrains")
         if terrains_element is None:
-            logger.warning("The RASMAP file does not contain a 'Terrains' section.")
+            logger.debug("No Terrains section found in %s", rasmap_path.name)
             return []
 
-        terrain_names = [layer.get('Name') for layer in terrains_element.findall('Layer') if layer.get('Name')]
-        logger.info(f"Extracted terrain names: {terrain_names}")
+        terrain_names = [
+            layer.get("Name")
+            for layer in terrains_element.findall("Layer")
+            if layer.get("Name")
+        ]
+        logger.debug(
+            "Found %d terrain layer(s) in %s: %s",
+            len(terrain_names),
+            rasmap_path.name,
+            terrain_names,
+        )
         return terrain_names
 
     @staticmethod
@@ -1049,7 +1794,7 @@ class RasMap:
             as_dataframe: Return a DataFrame when True. When omitted, explicit
                 ``ras_project_path`` calls return a DataFrame and legacy active-project
                 calls return the historical list-of-dicts shape.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             DataFrame with one row per top-level map layer, or legacy
@@ -1088,7 +1833,7 @@ class RasMap:
                 orient="records",
             )
 
-        logger.info(f"Found {len(layers)} map layers in .rasmap")
+        logger.debug("Found %d map layer(s) in .rasmap", len(layers))
         return layers
 
     @staticmethod
@@ -1267,7 +2012,7 @@ class RasMap:
         symbology: Optional[Dict[str, Any]] = None,
         replace_existing: bool = False,
         validate_geojson_wgs84: bool = True,
-        ras_object=None
+        ras_object=None,
     ) -> bool:
         """
         Add a reference map layer to the RASMapper configuration file.
@@ -1296,7 +2041,7 @@ class RasMap:
             replace_existing: Replace an existing reference layer with the same name.
                 Default False preserves the historical append behavior.
             validate_geojson_wgs84: Raise if a GeoJSON source is not WGS84-compatible.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             bool: True if layer was successfully added.
@@ -1355,16 +2100,13 @@ class RasMap:
 
     @staticmethod
     @log_call
-    def remove_map_layer(
-        layer_name: str,
-        ras_object=None
-    ) -> bool:
+    def remove_map_layer(layer_name: str, ras_object=None) -> bool:
         """
         Remove a map layer from the RASMapper configuration file (.rasmap).
 
         Args:
             layer_name: Name of the layer to remove.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             bool: True if layer was found and removed, False if not found.
@@ -1377,7 +2119,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return False
@@ -1389,17 +2131,22 @@ class RasMap:
             logger.error(f"Error parsing .rasmap XML: {e}")
             return False
 
-        map_layers = root.find("MapLayers")
+        from . import _rasmap_layer_helper as _mlh
+
+        map_layers = _mlh.map_layers_element(root)
         if map_layers is None:
             logger.warning("No MapLayers section found in .rasmap")
             return False
 
         # Find and remove layer by name
-        for layer in map_layers.findall("Layer"):
+        for layer in _mlh.top_level_map_layers(root):
             if layer.get("Name") == layer_name:
                 map_layers.remove(layer)
-                tree.write(rasmap_path, encoding='utf-8', xml_declaration=True)
-                logger.info(f"Removed map layer '{layer_name}' from {rasmap_path}")
+                _write_ras_xml(
+                    tree, rasmap_path, encoding="utf-8", xml_declaration=True
+                )
+                logger.info("Removed map layer '%s'", layer_name)
+                logger.debug("Updated RASMapper file: %s", rasmap_path)
                 return True
 
         logger.warning(f"Layer '{layer_name}' not found in .rasmap")
@@ -1412,7 +2159,7 @@ class RasMap:
         List all geometry layers in the RASMapper configuration file.
 
         Args:
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             List[Dict[str, Any]]: List of dicts with geometry info:
@@ -1428,7 +2175,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return []
@@ -1450,25 +2197,147 @@ class RasMap:
             filename = layer.get("Filename", "")
             # Extract geometry number from filename (e.g., ".\BaldEagle.g08.hdf" -> "08")
             import re
-            match = re.search(r'\.g(\d+)\.hdf', filename)
+
+            match = re.search(r"\.g(\d+)\.hdf", filename)
             geom_num = match.group(1) if match else ""
 
-            geometries.append({
-                "name": layer.get("Name", ""),
-                "filename": filename,
-                "geom_number": geom_num,
-                "checked": layer.get("Checked", "").lower() == "true"
-            })
+            geometries.append(
+                {
+                    "name": layer.get("Name", ""),
+                    "filename": filename,
+                    "geom_number": geom_num,
+                    "checked": layer.get("Checked", "").lower() == "true",
+                }
+            )
 
-        logger.info(f"Found {len(geometries)} geometries in .rasmap")
+        logger.debug("Found %d geometries in .rasmap", len(geometries))
         return geometries
 
     @staticmethod
     @log_call
+    def clone_geometry_layer(
+        source_geometry: Union[str, int],
+        target_geometry: Union[str, int],
+        *,
+        name: Optional[str] = None,
+        checked: bool = True,
+        expanded: bool = True,
+        ras_object=None,
+    ) -> Dict[str, Any]:
+        """Register a cloned geometry HDF in the RASMapper tree.
+
+        ``RasGeo.clone_geom()`` copies the geometry control file and HDF, but
+        HEC-RAS does not add the cloned HDF to ``<Geometries>`` in the project
+        ``.rasmap`` file. Exact text-to-HDF refresh workflows therefore cannot
+        resolve the clone until it has a RASMapper geometry layer.
+
+        The source geometry layer is deep-copied so the target keeps the same
+        child-layer display configuration. Only the top-level display name,
+        visibility, expansion state, and HDF filename are changed. Repeating
+        the call for the same target is idempotent.
+
+        Args:
+            source_geometry: Source geometry number, such as ``"01"``.
+            target_geometry: Cloned geometry number, such as ``"02"``.
+            name: Optional target display name. Defaults to the source name.
+            checked: Whether the target geometry is visible.
+            expanded: Whether the target geometry tree is expanded.
+            ras_object (RasPrj, optional): Optional initialized :class:`RasPrj` instance.
+
+        Returns:
+            Dict[str, Any]: Registered layer metadata and the ``.rasmap`` path.
+
+        Raises:
+            FileNotFoundError: If the ``.rasmap`` or target geometry HDF is absent.
+            ValueError: If the source layer is absent or the numbers are equal.
+        """
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        source_number = RasUtils.normalize_ras_number(source_geometry)
+        target_number = RasUtils.normalize_ras_number(target_geometry)
+        if source_number == target_number:
+            raise ValueError("source_geometry and target_geometry must differ")
+
+        project_folder = Path(ras_obj.project_folder)
+        project_name = str(ras_obj.project_name)
+        rasmap_path = project_folder / f"{project_name}.rasmap"
+        target_hdf = project_folder / f"{project_name}.g{target_number}.hdf"
+        if not rasmap_path.exists():
+            raise FileNotFoundError(f"RASMapper file not found: {rasmap_path}")
+        if not target_hdf.exists():
+            raise FileNotFoundError(f"Cloned geometry HDF not found: {target_hdf}")
+
+        try:
+            tree = ET.parse(rasmap_path)
+            root = tree.getroot()
+        except ET.ParseError as e:
+            raise ValueError(f"Error parsing .rasmap XML: {e}") from e
+        geometries = root.find("Geometries")
+        if geometries is None:
+            raise ValueError("No Geometries section found in .rasmap")
+
+        source_token = f".g{source_number}.hdf"
+        target_token = f".g{target_number}.hdf"
+        source_layer = None
+        target_layer = None
+        for layer in geometries.findall("Layer"):
+            filename = _normalize_rasmap_filename(layer.get("Filename"))
+            if source_token in filename:
+                source_layer = layer
+            if target_token in filename:
+                target_layer = layer
+        if source_layer is None:
+            raise ValueError(
+                f"Source geometry g{source_number} is not registered in {rasmap_path}"
+            )
+
+        if target_layer is None:
+            target_layer = copy.deepcopy(source_layer)
+            source_index = list(geometries).index(source_layer)
+            geometries.insert(source_index + 1, target_layer)
+
+        rel_hdf = _rasmap_relative_path(project_folder, target_hdf)
+        layer_name = str(name).strip() if name is not None else ""
+        target_layer.set("Name", layer_name or source_layer.get("Name", ""))
+        target_layer.set("Type", "RASGeometry")
+        target_layer.set("Checked", "True" if checked else "False")
+        target_layer.set("Expanded", "True" if expanded else "False")
+        target_layer.set("Filename", rel_hdf)
+        _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
+
+        readback = ET.parse(rasmap_path).getroot().find("Geometries")
+        registered = None if readback is None else next(
+            (
+                layer
+                for layer in readback.findall("Layer")
+                if target_token
+                in _normalize_rasmap_filename(layer.get("Filename"))
+            ),
+            None,
+        )
+        if registered is None:
+            raise RuntimeError(
+                f"RASMapper geometry registration failed readback for g{target_number}"
+            )
+        record = {
+            "name": registered.get("Name", ""),
+            "filename": registered.get("Filename", ""),
+            "geom_number": target_number,
+            "checked": registered.get("Checked", "").lower() == "true",
+            "expanded": registered.get("Expanded", "").lower() == "true",
+            "rasmap_path": rasmap_path,
+        }
+        logger.info(
+            "Registered cloned geometry g%s as RASMapper layer '%s'",
+            target_number,
+            record["name"],
+        )
+        return record
+
+    @staticmethod
+    @log_call
     def set_geometry_visibility(
-        geom_identifier: str,
-        visible: bool = True,
-        ras_object=None
+        geom_identifier: str, visible: bool = True, ras_object=None
     ) -> bool:
         """
         Set visibility of a specific geometry layer in RASMapper.
@@ -1479,7 +2348,7 @@ class RasMap:
                 - Geometry number (e.g., "08" or "g08")
                 - Filename pattern (e.g., "g08.hdf")
             visible: True to show geometry, False to hide.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             bool: True if geometry was found and modified.
@@ -1495,7 +2364,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return False
@@ -1515,7 +2384,7 @@ class RasMap:
         # Normalize identifier for matching
         identifier_lower = geom_identifier.lower().strip()
         # Handle "g08" -> "08" format
-        if identifier_lower.startswith('g') and identifier_lower[1:].isdigit():
+        if identifier_lower.startswith("g") and identifier_lower[1:].isdigit():
             identifier_lower = identifier_lower[1:]
 
         found = False
@@ -1525,10 +2394,10 @@ class RasMap:
 
             # Check if this layer matches the identifier
             matches = (
-                name.lower() == identifier_lower or
-                identifier_lower in filename.lower() or
-                f".g{identifier_lower}." in filename.lower() or
-                f".g{identifier_lower.zfill(2)}." in filename.lower()
+                name.lower() == identifier_lower
+                or identifier_lower in filename.lower()
+                or f".g{identifier_lower}." in filename.lower()
+                or f".g{identifier_lower.zfill(2)}." in filename.lower()
             )
 
             if matches:
@@ -1538,7 +2407,7 @@ class RasMap:
                 break
 
         if found:
-            tree.write(rasmap_path, encoding='utf-8', xml_declaration=True)
+            _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=True)
             return True
         else:
             logger.warning(f"Geometry '{geom_identifier}' not found in .rasmap")
@@ -1547,9 +2416,7 @@ class RasMap:
     @staticmethod
     @log_call
     def set_all_geometries_visibility(
-        visible: bool = False,
-        except_geom: Optional[str] = None,
-        ras_object=None
+        visible: bool = False, except_geom: Optional[str] = None, ras_object=None
     ) -> int:
         """
         Set visibility for all geometry layers, optionally excluding one.
@@ -1560,7 +2427,7 @@ class RasMap:
             visible: True to show all geometries, False to hide all.
             except_geom: Optional geometry to exclude from visibility change.
                 Can be geometry name, number (e.g., "08"), or filename pattern.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             int: Number of geometries modified.
@@ -1576,7 +2443,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return 0
@@ -1597,7 +2464,7 @@ class RasMap:
         except_lower = None
         if except_geom:
             except_lower = except_geom.lower().strip()
-            if except_lower.startswith('g') and except_lower[1:].isdigit():
+            if except_lower.startswith("g") and except_lower[1:].isdigit():
                 except_lower = except_lower[1:]
 
         modified_count = 0
@@ -1608,10 +2475,10 @@ class RasMap:
             # Check if this is the exception geometry
             if except_lower:
                 is_exception = (
-                    name.lower() == except_lower or
-                    except_lower in filename.lower() or
-                    f".g{except_lower}." in filename.lower() or
-                    f".g{except_lower.zfill(2)}." in filename.lower()
+                    name.lower() == except_lower
+                    or except_lower in filename.lower()
+                    or f".g{except_lower}." in filename.lower()
+                    or f".g{except_lower.zfill(2)}." in filename.lower()
                 )
                 if is_exception:
                     # Set opposite visibility for exception
@@ -1625,7 +2492,7 @@ class RasMap:
             modified_count += 1
 
         if modified_count > 0:
-            tree.write(rasmap_path, encoding='utf-8', xml_declaration=True)
+            _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=True)
             logger.info(f"Modified visibility for {modified_count} geometries")
 
         return modified_count
@@ -1649,7 +2516,7 @@ class RasMap:
         Args:
             ras_project_path: Project folder, ``.prj`` file, or ``.rasmap`` file.
                 If omitted, the active ``RasPrj`` object is used.
-            ras_object: Optional ``RasPrj`` object instance.
+            ras_object (RasPrj, optional): Optional ``RasPrj`` object instance.
 
         Returns:
             pd.DataFrame: One row per top-level geometry and child geometry
@@ -1700,7 +2567,7 @@ class RasMap:
             exclusive: If ``True``, hide all geometries and child elements first,
                 then show only the matching parent geometry and selected child
                 element. This is useful for screenshot workflows.
-            ras_object: Optional ``RasPrj`` object instance.
+            ras_object (RasPrj, optional): Optional ``RasPrj`` object instance.
 
         Returns:
             int: Number of XML visibility attributes modified.
@@ -1878,7 +2745,7 @@ class RasMap:
             exclusive: If ``True``, hide non-matching terrain layers first.
             surface_on: Keep the terrain ``<Surface On="...">`` state aligned
                 with the checked state.
-            ras_object: Optional ``RasPrj`` object instance.
+            ras_object (RasPrj, optional): Optional ``RasPrj`` object instance.
 
         Returns:
             int: Number of XML attributes/elements modified.
@@ -1980,7 +2847,7 @@ class RasMap:
             stitch_edges_enabled: Toggle ``Plot stitch TIN edges``.
             level0_stitch_edges_enabled: Toggle ``Plot Level0 stitch TIN edges``.
             remove_stitch_rendering_enabled: Toggle ``Remove Stitch Rendering``.
-            ras_object: Optional ``RasPrj`` object instance.
+            ras_object (RasPrj, optional): Optional ``RasPrj`` object instance.
 
         Returns:
             int: Number of XML attributes/elements modified.
@@ -2261,7 +3128,7 @@ class RasMap:
         prj_path = Path(ras_project_path)
         project_folder = prj_path.parent
         project_name = prj_path.stem
-        rasmap_path = project_folder / f"{project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(project_folder, project_name)
 
         # Backup .rasmap
         rasmap_backup = None
@@ -2315,7 +3182,8 @@ class RasMap:
                 rasmap_backup.unlink()
 
         if screenshot_result and screenshot_result.exists():
-            logger.info(f"Screenshot saved to {screenshot_result}")
+            logger.info("Screenshot saved: %s", screenshot_result.name)
+            logger.debug("Screenshot path: %s", screenshot_result)
         else:
             logger.warning("Screenshot capture returned no file")
 
@@ -2361,23 +3229,30 @@ class RasMap:
                     timeout_seconds=timeout_seconds,
                     ras_version=ras_version,
                 )
-                results.append({
-                    "label": label,
-                    "project_path": str(project_path),
-                    "screenshot_path": str(result_path) if result_path else None,
-                    "success": result_path is not None and result_path.exists(),
-                })
+                results.append(
+                    {
+                        "label": label,
+                        "project_path": str(project_path),
+                        "screenshot_path": str(result_path) if result_path else None,
+                        "success": result_path is not None and result_path.exists(),
+                    }
+                )
             except Exception as e:
                 logger.error(f"Failed to screenshot '{label}': {e}")
-                results.append({
-                    "label": label,
-                    "project_path": str(project_path),
-                    "screenshot_path": None,
-                    "success": False,
-                })
+                results.append(
+                    {
+                        "label": label,
+                        "project_path": str(project_path),
+                        "screenshot_path": None,
+                        "success": False,
+                    }
+                )
 
         successful = sum(1 for r in results if r["success"])
-        logger.info(f"Gallery: {successful}/{len(models)} screenshots captured in {out}")
+        logger.info(
+            "Screenshot gallery complete: %s/%s captured", successful, len(models)
+        )
+        logger.debug("Screenshot gallery output directory: %s", out)
         return results
 
     @staticmethod
@@ -2417,6 +3292,17 @@ class RasMap:
         snapshot_timeout_seconds: float = 1800.0,
         snapshot_poll_interval_seconds: float = 0.5,
         close_after_capture: bool = True,
+        viewport_width: Optional[int] = None,
+        viewport_height: Optional[int] = None,
+        dpi: Optional[int] = None,
+        expanded_tree_paths: Optional[Sequence[str]] = None,
+        ramp_id: Optional[str] = None,
+        range_mode: Optional[str] = None,
+        selected_layer: Optional[str] = None,
+        result_profile: Optional[str] = None,
+        render_mode: Optional[str] = None,
+        basemap: Optional[str] = None,
+        web_manifest_url: Optional[str] = None,
         rasmapper_exe_path: Optional[Union[str, Path]] = None,
         ras_version: Optional[str] = None,
         strict_preflight: bool = True,
@@ -2478,6 +3364,17 @@ class RasMap:
             snapshot_timeout_seconds=snapshot_timeout_seconds,
             snapshot_poll_interval_seconds=snapshot_poll_interval_seconds,
             close_after_capture=close_after_capture,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            dpi=dpi,
+            expanded_tree_paths=expanded_tree_paths,
+            ramp_id=ramp_id,
+            range_mode=range_mode,
+            selected_layer=selected_layer,
+            result_profile=result_profile,
+            render_mode=render_mode,
+            basemap=basemap,
+            web_manifest_url=web_manifest_url,
             rasmapper_exe_path=rasmapper_exe_path,
             ras_version=ras_version,
             strict_preflight=strict_preflight,
@@ -2496,7 +3393,7 @@ class RasMap:
         version incompatibility and attempts automatic upgrade via GUI automation.
 
         Args:
-            ras_object: Optional RasPrj object instance (default: global ras).
+            ras_object (RasPrj, optional): Optional RasPrj object instance (default: global ras).
             auto_upgrade (bool): If True, attempt automatic upgrade via GUI automation.
                 If False, only detect version and return status without upgrading.
 
@@ -2542,14 +3439,14 @@ class RasMap:
         ras_obj.check_initialized()
 
         # Get .rasmap path
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
 
         if not rasmap_path.exists():
             logger.warning(f"No .rasmap file found: {rasmap_path}")
             return {
-                'status': 'manual_needed',
-                'message': f'No .rasmap file found at {rasmap_path}',
-                'version': None
+                "status": "manual_needed",
+                "message": f"No .rasmap file found at {rasmap_path}",
+                "version": None,
             }
 
         # Parse .rasmap XML to detect version
@@ -2566,16 +3463,16 @@ class RasMap:
 
             # Determine if upgrade needed
             needs_upgrade = (
-                version.startswith("5.") and  # Old version number
-                results_elem is None           # Missing modern Results section
+                version.startswith("5.")  # Old version number
+                and results_elem is None  # Missing modern Results section
             )
 
             if not needs_upgrade:
-                logger.info(f".rasmap file is already compatible (version {version})")
+                logger.debug(".rasmap file is already compatible (version %s)", version)
                 return {
-                    'status': 'ready',
-                    'message': f'Already compatible (version {version})',
-                    'version': version
+                    "status": "ready",
+                    "message": f"Already compatible (version {version})",
+                    "version": version,
                 }
 
             logger.info(f".rasmap file needs upgrade from version {version}")
@@ -2583,17 +3480,17 @@ class RasMap:
         except ET.ParseError as e:
             logger.error(f"Error parsing .rasmap XML: {e}")
             return {
-                'status': 'manual_needed',
-                'message': f'XML parse error: {e}',
-                'version': None
+                "status": "manual_needed",
+                "message": f"XML parse error: {e}",
+                "version": None,
             }
 
         # If upgrade not needed or auto_upgrade disabled, return status
         if not auto_upgrade:
             return {
-                'status': 'manual_needed',
-                'message': f'Upgrade needed from version {version} (auto_upgrade=False)',
-                'version': version
+                "status": "manual_needed",
+                "message": f"Upgrade needed from version {version} (auto_upgrade=False)",
+                "version": version,
             }
 
         # Attempt GUI automation to upgrade .rasmap
@@ -2610,16 +3507,17 @@ class RasMap:
             except ImportError as e:
                 logger.error(f"GUI automation requires win32gui: {e}")
                 return {
-                    'status': 'manual_needed',
-                    'message': f'GUI automation requires pywin32 package: {e}',
-                    'version': version
+                    "status": "manual_needed",
+                    "message": f"GUI automation requires pywin32 package: {e}",
+                    "version": version,
                 }
 
             # Open HEC-RAS with project
             ras_exe = ras_obj.ras_exe_path
             prj_path = str(ras_obj.prj_file)
 
-            logger.info(f"Opening HEC-RAS: {ras_exe} {prj_path}")
+            logger.debug("Opening HEC-RAS for .rasmap upgrade")
+            logger.debug("HEC-RAS upgrade command: %s %s", ras_exe, prj_path)
 
             if sys.platform == "win32":
                 process = subprocess.Popen(f'"{ras_exe}" "{prj_path}"')
@@ -2632,7 +3530,9 @@ class RasMap:
             # Find HEC-RAS main window
             hecras_hwnd = None
             for _ in range(30):  # Try for up to 30 seconds
-                hecras_hwnd = win32gui.FindWindow(None, f"HEC-RAS {ras_obj.ras_version}")
+                hecras_hwnd = win32gui.FindWindow(
+                    None, f"HEC-RAS {ras_obj.ras_version}"
+                )
                 if hecras_hwnd:
                     break
                 time.sleep(1)
@@ -2641,23 +3541,26 @@ class RasMap:
                 logger.error("Could not find HEC-RAS window")
                 process.terminate()
                 return {
-                    'status': 'manual_needed',
-                    'message': 'HEC-RAS window not found (GUI automation failed)',
-                    'version': version
+                    "status": "manual_needed",
+                    "message": "HEC-RAS window not found (GUI automation failed)",
+                    "version": version,
                 }
 
-            logger.info(f"Found HEC-RAS window: {hecras_hwnd}")
+            logger.debug("Found HEC-RAS window handle: %s", hecras_hwnd)
 
             # Helper function to find RASMapper window
             def find_rasmapper_window():
                 """Find any RAS Mapper window"""
+
                 def callback(hwnd, windows):
-                    if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
+                    if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(
+                        hwnd
+                    ):
                         try:
                             window_title = win32gui.GetWindowText(hwnd)
                             if "RAS Mapper" in window_title:
                                 windows.append((hwnd, window_title))
-                        except:
+                        except Exception:
                             pass
                     return True
 
@@ -2685,12 +3588,12 @@ class RasMap:
                         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
                         logger.debug(f"Sent WM_CLOSE to RASMapper window: {title}")
                         return True
-                    except:
+                    except Exception:
                         pass
                 return False
 
             # Step 1: Open RASMapper via menu
-            logger.info("Opening RASMapper via menu...")
+            logger.debug("Opening RASMapper via menu")
             win32gui.SetForegroundWindow(hecras_hwnd)
             time.sleep(0.5)
 
@@ -2715,60 +3618,70 @@ class RasMap:
                                 # This varies by version, so we'll try clicking and checking
                                 if menu_id > 0:
                                     # Try sending this menu command
-                                    win32gui.PostMessage(hecras_hwnd, win32con.WM_COMMAND, menu_id, 0)
+                                    win32gui.PostMessage(
+                                        hecras_hwnd, win32con.WM_COMMAND, menu_id, 0
+                                    )
                                     time.sleep(1)
 
                                     # Check if RASMapper opened
                                     if find_rasmapper_window():
-                                        logger.info("RASMapper opened successfully via menu")
+                                        logger.debug(
+                                            "RASMapper opened successfully via menu"
+                                        )
                                         rasmapper_found = True
                                         break
-                            except:
+                            except Exception:
                                 continue
                         if rasmapper_found:
                             break
 
                 # Fallback: Try keyboard shortcut
                 if not rasmapper_found:
-                    logger.info("Menu enumeration failed, trying keyboard shortcut...")
+                    logger.debug("Menu enumeration failed, trying keyboard shortcut")
                     import win32api
+
                     win32api.keybd_event(0x12, 0, 0, 0)  # Alt down
                     time.sleep(0.1)
-                    win32api.keybd_event(ord('G'), 0, 0, 0)  # G
+                    win32api.keybd_event(ord("G"), 0, 0, 0)  # G
                     time.sleep(0.1)
                     win32api.keybd_event(0x12, 0, 0x0002, 0)  # Alt up
                     time.sleep(0.5)
-                    win32api.keybd_event(ord('M'), 0, 0, 0)  # M for Mapper
+                    win32api.keybd_event(ord("M"), 0, 0, 0)  # M for Mapper
                     time.sleep(0.1)
 
             # Step 2: Wait for RASMapper window to appear (60-90 second timeout)
-            logger.info("Waiting for RASMapper to open (up to 90 seconds)...")
-            rasmapper_windows = wait_for_window(find_rasmapper_window, timeout=90, check_interval=2)
+            logger.debug("Waiting for RASMapper to open (up to 90 seconds)")
+            rasmapper_windows = wait_for_window(
+                find_rasmapper_window, timeout=90, check_interval=2
+            )
 
             if not rasmapper_windows:
                 logger.error("RASMapper window did not appear within timeout")
                 return {
-                    'status': 'manual_needed',
-                    'message': 'RASMapper window did not open automatically. Please open RASMapper manually.',
-                    'version': version
+                    "status": "manual_needed",
+                    "message": "RASMapper window did not open automatically. Please open RASMapper manually.",
+                    "version": version,
                 }
 
-            logger.info(f"RASMapper is open: {rasmapper_windows[0][1]}")
+            logger.debug("RASMapper opened")
+            logger.debug("RASMapper window title: %s", rasmapper_windows[0][1])
 
             # Step 3: Wait 2 additional seconds for .rasmap file write
-            logger.info("Allowing time for .rasmap update...")
+            logger.debug("Allowing time for .rasmap update")
             time.sleep(2)
 
             # Step 4: Close RASMapper cleanly (with retry)
-            logger.info("Attempting to close RASMapper...")
+            logger.debug("Attempting to close RASMapper")
             close_attempts = 0
             max_attempts = 10
 
             while close_attempts < max_attempts:
                 if close_rasmapper():
-                    logger.info("Sent close message to RASMapper")
+                    logger.debug("Sent close message to RASMapper")
                     break
-                logger.debug(f"Retry {close_attempts+1}/{max_attempts} to close RASMapper...")
+                logger.debug(
+                    f"Retry {close_attempts + 1}/{max_attempts} to close RASMapper..."
+                )
                 time.sleep(2)
                 close_attempts += 1
 
@@ -2776,27 +3689,27 @@ class RasMap:
                 logger.warning("Could not send close message to RASMapper")
 
             # Step 5: Wait until RASMapper is fully closed
-            logger.info("Waiting for RASMapper to fully close...")
+            logger.debug("Waiting for RASMapper to fully close")
             close_wait_start = time.time()
             close_timeout = 30
 
             while time.time() - close_wait_start < close_timeout:
                 if not find_rasmapper_window():
-                    logger.info("RASMapper closed successfully")
+                    logger.debug("RASMapper closed successfully")
                     break
                 logger.debug("Waiting for RASMapper to fully close...")
                 time.sleep(2)
 
             # Step 6: Close HEC-RAS
-            logger.info("Closing HEC-RAS...")
+            logger.debug("Closing HEC-RAS")
             win32gui.PostMessage(hecras_hwnd, win32con.WM_CLOSE, 0, 0)
             time.sleep(1)
 
             # Wait for HEC-RAS to close
             try:
                 process.wait(timeout=10)
-                logger.info("HEC-RAS closed")
-            except:
+                logger.debug("HEC-RAS closed")
+            except Exception:
                 logger.warning("HEC-RAS did not close cleanly, may still be running")
 
             # Re-parse .rasmap to verify upgrade
@@ -2808,26 +3721,25 @@ class RasMap:
             if results_elem is not None:
                 logger.info(".rasmap file successfully upgraded")
                 return {
-                    'status': 'upgraded',
-                    'message': f'Successfully upgraded from version {version}',
-                    'version': version
+                    "status": "upgraded",
+                    "message": f"Successfully upgraded from version {version}",
+                    "version": version,
                 }
             else:
                 logger.warning(".rasmap file was not upgraded")
                 return {
-                    'status': 'manual_needed',
-                    'message': 'Upgrade verification failed - please open RASMapper manually',
-                    'version': version
+                    "status": "manual_needed",
+                    "message": "Upgrade verification failed - please open RASMapper manually",
+                    "version": version,
                 }
 
         except Exception as e:
             logger.error(f"GUI automation failed: {e}")
             return {
-                'status': 'manual_needed',
-                'message': f'Auto-upgrade failed: {e}. Please open RASMapper manually.',
-                'version': version
+                "status": "manual_needed",
+                "message": f"Auto-upgrade failed: {e}. Please open RASMapper manually.",
+                "version": version,
             }
-
 
     @staticmethod
     @log_call
@@ -2836,7 +3748,7 @@ class RasMap:
         specify_terrain: Optional[str] = None,
         layers: Union[str, List[str]] = None,
         ras_object: Optional[Any] = None,
-        auto_click_compute: bool = True
+        auto_click_compute: bool = True,
     ) -> bool:
         """
         Automates the generation of stored floodplain map outputs (e.g., .tif files).
@@ -2870,7 +3782,7 @@ class RasMap:
         # incorrect results if the project was ever opened in a newer version.
         # Verified 2026-03-23: GUI floodplain mapping (Run RASMapper= -1)
         # produces pixel-perfect output for HEC-RAS 6.3.1 and 6.6.
-        ras_version = getattr(ras_obj, 'ras_version', None) or ""
+        ras_version = getattr(ras_obj, "ras_version", None) or ""
         if ras_version.startswith("5.") or ras_version.startswith("4."):
             raise RuntimeError(
                 f"postprocess_stored_maps() is not supported for HEC-RAS {ras_version}.\n\n"
@@ -2882,10 +3794,12 @@ class RasMap:
             )
 
         # Ensure .rasmap compatibility (upgrade 5.0.7 to 6.x if needed)
-        logger.info("Checking .rasmap compatibility...")
-        compat_result = RasMap.ensure_rasmap_compatible(ras_object=ras_obj, auto_upgrade=True)
+        logger.debug("Checking .rasmap compatibility")
+        compat_result = RasMap.ensure_rasmap_compatible(
+            ras_object=ras_obj, auto_upgrade=True
+        )
 
-        if compat_result['status'] == 'manual_needed':
+        if compat_result["status"] == "manual_needed":
             logger.error(
                 f".rasmap upgrade required but failed: {compat_result['message']}\n\n"
                 "Manual steps required:\n"
@@ -2896,21 +3810,27 @@ class RasMap:
                 "5. Re-run this function"
             )
             return False
-        elif compat_result['status'] == 'upgraded':
-            logger.info(f".rasmap successfully upgraded: {compat_result['message']}")
+        elif compat_result["status"] == "upgraded":
+            logger.debug(".rasmap successfully upgraded: %s", compat_result["message"])
         else:  # 'ready'
-            logger.info(f".rasmap compatibility check passed: {compat_result['message']}")
+            logger.debug(
+                ".rasmap compatibility check passed: %s", compat_result["message"]
+            )
 
         if layers is None:
-            layers = ['WSEL', 'Velocity', 'Depth']
+            layers = ["WSEL", "Velocity", "Depth"]
         elif isinstance(layers, str):
             layers = [layers]
 
         # Convert plan_number to list if it's a string
-        plan_number_list = [plan_number] if isinstance(plan_number, str) else plan_number
+        plan_number_list = (
+            [plan_number] if isinstance(plan_number, str) else plan_number
+        )
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
-        rasmap_backup_path = rasmap_path.with_suffix(f"{rasmap_path.suffix}.storedmap.bak")
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
+        rasmap_backup_path = rasmap_path.with_suffix(
+            f"{rasmap_path.suffix}.storedmap.bak"
+        )
 
         # Store plan paths and their backups
         plan_paths = []
@@ -2919,24 +3839,30 @@ class RasMap:
 
         for plan_num in plan_number_list:
             plan_path = Path(RasPlan.get_plan_path(plan_num, ras_obj))
-            plan_backup_path = plan_path.with_suffix(f"{plan_path.suffix}.storedmap.bak")
+            plan_backup_path = plan_path.with_suffix(
+                f"{plan_path.suffix}.storedmap.bak"
+            )
             plan_paths.append(plan_path)
             plan_backup_paths.append(plan_backup_path)
 
             # Get the Short Identifier for this plan to determine results folder
             plan_df = ras_obj.plan_df
-            plan_info = plan_df[plan_df['plan_number'] == plan_num]
+            plan_info = plan_df[plan_df["plan_number"] == plan_num]
             if not plan_info.empty:
-                short_id = plan_info.iloc[0]['Short Identifier']
+                short_id = plan_info.iloc[0]["Short Identifier"]
                 if pd.notna(short_id) and short_id:
                     plan_results_folders[plan_num] = short_id
                 else:
                     # Fallback: use plan number if no Short Identifier
                     plan_results_folders[plan_num] = f"Plan_{plan_num}"
-                    logger.warning(f"Plan {plan_num} has no Short Identifier, using 'Plan_{plan_num}' as folder name")
+                    logger.warning(
+                        f"Plan {plan_num} has no Short Identifier, using 'Plan_{plan_num}' as folder name"
+                    )
             else:
                 plan_results_folders[plan_num] = f"Plan_{plan_num}"
-                logger.warning(f"Could not find plan {plan_num} in plan_df, using 'Plan_{plan_num}' as folder name")
+                logger.warning(
+                    f"Could not find plan {plan_num} in plan_df, using 'Plan_{plan_num}' as folder name"
+                )
 
         def _create_map_element(name, map_type, results_folder, profile_name="Max"):
             # Generate filename: "WSE (Max).vrt", "Depth (Max).vrt", etc.
@@ -2948,47 +3874,56 @@ class RasMap:
                 "OutputMode": "Stored Current Terrain",
                 "StoredFilename": relative_path,  # Required for stored maps
                 "ProfileIndex": "2147483647",
-                "ProfileName": profile_name
+                "ProfileName": profile_name,
             }
 
             # Create Layer element with Filename attribute
             layer_elem = ET.Element(
-                'Layer',
+                "Layer",
                 Name=name,
                 Type="RASResultsMap",
                 Checked="True",
-                Filename=relative_path  # Required for stored maps
+                Filename=relative_path,  # Required for stored maps
             )
 
-            map_params_elem = ET.SubElement(layer_elem, 'MapParameters')
+            map_params_elem = ET.SubElement(layer_elem, "MapParameters")
             for k, v in map_params.items():
                 map_params_elem.set(k, str(v))
             return layer_elem
 
         try:
             # --- 1. Backup and Modify Plan Files ---
-            for plan_num, plan_path, plan_backup_path in zip(plan_number_list, plan_paths, plan_backup_paths):
-                logger.info(f"Backing up plan file {plan_path} to {plan_backup_path}")
+            for plan_num, plan_path, plan_backup_path in zip(
+                plan_number_list, plan_paths, plan_backup_paths
+            ):
+                logger.debug(
+                    "Backing up plan file %s to %s", plan_path, plan_backup_path
+                )
                 shutil.copy2(plan_path, plan_backup_path)
-                
-                logger.info(f"Updating plan run flags for floodplain mapping for plan {plan_num}...")
+
+                logger.debug(
+                    "Updating plan run flags for floodplain mapping for plan %s",
+                    plan_num,
+                )
                 RasPlan.update_run_flags(
                     plan_num,
                     geometry_preprocessor=True,
                     unsteady_flow_simulation=False,
                     post_processor=False,
                     floodplain_mapping=True,
-                    ras_object=ras_obj
+                    ras_object=ras_obj,
                 )
 
             # --- 2. Backup and Modify RASMAP File ---
-            logger.info(f"Backing up rasmap file {rasmap_path} to {rasmap_backup_path}")
+            logger.debug(
+                "Backing up rasmap file %s to %s", rasmap_path, rasmap_backup_path
+            )
             shutil.copy2(rasmap_path, rasmap_backup_path)
 
             tree = ET.parse(rasmap_path)
             root = tree.getroot()
-            
-            results_section = root.find('Results')
+
+            results_section = root.find("Results")
             if results_section is None:
                 raise ValueError(f"No <Results> section found in {rasmap_path}")
 
@@ -3005,31 +3940,40 @@ class RasMap:
                 if results_layer is None:
                     # Create a new RASResults layer for this plan
                     plan_hdf_filename = f".\\{ras_obj.project_name}.p{plan_num}.hdf"
-                    plan_info = ras_obj.plan_df[ras_obj.plan_df['plan_number'] == plan_num]
+                    plan_info = ras_obj.plan_df[
+                        ras_obj.plan_df["plan_number"] == plan_num
+                    ]
                     if not plan_info.empty:
-                        layer_name = plan_info.iloc[0].get('Plan Title', f'Plan {plan_num}')
+                        layer_name = plan_info.iloc[0].get(
+                            "Plan Title", f"Plan {plan_num}"
+                        )
                         if pd.isna(layer_name) or not layer_name:
                             layer_name = f"Plan {plan_num}"
                     else:
                         layer_name = f"Plan {plan_num}"
 
                     results_layer = ET.SubElement(
-                        results_section, 'Layer',
+                        results_section,
+                        "Layer",
                         Name=layer_name,
                         Type="RASResults",
                         Checked="True",
                         Expanded="True",
-                        Filename=plan_hdf_filename
+                        Filename=plan_hdf_filename,
                     )
-                    logger.info(f"Created new RASResults layer '{layer_name}' for plan {plan_num} (none existed in .rasmap)")
-                
+                    logger.debug(
+                        "Created new RASResults layer '%s' for plan %s (none existed in .rasmap)",
+                        layer_name,
+                        plan_num,
+                    )
+
                 # Map user-provided layer names to HEC-RAS variable names and map types
                 # Note: "WSE" is the correct HEC-RAS convention (not "WSEL")
                 map_definitions = {
                     "WSE": "elevation",
                     "WSEL": "elevation",  # Accept both for backward compatibility, but use "WSE" in output
                     "Velocity": "velocity",
-                    "Depth": "depth"
+                    "Depth": "depth",
                 }
 
                 # Get the results folder for this plan
@@ -3042,20 +3986,28 @@ class RasMap:
                         # Convert WSEL to WSE for output (HEC-RAS convention)
                         output_name = "WSE" if layer_name == "WSEL" else layer_name
 
-                        map_elem = _create_map_element(output_name, map_type, results_folder)
+                        map_elem = _create_map_element(
+                            output_name, map_type, results_folder
+                        )
                         results_layer.append(map_elem)
-                        logger.info(f"Added '{output_name}' stored map to results layer for plan {plan_num}.")
+                        logger.debug(
+                            "Added '%s' stored map to results layer for plan %s",
+                            output_name,
+                            plan_num,
+                        )
 
             if specify_terrain:
-                terrains_elem = root.find('Terrains')
+                terrains_elem = root.find("Terrains")
                 if terrains_elem is not None:
                     for layer in list(terrains_elem):
-                        if layer.get('Name') != specify_terrain:
+                        if layer.get("Name") != specify_terrain:
                             terrains_elem.remove(layer)
-                    logger.info(f"Filtered terrains, keeping only '{specify_terrain}'.")
+                    logger.debug(
+                        "Filtered terrains, keeping only '%s'", specify_terrain
+                    )
 
-            tree.write(rasmap_path, encoding='utf-8', xml_declaration=True)
-            
+            _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=True)
+
             # --- 3. Execute HEC-RAS ---
             if auto_click_compute:
                 # Use GUI automation to automatically click menu and Compute button
@@ -3065,16 +4017,20 @@ class RasMap:
                 # The user can manually run additional plans if needed
                 first_plan = plan_number_list[0]
 
+                from .RasGuiAutomation import RasGuiAutomation
+
                 success = RasGuiAutomation.open_and_compute(
                     plan_number=first_plan,
                     ras_object=ras_obj,
                     auto_click_compute=True,
-                    wait_for_user=True
+                    wait_for_user=True,
                 )
 
                 if len(plan_number_list) > 1:
-                    logger.info(f"Note: GUI automation ran plan {first_plan}. "
-                               f"Please manually run remaining plans: {', '.join(plan_number_list[1:])}")
+                    logger.info(
+                        f"Note: GUI automation ran plan {first_plan}. "
+                        f"Please manually run remaining plans: {', '.join(plan_number_list[1:])}"
+                    )
 
                 if not success:
                     logger.error("Floodplain mapping computation failed.")
@@ -3090,18 +4046,23 @@ class RasMap:
                 try:
                     import sys
                     import subprocess
+
                     if sys.platform == "win32":
                         hecras_process = subprocess.Popen(command)
                     else:
                         hecras_process = subprocess.Popen([ras_exe, prj_path])
 
-                    logger.info(f"HEC-RAS opened with Process ID: {hecras_process.pid}")
-                    logger.info(f"Please run plan(s) {', '.join(plan_number_list)} using the 'Compute Multiple' window in HEC-RAS to generate floodplain mapping results.")
+                    logger.debug(
+                        "HEC-RAS opened with Process ID: %s", hecras_process.pid
+                    )
+                    logger.info(
+                        f"Please run plan(s) {', '.join(plan_number_list)} using the 'Compute Multiple' window in HEC-RAS to generate floodplain mapping results."
+                    )
 
                     # Wait for HEC-RAS to close
-                    logger.info("Waiting for HEC-RAS to close...")
+                    logger.debug("Waiting for HEC-RAS to close")
                     hecras_process.wait()
-                    logger.info("HEC-RAS has closed")
+                    logger.debug("HEC-RAS has closed")
 
                     success = True
 
@@ -3115,7 +4076,7 @@ class RasMap:
 
             logger.info("Floodplain mapping computation successful.")
             return True
-        
+
         except Exception as e:
             logger.error(f"Error in postprocess_stored_maps: {e}")
             return False
@@ -3124,10 +4085,14 @@ class RasMap:
             # --- 4. Restore Files ---
             for plan_path, plan_backup_path in zip(plan_paths, plan_backup_paths):
                 if plan_backup_path.exists():
-                    logger.info(f"Restoring original plan file from {plan_backup_path}")
+                    logger.debug(
+                        "Restoring original plan file from %s", plan_backup_path
+                    )
                     shutil.move(plan_backup_path, plan_path)
             if rasmap_backup_path.exists():
-                logger.info(f"Restoring original rasmap file from {rasmap_backup_path}")
+                logger.debug(
+                    "Restoring original rasmap file from %s", rasmap_backup_path
+                )
                 shutil.move(rasmap_backup_path, rasmap_path)
 
     # ── Cross-version validation registry ──────────────────────────────────
@@ -3143,6 +4108,652 @@ class RasMap:
     @staticmethod
     @log_call
     def store_all_maps(
+        plan_number: Optional[
+            Union[
+                str,
+                int,
+                float,
+                Sequence[Union[str, int, float]],
+            ]
+        ] = None,
+        render_mode: str = None,
+        ras_object: Optional[Any] = None,
+        timeout: int = 600,
+        *,
+        mode: str = "auto",
+        output_folder: Optional[str] = None,
+        output_path: Optional[Union[str, Path]] = None,
+        profile: str = "Max",
+        profiles: Optional[
+            Union[str, int, Sequence[Union[str, int]]]
+        ] = None,
+        timesteps: Optional[
+            Union[int, str, datetime, Sequence[Union[int, str, datetime]]]
+        ] = None,
+        max_timesteps: Optional[int] = None,
+        map_types: Optional[Union[str, Sequence[str]]] = None,
+        wse: Optional[bool] = None,
+        depth: Optional[bool] = None,
+        velocity: Optional[bool] = None,
+        froude: Optional[bool] = None,
+        shear_stress: Optional[bool] = None,
+        depth_x_velocity: Optional[bool] = None,
+        depth_x_velocity_sq: Optional[bool] = None,
+        inundation_boundary: Optional[bool] = None,
+        arrival_time: Optional[bool] = None,
+        duration: Optional[bool] = None,
+        percent_inundated: Optional[bool] = None,
+        arrival_depth: float = 0.0,
+        clear_existing: bool = True,
+        fix_georef: bool = True,
+        ras_version: Optional[str] = None,
+        terrain_name: Optional[str] = None,
+        benefit_area: Optional[BenefitAreaConfig] = None,
+        performance: Optional[StoreMapPerformanceOptions] = None,
+        raise_on_error: bool = False,
+    ) -> Dict[str, Any]:
+        """Generate RASMapper stored maps through one canonical API.
+
+        ``mode`` selects the operation without requiring a second
+        ``store_all_maps`` implementation:
+
+        - ``"configured"`` runs ras-commander's packaged RAS Mapper helper
+          for every stored map already configured in the ``.rasmap``. This is
+          the compatibility behavior of historic
+          ``RasMap.store_all_maps(plan_number)`` calls.
+        - ``"native"`` is a deprecated alias for ``"configured"``. It does
+          not invoke ``RasProcess.exe``: that executable does not honor the
+          required stored-map interpolation/render-mode behavior.
+        - ``"selected"`` configures and generates selected map products for
+          one or more plans. ``performance=StoreMapPerformanceOptions(...)``
+          enables memory-admitted map-level parallelism.
+        - ``"timesteps"`` generates selected products for requested output
+          timesteps.
+        - ``"steady_profiles"`` configures every selected steady profile in
+          one XML transaction and invokes aggregate ``StoreAllMaps`` once per
+          plan.
+        - ``"all_plans"`` applies the selected-map configuration to every
+          project plan with an HDF result.
+        - ``"auto"`` preserves a plain historic call as ``"configured"``,
+          uses ``"all_plans"`` when ``plan_number`` is omitted, and otherwise
+          selects ``"selected"`` or ``"timesteps"`` when advanced options are
+          supplied.
+
+        The result always contains ``success``, resolved ``mode``, ``plans``,
+        and ``render_mode``. Configured plan results add ``files_by_type``;
+        timestep results add a nested ``timesteps`` mapping. File paths are
+        strings so the summary is directly JSON serializable.
+
+        Args:
+            plan_number: One flexible plan number (for example ``1`` or
+                ``"01"``) or a plan sequence for ``configured``/``selected``/
+                ``timesteps``. Omit it for ``all_plans``.
+            render_mode: Optional water-surface rendering override.
+            ras_object (RasPrj, optional): Initialized project object; defaults to the active project.
+            timeout: Per-helper timeout in seconds.
+            mode: ``auto``, ``configured``, ``selected``, ``timesteps``,
+                ``steady_profiles``, or ``all_plans``. ``native`` remains a
+                deprecated compatibility alias for ``configured``.
+            output_folder: Relative ``.rasmap`` StoredFilename folder name for
+                configured non-timestep modes. It is not an output destination.
+            output_path: Destination directory to which generated products are
+                moved. Multi-plan modes create ``plan_XX`` children.
+            profile: ``Max``, ``Min``, or a timestamp for configured
+                non-timestep modes.
+            profiles: Steady-profile selectors for ``steady_profiles`` mode.
+                ``None`` selects all profiles; exact names and zero-based
+                indexes may be mixed in a sequence.
+            timesteps: Timestep selectors for ``timesteps`` mode.
+            max_timesteps: Optional cap applied after timestep selection.
+            map_types: One product name or a sequence of names. Exactly the
+                listed products are generated. Do not combine with individual
+                raster/product flags, except ``inundation_boundary`` (see
+                below). Defaults, when neither ``map_types`` nor any flag is
+                given, are WSE/Depth/Velocity for selected/all-plans, Depth
+                only for timesteps, and Depth plus one inundation boundary for
+                steady_profiles.
+            wse: Individual Water Surface Elevation product flag. Once any
+                individual product flag is given, only flags set to True are generated.
+            depth: Individual Depth product flag.
+            velocity: Individual Velocity product flag.
+            froude: Individual Froude number product flag.
+            shear_stress: Individual Shear Stress product flag.
+            depth_x_velocity: Individual depth-times-velocity product flag.
+            depth_x_velocity_sq: Individual depth-times-velocity-squared product flag.
+            arrival_time: Individual Arrival Time product flag.
+            duration: Individual Duration product flag.
+            percent_inundated: Individual Percent Inundated product flag.
+            inundation_boundary: Individual inundation boundary polygon flag.
+                May also be passed together with
+                ``map_types`` to add (True) or explicitly omit (False) the
+                boundary polygon; False conflicts with a ``map_types`` entry of
+                ``"inundation_boundary"``. For steady_profiles,
+                ``map_types=["depth"]`` therefore yields Depth rasters only.
+            arrival_depth: Threshold for whole-simulation configured products.
+            clear_existing: Clear existing stored maps before adding new ones.
+            fix_georef: Apply georeferencing fixes to generated rasters.
+            ras_version: Optional installed mapping-runtime version.
+            terrain_name: Registered terrain selection for non-timestep modes.
+            benefit_area: Optional single-plan benefit-area configuration.
+            performance: Typed map-helper execution and memory policy.
+            raise_on_error: Re-raise a per-plan runtime failure instead of
+                retaining it in the summary. For steady_profiles, a plan whose
+                StoreAllMaps run omitted some requested products is reported
+                with ``success=False``, ``error``, the preserved ``files``,
+                per-product ``stored_maps`` (each with ``status``), and
+                ``missing``; with ``raise_on_error=True`` the
+                :class:`~ras_commander.RasProcess.StoredMapProductsIncompleteError`
+                is re-raised after those products are preserved.
+
+        Raises:
+            ValueError: If the selected mode cannot honor an option, no plans
+                are available, or no map product is selected.
+        """
+        from .RasProcess import RasProcess
+
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+
+        requested_mode = str(mode).strip().casefold().replace("-", "_")
+        if requested_mode == "native":
+            warnings.warn(
+                "mode='native' is deprecated because stored maps are generated "
+                "by ras-commander's packaged RAS Mapper helper, not "
+                "RasProcess.exe. Use mode='configured'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        mode_aliases = {
+            "legacy": "configured",
+            "native": "configured",
+            "native_all": "configured",
+            "plan": "selected",
+            "project": "all_plans",
+            "all": "all_plans",
+        }
+        resolved_mode = mode_aliases.get(requested_mode, requested_mode)
+        valid_modes = {
+            "auto",
+            "configured",
+            "selected",
+            "timesteps",
+            "steady_profiles",
+            "all_plans",
+        }
+        if resolved_mode not in valid_modes:
+            raise ValueError(
+                "mode must be auto, configured, selected, timesteps, "
+                "steady_profiles, or all_plans"
+            )
+
+        requested_flags = {
+            "wse": wse,
+            "depth": depth,
+            "velocity": velocity,
+            "froude": froude,
+            "shear_stress": shear_stress,
+            "depth_x_velocity": depth_x_velocity,
+            "depth_x_velocity_sq": depth_x_velocity_sq,
+            "inundation_boundary": inundation_boundary,
+            "arrival_time": arrival_time,
+            "duration": duration,
+            "percent_inundated": percent_inundated,
+        }
+        advanced_requested = any(
+            (
+                output_folder is not None,
+                output_path is not None,
+                profile != "Max",
+                profiles is not None,
+                timesteps is not None,
+                max_timesteps is not None,
+                map_types is not None,
+                any(value is not None for value in requested_flags.values()),
+                arrival_depth != 0.0,
+                clear_existing is not True,
+                fix_georef is not True,
+                ras_version is not None,
+                terrain_name is not None,
+                benefit_area is not None,
+                performance is not None,
+                raise_on_error is not False,
+            )
+        )
+        if resolved_mode == "auto":
+            if profiles is not None:
+                resolved_mode = "steady_profiles"
+            elif timesteps is not None or max_timesteps is not None:
+                resolved_mode = "timesteps"
+            elif plan_number is None:
+                resolved_mode = "all_plans"
+            elif advanced_requested:
+                resolved_mode = "selected"
+            else:
+                resolved_mode = "configured"
+
+        if resolved_mode == "configured":
+            if plan_number is None:
+                raise ValueError("plan_number is required for mode='configured'")
+            if not isinstance(plan_number, (str, int, float)) and not list(plan_number):
+                raise ValueError("mode='configured' requires at least one plan")
+            if advanced_requested:
+                raise ValueError(
+                    "mode='configured' only accepts plan_number, render_mode, "
+                    "ras_object, and timeout; use mode='selected' for output, "
+                    "map, terrain, or performance options"
+                )
+            configured_plan_numbers = (
+                [RasUtils.normalize_ras_number(plan_number)]
+                if isinstance(plan_number, (str, int, float))
+                else [RasUtils.normalize_ras_number(value) for value in plan_number]
+            )
+            result = RasMap._store_all_maps_configured(
+                (
+                    configured_plan_numbers[0]
+                    if len(configured_plan_numbers) == 1
+                    else configured_plan_numbers
+                ),
+                render_mode=render_mode,
+                ras_object=ras_obj,
+                timeout=timeout,
+            )
+            result["mode"] = "configured"
+            return result
+
+        if resolved_mode == "all_plans" and plan_number is not None:
+            raise ValueError("plan_number must be omitted for mode='all_plans'")
+        if resolved_mode in {
+            "selected",
+            "timesteps",
+            "steady_profiles",
+        } and plan_number is None:
+            raise ValueError(f"plan_number is required for mode='{resolved_mode}'")
+        if resolved_mode != "timesteps" and timesteps is not None:
+            raise ValueError("timesteps are only valid with mode='timesteps'")
+        if resolved_mode != "timesteps" and max_timesteps is not None:
+            raise ValueError("max_timesteps is only valid with mode='timesteps'")
+        if resolved_mode != "steady_profiles" and profiles is not None:
+            raise ValueError(
+                "profiles are only valid with mode='steady_profiles'"
+            )
+        if resolved_mode == "timesteps":
+            unsupported_timestep_options = []
+            if output_folder is not None:
+                unsupported_timestep_options.append("output_folder (use output_path)")
+            if profile != "Max":
+                unsupported_timestep_options.append("profile")
+            if arrival_depth != 0.0:
+                unsupported_timestep_options.append("arrival_depth")
+            if terrain_name is not None:
+                unsupported_timestep_options.append("terrain_name")
+            if benefit_area is not None:
+                unsupported_timestep_options.append("benefit_area")
+            if unsupported_timestep_options:
+                raise ValueError(
+                    "mode='timesteps' does not support: "
+                    + ", ".join(unsupported_timestep_options)
+                )
+
+        if resolved_mode == "steady_profiles":
+            unsupported_steady_options = []
+            if output_folder is not None:
+                unsupported_steady_options.append("output_folder (use output_path)")
+            if profile != "Max":
+                unsupported_steady_options.append("profile (use profiles)")
+            if timesteps is not None or max_timesteps is not None:
+                unsupported_steady_options.append("timesteps")
+            if arrival_depth != 0.0:
+                unsupported_steady_options.append("arrival_depth")
+            if benefit_area is not None:
+                unsupported_steady_options.append("benefit_area")
+            for product in ("arrival_time", "duration", "percent_inundated"):
+                if requested_flags.get(product):
+                    unsupported_steady_options.append(product)
+            if unsupported_steady_options:
+                raise ValueError(
+                    "mode='steady_profiles' does not support: "
+                    + ", ".join(unsupported_steady_options)
+                )
+
+        supported_map_types = tuple(requested_flags)
+        if resolved_mode == "steady_profiles":
+            # Flow is a profile-dependent RASMapper product supported by the
+            # steady batch engine, but it has no legacy individual boolean
+            # flag on this facade. It is therefore selected through map_types.
+            supported_map_types += ("flow",)
+        supported_map_type_set = set(supported_map_types)
+        explicit_map_selection = map_types is not None or any(
+            value is not None for value in requested_flags.values()
+        )
+        if map_types is not None:
+            # inundation_boundary is a polygon companion product, so it may be
+            # combined with map_types; the raster flags may not.
+            if any(
+                value is not None
+                for name, value in requested_flags.items()
+                if name != "inundation_boundary"
+            ):
+                raise ValueError(
+                    "map_types cannot be combined with individual map flags "
+                    "(only inundation_boundary may be combined with map_types)"
+                )
+            map_type_values = (map_types,) if isinstance(map_types, str) else map_types
+            normalized_types = {
+                str(value).strip().casefold().replace(" ", "_")
+                for value in map_type_values
+            }
+            unknown_types = sorted(normalized_types - supported_map_type_set)
+            if unknown_types:
+                raise ValueError("unsupported map_types: " + ", ".join(unknown_types))
+            map_flags = {name: name in normalized_types for name in supported_map_types}
+            if inundation_boundary is not None:
+                if (
+                    "inundation_boundary" in normalized_types
+                    and not inundation_boundary
+                ):
+                    raise ValueError(
+                        "inundation_boundary=False conflicts with "
+                        "map_types containing 'inundation_boundary'"
+                    )
+                map_flags["inundation_boundary"] = bool(inundation_boundary)
+        elif any(value is not None for value in requested_flags.values()):
+            map_flags = {name: bool(value) for name, value in requested_flags.items()}
+        elif benefit_area is not None:
+            # BenefitArea has configuration-dependent defaults in RasProcess.
+            map_flags = dict(requested_flags)
+        elif resolved_mode == "steady_profiles":
+            # Historic steady default: Depth plus one boundary polygon.
+            map_flags = {
+                name: name in {"depth", "inundation_boundary"}
+                for name in supported_map_types
+            }
+        elif resolved_mode == "timesteps":
+            map_flags = {name: name == "depth" for name in supported_map_types}
+        else:
+            map_flags = {
+                name: name in {"wse", "depth", "velocity"}
+                for name in supported_map_types
+            }
+
+        if explicit_map_selection and not any(map_flags.values()):
+            raise ValueError("At least one stored-map product must be selected")
+
+        if resolved_mode == "timesteps":
+            unsupported_timestep_products = sorted(
+                name
+                for name in (
+                    "inundation_boundary",
+                    "arrival_time",
+                    "duration",
+                    "percent_inundated",
+                )
+                if map_flags.get(name)
+            )
+            if unsupported_timestep_products:
+                raise ValueError(
+                    "mode='timesteps' does not support: "
+                    + ", ".join(unsupported_timestep_products)
+                )
+
+        if resolved_mode == "steady_profiles":
+            unsupported_steady_products = sorted(
+                name
+                for name in ("arrival_time", "duration", "percent_inundated")
+                if map_flags.get(name)
+            )
+            if unsupported_steady_products:
+                raise ValueError(
+                    "mode='steady_profiles' does not support: "
+                    + ", ".join(unsupported_steady_products)
+                )
+
+        if resolved_mode == "all_plans":
+            plan_numbers = [
+                RasUtils.normalize_ras_number(row["plan_number"])
+                for _, row in ras_obj.plan_df.iterrows()
+                if (
+                    ras_obj.project_folder
+                    / f"{ras_obj.project_name}.p{RasUtils.normalize_ras_number(row['plan_number'])}.hdf"
+                ).exists()
+            ]
+        else:
+            raw_plan_numbers = (
+                [plan_number]
+                if isinstance(plan_number, (str, int, float))
+                else list(plan_number)
+            )
+            plan_numbers = [
+                RasUtils.normalize_ras_number(value) for value in raw_plan_numbers
+            ]
+
+        if not plan_numbers:
+            raise ValueError("No plans with HDF results are available for stored maps")
+        if benefit_area is not None and len(plan_numbers) != 1:
+            raise ValueError("benefit_area requires exactly one selected plan")
+
+        summary: Dict[str, Any] = {
+            "success": True,
+            "mode": resolved_mode,
+            "plans": {},
+            "render_mode": (
+                normalize_store_map_render_mode(render_mode)
+                if render_mode is not None
+                else None
+            ),
+        }
+        multiple_plans = len(plan_numbers) > 1 or resolved_mode == "all_plans"
+
+        for plan_num in plan_numbers:
+            plan_output_folder = (
+                f"{output_folder}_{plan_num}"
+                if output_folder is not None and multiple_plans
+                else output_folder
+            )
+            plan_output_path = (
+                Path(output_path) / f"plan_{plan_num}"
+                if output_path is not None and multiple_plans
+                else output_path
+            )
+            shared_arguments = {
+                "plan_number": plan_num,
+                "output_folder": plan_output_folder,
+                "output_path": plan_output_path,
+                "profile": profile,
+                "render_mode": render_mode,
+                **map_flags,
+                "arrival_depth": arrival_depth,
+                "clear_existing": clear_existing,
+                "fix_georef": fix_georef,
+                "ras_object": ras_obj,
+                "ras_version": ras_version,
+                "timeout": timeout,
+                "performance": performance,
+            }
+            if terrain_name is not None:
+                shared_arguments["terrain_name"] = terrain_name
+            if benefit_area is not None:
+                shared_arguments["benefit_area"] = benefit_area
+
+            try:
+                if resolved_mode == "timesteps":
+                    timestep_arguments = {
+                        key: value
+                        for key, value in shared_arguments.items()
+                        if key
+                        not in {
+                            "output_folder",
+                            "profile",
+                            "inundation_boundary",
+                            "arrival_time",
+                            "duration",
+                            "percent_inundated",
+                            "arrival_depth",
+                            "terrain_name",
+                            "benefit_area",
+                        }
+                    }
+                    generated_by_timestep = RasProcess.store_maps_at_timesteps(
+                        timesteps=timesteps,
+                        max_timesteps=max_timesteps,
+                        **timestep_arguments,
+                    )
+                    timestep_summary = {
+                        timestamp: {
+                            map_type: [str(path) for path in paths]
+                            for map_type, paths in generated.items()
+                        }
+                        for timestamp, generated in generated_by_timestep.items()
+                    }
+                    flat_files = [
+                        path
+                        for generated in timestep_summary.values()
+                        for paths in generated.values()
+                        for path in paths
+                    ]
+                    summary["plans"][plan_num] = {
+                        "success": True,
+                        "timesteps": timestep_summary,
+                        "files": flat_files,
+                    }
+                elif resolved_mode == "steady_profiles":
+                    steady_map_types = [
+                        name
+                        for name in (
+                            "wse",
+                            "depth",
+                            "velocity",
+                            "froude",
+                            "shear_stress",
+                            "depth_x_velocity",
+                            "depth_x_velocity_sq",
+                            "flow",
+                        )
+                        if map_flags.get(name)
+                    ]
+                    if not steady_map_types:
+                        raise ValueError(
+                            "At least one steady profile raster product is required"
+                        )
+                    frame = RasProcess.store_maps_at_steady_profiles(
+                        plan_number=plan_num,
+                        profiles=profiles,
+                        output_path=plan_output_path,
+                        map_types=steady_map_types,
+                        render_mode=render_mode,
+                        clear_existing=clear_existing,
+                        fix_georef=fix_georef,
+                        ras_object=ras_obj,
+                        ras_version=ras_version,
+                        timeout=timeout,
+                        terrain_name=terrain_name,
+                        inundation_boundary=bool(
+                            map_flags.get("inundation_boundary")
+                        ),
+                        raise_on_missing=True,
+                        performance=performance,
+                    )
+                    records = frame.to_dict(orient="records")
+                    grouped_profiles = []
+                    for profile_index in frame["profile_index"].drop_duplicates():
+                        profile_rows = frame[
+                            frame["profile_index"] == profile_index
+                        ]
+                        grouped_profiles.append(
+                            {
+                                "profile_index": int(profile_index),
+                                "profile_name": str(
+                                    profile_rows.iloc[0]["profile_name"]
+                                ),
+                                "products": profile_rows.to_dict(orient="records"),
+                            }
+                        )
+                    flat_files = list(
+                        dict.fromkeys(
+                            path
+                            for record in records
+                            for path in record["files"]
+                        )
+                    )
+                    output_directories = sorted(
+                        {str(Path(path).parent) for path in flat_files}
+                    )
+                    summary["plans"][plan_num] = {
+                        "success": True,
+                        "output_dir": (
+                            output_directories[0]
+                            if len(output_directories) == 1
+                            else None
+                        ),
+                        "files": flat_files,
+                        "stored_maps": records,
+                        "profiles": grouped_profiles,
+                        "performance": json.loads(
+                            json.dumps(frame.attrs, default=str)
+                        ),
+                    }
+                else:
+                    generated = RasProcess.store_maps(**shared_arguments)
+                    files_by_type = {
+                        map_type: [str(path) for path in paths]
+                        for map_type, paths in generated.items()
+                    }
+                    flat_files = [
+                        path for paths in files_by_type.values() for path in paths
+                    ]
+                    output_directories = sorted(
+                        {str(Path(path).parent) for path in flat_files}
+                    )
+                    summary["plans"][plan_num] = {
+                        "success": True,
+                        "output_dir": (
+                            output_directories[0]
+                            if len(output_directories) == 1
+                            else None
+                        ),
+                        "files": flat_files,
+                        "files_by_type": files_by_type,
+                    }
+            except Exception as exc:
+                logger.error("Failed to generate maps for plan %s: %s", plan_num, exc)
+                summary["success"] = False
+                summary["plans"][plan_num] = {
+                    "success": False,
+                    "error": str(exc),
+                }
+                partial_frame = getattr(exc, "frame", None)
+                if isinstance(partial_frame, pd.DataFrame):
+                    # StoredMapProductsIncompleteError: the generated products
+                    # were preserved on disk, so report them with the missing
+                    # ones instead of discarding the file list.
+                    partial_records = json.loads(
+                        partial_frame.to_json(orient="records")
+                    )
+                    summary["plans"][plan_num].update(
+                        {
+                            "files": list(
+                                dict.fromkeys(
+                                    path
+                                    for record in partial_records
+                                    if record.get("status") == "generated"
+                                    for path in record["files"]
+                                )
+                            ),
+                            "stored_maps": partial_records,
+                            "missing": [
+                                record
+                                for record in partial_records
+                                if record.get("status") != "generated"
+                            ],
+                        }
+                    )
+                if raise_on_error:
+                    raise
+
+        return summary
+
+    @staticmethod
+    def _store_all_maps_configured(
         plan_number: Union[str, List[str]],
         render_mode: str = None,
         ras_object: Optional[Any] = None,
@@ -3165,7 +4776,7 @@ class RasMap:
             plan_number: Plan number(s) to generate maps for (e.g. "01" or ["01", "02"]).
             render_mode: Rendering mode override. If None, reads from .rasmap file.
                 Valid values: "horizontal", "sloping", "slopingPretty".
-            ras_object: Optional RAS project object.
+            ras_object (RasPrj, optional): Optional RAS project object.
             timeout: Timeout in seconds per plan (default: 600).
 
         Returns:
@@ -3188,8 +4799,8 @@ class RasMap:
         ras_obj.check_initialized()
 
         # Version guard: only 6.x is validated
-        ras_version = getattr(ras_obj, 'ras_version', None) or ""
-        exe_path_str = str(getattr(ras_obj, 'ras_exe_path', ''))
+        ras_version = getattr(ras_obj, "ras_version", None) or ""
+        exe_path_str = str(getattr(ras_obj, "ras_exe_path", ""))
         # Try to detect version from exe path (e.g. "...\6.6\Ras.exe")
         if not ras_version:
             for segment in Path(exe_path_str).parts:
@@ -3213,28 +4824,41 @@ class RasMap:
             render_mode = RasMap.get_water_surface_render_mode(ras_object=ras_obj)
             if render_mode is None:
                 render_mode = {"mode": "horizontal"}
-                logger.warning("No RenderMode found in .rasmap, defaulting to 'horizontal'")
+                logger.warning(
+                    "No RenderMode found in .rasmap, defaulting to 'horizontal'"
+                )
 
         helper_mode = normalize_store_map_render_mode(render_mode)
 
         # Process plan numbers
-        plan_number_list = [plan_number] if isinstance(plan_number, str) else list(plan_number)
+        plan_number_list = (
+            [plan_number] if isinstance(plan_number, str) else list(plan_number)
+        )
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             raise FileNotFoundError(f".rasmap file not found: {rasmap_path}")
 
         results = {"success": True, "plans": {}, "render_mode": helper_mode}
 
         for plan_num in plan_number_list:
-            result_hdf = ras_obj.project_folder / f"{ras_obj.project_name}.p{plan_num}.hdf"
+            result_hdf = (
+                ras_obj.project_folder / f"{ras_obj.project_name}.p{plan_num}.hdf"
+            )
             if not result_hdf.exists():
-                logger.warning(f"Skipping plan {plan_num} — no result HDF: {result_hdf}")
-                results["plans"][plan_num] = {"success": False, "error": "No result HDF"}
+                logger.warning(
+                    f"Skipping plan {plan_num} — no result HDF: {result_hdf}"
+                )
+                results["plans"][plan_num] = {
+                    "success": False,
+                    "error": "No result HDF",
+                }
                 results["success"] = False
                 continue
 
-            logger.info(f"Generating stored maps for plan {plan_num} (mode={helper_mode})...")
+            logger.debug(
+                "Generating stored maps for plan %s (mode=%s)", plan_num, helper_mode
+            )
 
             try:
                 proc = run_store_all_maps_helper(
@@ -3247,13 +4871,21 @@ class RasMap:
                 )
 
                 if proc.returncode == 0:
-                    logger.info(f"Plan {plan_num}: StoreAllMaps completed successfully")
-                    logger.debug(f"stdout: {proc.stdout}")
+                    logger.debug(
+                        "Plan %s: StoreAllMaps completed successfully", plan_num
+                    )
+                    logger.debug(
+                        "Plan %s StoreAllMaps stdout: %s", plan_num, proc.stdout
+                    )
 
                     # Collect output files
-                    plan_info = ras_obj.plan_df[ras_obj.plan_df['plan_number'] == plan_num]
+                    plan_info = ras_obj.plan_df[
+                        ras_obj.plan_df["plan_number"] == plan_num
+                    ]
                     if not plan_info.empty:
-                        short_id = plan_info.iloc[0].get('Short Identifier', f'Plan_{plan_num}')
+                        short_id = plan_info.iloc[0].get(
+                            "Short Identifier", f"Plan_{plan_num}"
+                        )
                         if pd.isna(short_id) or not short_id:
                             short_id = f"Plan_{plan_num}"
                     else:
@@ -3262,7 +4894,9 @@ class RasMap:
                     output_dir = ras_obj.project_folder / short_id.strip()
                     output_files = []
                     if output_dir.exists():
-                        output_files = list(output_dir.glob("*.tif")) + list(output_dir.glob("*.vrt"))
+                        output_files = list(output_dir.glob("*.tif")) + list(
+                            output_dir.glob("*.vrt")
+                        )
 
                     results["plans"][plan_num] = {
                         "success": True,
@@ -3271,9 +4905,17 @@ class RasMap:
                         "stdout": proc.stdout,
                     }
                 else:
-                    logger.error(f"Plan {plan_num}: StoreAllMaps failed (exit code {proc.returncode})")
-                    logger.error(f"stderr: {proc.stderr}")
-                    logger.error(f"stdout: {proc.stdout}")
+                    logger.error(
+                        "Plan %s: StoreAllMaps failed (exit code %s)",
+                        plan_num,
+                        proc.returncode,
+                    )
+                    logger.debug(
+                        "Plan %s StoreAllMaps stderr: %s", plan_num, proc.stderr
+                    )
+                    logger.debug(
+                        "Plan %s StoreAllMaps stdout: %s", plan_num, proc.stdout
+                    )
                     results["plans"][plan_num] = {
                         "success": False,
                         "error": proc.stderr or proc.stdout,
@@ -3282,15 +4924,28 @@ class RasMap:
                     results["success"] = False
 
             except subprocess.TimeoutExpired:
-                logger.error(f"Plan {plan_num}: StoreAllMaps timed out after {timeout}s")
+                logger.error(
+                    f"Plan {plan_num}: StoreAllMaps timed out after {timeout}s"
+                )
                 results["plans"][plan_num] = {"success": False, "error": "Timeout"}
                 results["success"] = False
 
+        successful_plans = sum(
+            1 for result in results["plans"].values() if result.get("success")
+        )
+        logger.info(
+            "Stored map generation complete: %s/%s plans succeeded (mode=%s)",
+            successful_plans,
+            len(plan_number_list),
+            helper_mode,
+        )
         return results
 
     @staticmethod
     @log_call
-    def get_results_folder(plan_number: Union[str, int, float], ras_object=None) -> Path:
+    def get_results_folder(
+        plan_number: Union[str, int, float], ras_object=None
+    ) -> Path:
         """
         Get the folder path containing raster results for a specified plan.
 
@@ -3299,7 +4954,7 @@ class RasMap:
 
         Args:
             plan_number (Union[str, int, float]): Plan number (accepts flexible formats like 1, "01", "001").
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             Path: Path to the mapping output folder.
@@ -3326,7 +4981,7 @@ class RasMap:
 
         # Get plan metadata from plan_df
         plan_df = ras_obj.plan_df
-        plan_info = plan_df[plan_df['plan_number'] == plan_number]
+        plan_info = plan_df[plan_df["plan_number"] == plan_number]
 
         if plan_info.empty:
             raise ValueError(
@@ -3334,7 +4989,7 @@ class RasMap:
                 f"Available plans: {list(plan_df['plan_number'])}"
             )
 
-        short_id = plan_info.iloc[0]['Short Identifier']
+        short_id = plan_info.iloc[0]["Short Identifier"]
 
         if pd.isna(short_id) or not short_id:
             raise ValueError(
@@ -3345,9 +5000,17 @@ class RasMap:
         # Normalize Short ID to match Windows folder naming
         # RASMapper replaces special characters for Windows compatibility
         replacements = {
-            '/': '_', '\\': '_', ':': '_', '*': '_',
-            '?': '_', '"': '_', '<': '_', '>': '_',
-            '|': '_', '+': '_', ' ': '_'
+            "/": "_",
+            "\\": "_",
+            ":": "_",
+            "*": "_",
+            "?": "_",
+            '"': "_",
+            "<": "_",
+            ">": "_",
+            "|": "_",
+            "+": "_",
+            " ": "_",
         }
 
         normalized = short_id
@@ -3355,7 +5018,7 @@ class RasMap:
             normalized = normalized.replace(old, new)
 
         # Remove trailing underscores
-        normalized = normalized.rstrip('_')
+        normalized = normalized.rstrip("_")
 
         # Search for output folder in project directory
         project_folder = ras_obj.project_folder
@@ -3363,13 +5026,15 @@ class RasMap:
         # Try exact match with Short ID
         exact_match = project_folder / short_id
         if exact_match.exists() and exact_match.is_dir():
-            logger.info(f"Found output folder (exact match): {exact_match}")
+            logger.debug("Found output folder by exact match: %s", exact_match)
             return exact_match
 
         # Try normalized name
         normalized_match = project_folder / normalized
         if normalized_match.exists() and normalized_match.is_dir():
-            logger.info(f"Found output folder (normalized): {normalized_match}")
+            logger.debug(
+                "Found output folder by normalized match: %s", normalized_match
+            )
             return normalized_match
 
         # Try partial match (contains)
@@ -3379,11 +5044,13 @@ class RasMap:
             folder_name = item.name
             # Check if short_id is contained in folder name or vice versa
             if short_id in folder_name or folder_name in short_id:
-                logger.info(f"Found output folder (partial match): {item}")
+                logger.debug("Found output folder by partial match: %s", item)
                 return item
             # Check normalized version
             if normalized in folder_name or folder_name in normalized:
-                logger.info(f"Found output folder (normalized partial match): {item}")
+                logger.debug(
+                    "Found output folder by normalized partial match: %s", item
+                )
                 return item
 
         # No folder found
@@ -3396,9 +5063,7 @@ class RasMap:
     @staticmethod
     @log_call
     def get_results_raster(
-        plan_number: Union[str, int, float],
-        variable_name: str,
-        ras_object=None
+        plan_number: Union[str, int, float], variable_name: str, ras_object=None
     ) -> Path:
         """
         Get the .vrt file path for a specified plan and variable name.
@@ -3409,7 +5074,7 @@ class RasMap:
         Args:
             plan_number (Union[str, int, float]): Plan number (accepts flexible formats).
             variable_name (str): Variable name to search for in VRT filenames (e.g., "WSE", "Depth", "Velocity").
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             Path: Path to the matching .vrt file.
@@ -3446,8 +5111,7 @@ class RasMap:
 
         # Filter files containing variable_name (case-insensitive)
         matching_files = [
-            f for f in vrt_files
-            if variable_name.lower() in f.name.lower()
+            f for f in vrt_files if variable_name.lower() in f.name.lower()
         ]
 
         # Handle results
@@ -3459,13 +5123,14 @@ class RasMap:
                 "Try making variable_name more specific or check for typos."
             )
         elif len(matching_files) == 1:
-            logger.info(f"Found matching VRT file: {matching_files[0]}")
+            logger.debug("Found matching VRT file: %s", matching_files[0])
             return matching_files[0]
         else:
-            # Multiple matches - print list and raise error
-            logger.error(f"Multiple .vrt files match '{variable_name}':")
-            for i, f in enumerate(matching_files, 1):
-                logger.error(f"  {i}. {f.name}")
+            logger.debug(
+                "Multiple .vrt files match '%s': %s",
+                variable_name,
+                [f.name for f in matching_files],
+            )
 
             raise ValueError(
                 f"Multiple .vrt files ({len(matching_files)}) match variable name '{variable_name}'. "
@@ -3479,7 +5144,7 @@ class RasMap:
         mode: str = "horizontal",
         reduce_shallow_to_horizontal: bool = True,
         use_depth_weighted_faces: bool = False,
-        ras_object=None
+        ras_object=None,
     ) -> bool:
         """
         Set the water surface rendering mode in the RASMapper configuration file.
@@ -3504,7 +5169,7 @@ class RasMap:
             use_depth_weighted_faces (bool): When True, face contributions are
                 weighted by depth. Only applies to slopingPretty mode.
                 Default: False.
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             bool: True if successful, False otherwise.
@@ -3556,7 +5221,7 @@ class RasMap:
             )
 
         # Get rasmap path
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             raise FileNotFoundError(f"RASMapper file not found: {rasmap_path}")
 
@@ -3621,7 +5286,11 @@ class RasMap:
                 if use_depth_weighted_faces:
                     if depth_weighted_elem is None:
                         # Insert after RenderMode (or after ReduceShallowToHorizontal if present)
-                        after_elem = reduce_shallow_elem if reduce_shallow_elem is not None else render_mode_elem
+                        after_elem = (
+                            reduce_shallow_elem
+                            if reduce_shallow_elem is not None
+                            else render_mode_elem
+                        )
                         idx = list(root).index(after_elem) + 1
                         depth_weighted_elem = ET.Element("UseDepthWeightedFaces")
                         root.insert(idx, depth_weighted_elem)
@@ -3637,8 +5306,8 @@ class RasMap:
                 )
 
             # Write the modified XML back
-            tree.write(rasmap_path, encoding='utf-8', xml_declaration=True)
-            logger.info(f"Updated RASMapper configuration: {rasmap_path}")
+            _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=True)
+            logger.debug("Updated RASMapper configuration: %s", rasmap_path)
 
             return True
 
@@ -3653,7 +5322,7 @@ class RasMap:
         Get the current water surface rendering mode from the RASMapper configuration.
 
         Args:
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             Optional[dict]: Rendering mode configuration with keys:
@@ -3677,7 +5346,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return None
@@ -3756,19 +5425,21 @@ class RasMap:
         """
         results = {}
         for folder in ras_folder.iterdir():
-            if folder.is_dir() and not folder.name.startswith('.'):
+            if folder.is_dir() and not folder.name.startswith("."):
                 # Check for raster files
-                tif_files = list(folder.glob('*.tif'))
-                vrt_files = list(folder.glob('*.vrt'))
+                tif_files = list(folder.glob("*.tif"))
+                vrt_files = list(folder.glob("*.vrt"))
 
                 if tif_files or vrt_files:
                     results[folder.name] = {
-                        'path': folder,
-                        'has_vrt': len(vrt_files) > 0,
-                        'has_tif': len(tif_files) > 0
+                        "path": folder,
+                        "has_vrt": len(vrt_files) > 0,
+                        "has_tif": len(tif_files) > 0,
                     }
-                    logger.debug(f"Found results folder: {folder.name} "
-                               f"(VRT: {len(vrt_files)}, TIF: {len(tif_files)})")
+                    logger.debug(
+                        f"Found results folder: {folder.name} "
+                        f"(VRT: {len(vrt_files)}, TIF: {len(tif_files)})"
+                    )
         return results
 
     @staticmethod
@@ -3790,9 +5461,17 @@ class RasMap:
         # Normalize Short ID to match Windows folder naming
         # RASMapper replaces special characters for Windows compatibility
         replacements = {
-            '/': '_', '\\': '_', ':': '_', '*': '_',
-            '?': '_', '"': '_', '<': '_', '>': '_',
-            '|': '_', '+': '_', ' ': '_'
+            "/": "_",
+            "\\": "_",
+            ":": "_",
+            "*": "_",
+            "?": "_",
+            '"': "_",
+            "<": "_",
+            ">": "_",
+            "|": "_",
+            "+": "_",
+            " ": "_",
         }
 
         normalized = short_id
@@ -3800,27 +5479,27 @@ class RasMap:
             normalized = normalized.replace(old, new)
 
         # Remove trailing underscores
-        normalized = normalized.rstrip('_')
+        normalized = normalized.rstrip("_")
 
         # Scan for folders
         folders = RasMap.scan_results_folders(ras_folder)
 
         # Try exact match
         if short_id in folders:
-            return folders[short_id]['path']
+            return folders[short_id]["path"]
 
         # Try normalized name
         if normalized in folders:
-            return folders[normalized]['path']
+            return folders[normalized]["path"]
 
         # Try partial match
         for folder_name, folder_info in folders.items():
             # Check if short_id is contained in folder name or vice versa
             if short_id in folder_name or folder_name in short_id:
-                return folder_info['path']
+                return folder_info["path"]
             # Check normalized version
             if normalized in folder_name or folder_name in normalized:
-                return folder_info['path']
+                return folder_info["path"]
 
         return None
 
@@ -3847,91 +5526,121 @@ class RasMap:
             >>> wse_path = rasters['wse']
             >>> depth_path = rasters['depth']
         """
-        result = {'wse': None, 'depth': None}
+        result = {"wse": None, "depth": None}
 
         # Priority 1: Look for unsteady flow VRT files (with "max")
-        for vrt_file in results_folder.glob('*.vrt'):
+        for vrt_file in results_folder.glob("*.vrt"):
             name_lower = vrt_file.name.lower()
-            if 'depth' in name_lower and 'max' in name_lower:
-                result['depth'] = vrt_file
+            if "depth" in name_lower and "max" in name_lower:
+                result["depth"] = vrt_file
                 logger.debug(f"Found unsteady depth VRT: {vrt_file.name}")
-            elif 'wse' in name_lower and 'max' in name_lower:
-                result['wse'] = vrt_file
+            elif "wse" in name_lower and "max" in name_lower:
+                result["wse"] = vrt_file
                 logger.debug(f"Found unsteady WSE VRT: {vrt_file.name}")
 
         # Priority 2: Look for steady flow VRT files (without "max") - only if not already found
-        if not result['depth'] or not result['wse']:
-            for vrt_file in results_folder.glob('*.vrt'):
+        if not result["depth"] or not result["wse"]:
+            for vrt_file in results_folder.glob("*.vrt"):
                 name_lower = vrt_file.name.lower()
                 name_base = vrt_file.stem.lower()
 
                 # Match depth files - steady flow patterns
-                if not result['depth'] and 'depth' in name_lower and 'max' not in name_lower:
-                    if (name_base == 'depth' or
-                        name_base.startswith('depth (') or
-                        name_base.startswith('depth ') or
-                        name_base.startswith('depth_grid')):
-                        result['depth'] = vrt_file
+                if (
+                    not result["depth"]
+                    and "depth" in name_lower
+                    and "max" not in name_lower
+                ):
+                    if (
+                        name_base == "depth"
+                        or name_base.startswith("depth (")
+                        or name_base.startswith("depth ")
+                        or name_base.startswith("depth_grid")
+                    ):
+                        result["depth"] = vrt_file
                         logger.debug(f"Found steady depth VRT: {vrt_file.name}")
 
                 # Match WSE files - steady flow patterns
-                elif not result['wse'] and 'wse' in name_lower and 'max' not in name_lower:
-                    if (name_base == 'wse' or
-                        name_base.startswith('wse (') or
-                        name_base.startswith('wse ') or
-                        name_base.startswith('wse_grid')):
-                        result['wse'] = vrt_file
+                elif (
+                    not result["wse"]
+                    and "wse" in name_lower
+                    and "max" not in name_lower
+                ):
+                    if (
+                        name_base == "wse"
+                        or name_base.startswith("wse (")
+                        or name_base.startswith("wse ")
+                        or name_base.startswith("wse_grid")
+                    ):
+                        result["wse"] = vrt_file
                         logger.debug(f"Found steady WSE VRT: {vrt_file.name}")
 
         # Priority 3: Fall back to unsteady flow TIF files if no VRT found
-        if not result['depth'] or not result['wse']:
-            for tif_file in results_folder.glob('*.tif'):
+        if not result["depth"] or not result["wse"]:
+            for tif_file in results_folder.glob("*.tif"):
                 name_lower = tif_file.name.lower()
-                if not result['depth'] and 'depth' in name_lower and 'max' in name_lower:
-                    result['depth'] = tif_file
+                if (
+                    not result["depth"]
+                    and "depth" in name_lower
+                    and "max" in name_lower
+                ):
+                    result["depth"] = tif_file
                     logger.debug(f"Found unsteady depth TIF: {tif_file.name}")
-                elif not result['wse'] and 'wse' in name_lower and 'max' in name_lower:
-                    result['wse'] = tif_file
+                elif not result["wse"] and "wse" in name_lower and "max" in name_lower:
+                    result["wse"] = tif_file
                     logger.debug(f"Found unsteady WSE TIF: {tif_file.name}")
 
         # Priority 4: Fall back to steady flow TIF files if still not found
-        if not result['depth'] or not result['wse']:
-            for tif_file in results_folder.glob('*.tif'):
+        if not result["depth"] or not result["wse"]:
+            for tif_file in results_folder.glob("*.tif"):
                 name_lower = tif_file.name.lower()
                 name_base = tif_file.stem.lower()
 
                 # Match depth TIF files - steady flow patterns
-                if not result['depth'] and 'depth' in name_lower and 'max' not in name_lower:
-                    if (name_base == 'depth' or
-                        name_base.startswith('depth (') or
-                        name_base.startswith('depth ') or
-                        name_base.startswith('depth_grid')):
-                        result['depth'] = tif_file
+                if (
+                    not result["depth"]
+                    and "depth" in name_lower
+                    and "max" not in name_lower
+                ):
+                    if (
+                        name_base == "depth"
+                        or name_base.startswith("depth (")
+                        or name_base.startswith("depth ")
+                        or name_base.startswith("depth_grid")
+                    ):
+                        result["depth"] = tif_file
                         logger.debug(f"Found steady depth TIF: {tif_file.name}")
 
                 # Match WSE TIF files - steady flow patterns
-                elif not result['wse'] and 'wse' in name_lower and 'max' not in name_lower:
-                    if (name_base == 'wse' or
-                        name_base.startswith('wse (') or
-                        name_base.startswith('wse ') or
-                        name_base.startswith('wse_grid')):
-                        result['wse'] = tif_file
+                elif (
+                    not result["wse"]
+                    and "wse" in name_lower
+                    and "max" not in name_lower
+                ):
+                    if (
+                        name_base == "wse"
+                        or name_base.startswith("wse (")
+                        or name_base.startswith("wse ")
+                        or name_base.startswith("wse_grid")
+                    ):
+                        result["wse"] = tif_file
                         logger.debug(f"Found steady WSE TIF: {tif_file.name}")
 
         # Log detected model type
-        if result['depth'] or result['wse']:
-            depth_path = str(result.get('depth', '')).lower()
-            wse_path = str(result.get('wse', '')).lower()
-            if 'max' in depth_path or 'max' in wse_path:
-                logger.info(f"Detected unsteady flow model in {results_folder.name}")
+        if result["depth"] or result["wse"]:
+            depth_path = str(result.get("depth", "")).lower()
+            wse_path = str(result.get("wse", "")).lower()
+            if "max" in depth_path or "max" in wse_path:
+                logger.debug("Detected unsteady flow model in %s", results_folder.name)
             else:
-                logger.info(f"Detected steady flow model in {results_folder.name}")
+                logger.debug("Detected steady flow model in %s", results_folder.name)
 
         return result
 
     @staticmethod
     @log_call
-    def find_steady_raster(results_folder: Path, profile_name: str, raster_type: str) -> Optional[Path]:
+    def find_steady_raster(
+        results_folder: Path, profile_name: str, raster_type: str
+    ) -> Optional[Path]:
         """
         Find steady state raster for a specific profile.
 
@@ -4014,7 +5723,8 @@ class RasMap:
         rasmap_path: Union[str, Path],
         layer_name: str = "Terrain",
         projection_prj: Optional[Union[str, Path]] = None,
-        ras_object=None
+        ras_object=None,
+        relative_paths: bool = False,
     ) -> None:
         """
         Add terrain layer to RASMapper configuration.
@@ -4029,7 +5739,11 @@ class RasMap:
             layer_name: Display name for terrain layer (default: "Terrain")
             projection_prj: Path to ESRI PRJ file. If provided, updates
                 RASProjectionFilename element. Default: None (keeps existing).
-            ras_object: Optional RasPrj object instance (default: global ras).
+            ras_object (RasPrj, optional): Optional RasPrj object instance (default: global ras).
+            relative_paths: Include sibling and parent folders in relative terrain
+                and projection references on the same drive. Default False keeps
+                the existing descendant-only behavior. Different drives retain
+                absolute references. Use True for relocatable cloned bundles.
 
         Returns:
             None
@@ -4082,7 +5796,9 @@ class RasMap:
         if projection_prj is not None:
             projection_prj = Path(projection_prj)
             if not projection_prj.exists():
-                raise FileNotFoundError(f"Projection PRJ file not found: {projection_prj}")
+                raise FileNotFoundError(
+                    f"Projection PRJ file not found: {projection_prj}"
+                )
 
         # Parse existing rasmap
         try:
@@ -4100,13 +5816,17 @@ class RasMap:
 
         try:
             # Calculate relative path
-            rel_path = terrain_hdf_resolved.relative_to(rasmap_dir)
+            rel_path = (
+                Path(os.path.relpath(terrain_hdf_resolved, rasmap_dir))
+                if relative_paths
+                else terrain_hdf_resolved.relative_to(rasmap_dir)
+            )
             # Format as Windows-style relative path with .\ prefix
             rel_path_str = ".\\" + str(rel_path).replace("/", "\\")
         except ValueError:
             # If terrain is not relative to rasmap dir, use absolute path
             logger.warning(
-                f"Terrain HDF is not under rasmap directory. Using absolute path."
+                "Terrain HDF is not under rasmap directory. Using absolute path."
             )
             rel_path_str = str(terrain_hdf_resolved).replace("/", "\\")
 
@@ -4124,7 +5844,7 @@ class RasMap:
                 if child.tag in ["Results", "Geometries", "EventConditions"]:
                     insert_index = i + 1
             root.insert(insert_index, terrains)
-            logger.info("Created new Terrains section in .rasmap file")
+            logger.debug("Created new Terrains section in .rasmap file")
 
         # Check for existing layer with same name and remove it
         existing_layer = None
@@ -4135,7 +5855,7 @@ class RasMap:
 
         if existing_layer is not None:
             terrains.remove(existing_layer)
-            logger.info(f"Replaced existing terrain layer: {layer_name}")
+            logger.debug("Replaced existing terrain layer: %s", layer_name)
 
         # Create terrain layer element
         layer = ET.SubElement(terrains, "Layer")
@@ -4154,10 +5874,17 @@ class RasMap:
         # Update projection reference if provided
         if projection_prj is not None:
             try:
-                prj_rel_path = RasUtils.safe_resolve(projection_prj).relative_to(rasmap_dir)
+                projection_resolved = RasUtils.safe_resolve(projection_prj)
+                prj_rel_path = (
+                    Path(os.path.relpath(projection_resolved, rasmap_dir))
+                    if relative_paths
+                    else projection_resolved.relative_to(rasmap_dir)
+                )
                 prj_rel_path_str = ".\\" + str(prj_rel_path).replace("/", "\\")
             except ValueError:
-                prj_rel_path_str = str(RasUtils.safe_resolve(projection_prj)).replace("/", "\\")
+                prj_rel_path_str = str(RasUtils.safe_resolve(projection_prj)).replace(
+                    "/", "\\"
+                )
 
             # Find or create RASProjectionFilename element
             proj_elem = root.find("RASProjectionFilename")
@@ -4172,15 +5899,187 @@ class RasMap:
                 root.insert(insert_idx, proj_elem)
 
             proj_elem.set("Filename", prj_rel_path_str)
-            logger.info(f"Updated projection reference: {prj_rel_path_str}")
+            logger.debug("Updated RASMapper projection reference")
+            logger.debug("RASMapper projection reference: %s", prj_rel_path_str)
 
         # Write updated rasmap file
         # Use a custom write to preserve XML formatting
-        tree.write(rasmap_path, encoding='utf-8', xml_declaration=False)
+        _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
 
+        action = "Replaced" if existing_layer is not None else "Added"
+        logger.info("%s terrain layer '%s' in .rasmap", action, layer_name)
+        logger.debug("Terrain layer '%s' filename: %s", layer_name, rel_path_str)
+
+    @staticmethod
+    @log_call
+    def prune_event_condition_layers(
+        keep_filenames: Sequence[Union[str, Path]],
+        rasmap_path: Optional[Union[str, Path]] = None,
+        ras_object=None,
+        backup: bool = True,
+    ) -> Dict[str, Any]:
+        """Remove stale event-condition layers from a cloned project.
+
+        HEC-RAS evaluates ``RASEventConditions`` layers during unsteady
+        preprocessing, including unchecked layers inherited from other plans
+        or source-project folders.  A cloned breakout project can therefore
+        fail with ``Error processing event conditions`` even when its current
+        plan and unsteady-flow file are valid.
+
+        This method retains only exact filename matches, removes unmatched
+        event-condition layers anywhere in the ``.rasmap`` tree, writes
+        atomically, and validates exact readback.  It never edits the referenced
+        HDF files.  Pass an empty sequence to remove every event-condition
+        layer.
+
+        Args:
+            keep_filenames: Exact layer ``Filename`` values to retain. Paths
+                inside the project folder may be supplied as absolute paths;
+                they are normalized to ``.\\`` relative Windows form.
+            rasmap_path: Explicit ``.rasmap`` path. When omitted, resolve it
+                from ``ras_object``.
+            ras_object (RasPrj, optional): Optional initialized project object.
+            backup: Create a durable sibling backup before mutation.
+
+        Returns:
+            JSON-safe mutation evidence including removed/retained layers,
+            backup path, and exact readback counts.
+
+        Raises:
+            FileNotFoundError: If the ``.rasmap`` does not exist.
+            FileExistsError: If the backup or atomic staging path exists.
+            ValueError: If XML is invalid or a requested retained filename is
+                absent before mutation.
+            RuntimeError: If exact readback validation fails.
+        """
+        ras_obj = ras_object or ras
+        if rasmap_path is None:
+            resolved = RasMap.get_rasmap_path(ras_obj)
+            if resolved is None:
+                raise FileNotFoundError("Project .rasmap file was not found")
+            target = Path(resolved)
+        else:
+            target = Path(rasmap_path)
+        if not target.is_file():
+            raise FileNotFoundError(f"RASMapper file not found: {target}")
+
+        def normalize_filename(value: Union[str, Path]) -> str:
+            raw = str(value).strip()
+            candidate = Path(raw)
+            if candidate.is_absolute():
+                try:
+                    raw = ".\\" + str(
+                        RasUtils.safe_resolve(candidate).relative_to(
+                            RasUtils.safe_resolve(target.parent)
+                        )
+                    )
+                except ValueError:
+                    raw = str(candidate)
+            return raw.replace("/", "\\").casefold()
+
+        requested = {normalize_filename(value) for value in keep_filenames}
+        try:
+            tree = ET.parse(target)
+        except ET.ParseError as exc:
+            raise ValueError(f"Error parsing .rasmap XML: {exc}") from exc
+        root = tree.getroot()
+
+        layers = []
+        for parent in root.iter():
+            for layer in list(parent):
+                if (
+                    layer.tag == "Layer"
+                    and layer.get("Type") == "RASEventConditions"
+                ):
+                    layers.append((parent, layer))
+        available = {
+            normalize_filename(layer.get("Filename") or "")
+            for _parent, layer in layers
+        }
+        missing = sorted(requested - available)
+        if missing:
+            raise ValueError(
+                "Requested event-condition layer filename(s) are absent: "
+                + ", ".join(missing)
+            )
+
+        removed = []
+        retained = []
+        for parent, layer in layers:
+            record = {
+                "name": layer.get("Name") or "",
+                "filename": layer.get("Filename") or "",
+                "checked": layer.get("Checked"),
+            }
+            if normalize_filename(record["filename"]) in requested:
+                retained.append(record)
+            else:
+                parent.remove(layer)
+                removed.append(record)
+
+        backup_path = None
+        staging = target.with_name(f".{target.name}.event-conditions.tmp")
+        if removed:
+            if staging.exists():
+                raise FileExistsError(
+                    f"Atomic .rasmap staging path already exists: {staging}"
+                )
+            if backup:
+                backup_path = target.with_name(
+                    f"{target.stem}.event-conditions.bak{target.suffix}"
+                )
+                if backup_path.exists():
+                    raise FileExistsError(
+                        f"Event-condition backup already exists: {backup_path}"
+                    )
+                shutil.copy2(target, backup_path)
+            try:
+                _write_ras_xml(tree, staging, encoding="utf-8", xml_declaration=False)
+                ET.parse(staging)
+                os.replace(staging, target)
+            finally:
+                if staging.exists():
+                    staging.unlink()
+
+        readback_root = ET.parse(target).getroot()
+        readback = []
+        for layer in readback_root.iter("Layer"):
+            if layer.get("Type") == "RASEventConditions":
+                readback.append(
+                    {
+                        "name": layer.get("Name") or "",
+                        "filename": layer.get("Filename") or "",
+                        "checked": layer.get("Checked"),
+                    }
+                )
+        readback_filenames = {
+            normalize_filename(layer["filename"]) for layer in readback
+        }
+        if readback_filenames != requested:
+            raise RuntimeError(
+                "Event-condition readback mismatch: expected "
+                f"{sorted(requested)}, observed {sorted(readback_filenames)}"
+            )
+
+        evidence = {
+            "rasmap_path": str(target),
+            "backup_path": str(backup_path) if backup_path is not None else None,
+            "requested_filenames": sorted(requested),
+            "before_count": len(layers),
+            "removed_count": len(removed),
+            "retained_count": len(retained),
+            "readback_count": len(readback),
+            "removed": removed,
+            "retained": retained,
+            "readback": readback,
+            "changed": bool(removed),
+        }
         logger.info(
-            f"Added terrain layer '{layer_name}' to .rasmap file: {rel_path_str}"
+            "Pruned %d stale event-condition layer(s); retained %d",
+            len(removed),
+            len(retained),
         )
+        return evidence
 
     # ── Calculated Layers ───────────────────────────────────────────────
 
@@ -4195,7 +6094,7 @@ class RasMap:
         calculated layers.
 
         Args:
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             List[Dict[str, Any]]: List of dicts with keys:
@@ -4213,7 +6112,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return []
@@ -4227,19 +6126,21 @@ class RasMap:
 
         results = root.find("Results")
         if results is None:
-            logger.warning("No Results section found in .rasmap")
+            logger.debug("No Results section found in .rasmap")
             return []
 
         plans = []
         for layer in results.findall("Layer"):
             if layer.get("Type") == "RASResults":
-                plans.append({
-                    "name": layer.get("Name", ""),
-                    "filename": layer.get("Filename", ""),
-                    "checked": layer.get("Checked", "True").lower() == "true",
-                })
+                plans.append(
+                    {
+                        "name": layer.get("Name", ""),
+                        "filename": layer.get("Filename", ""),
+                        "checked": layer.get("Checked", "True").lower() == "true",
+                    }
+                )
 
-        logger.info(f"Found {len(plans)} results plan(s) in .rasmap")
+        logger.debug("Found %d results plan(s) in .rasmap", len(plans))
         return plans
 
     @staticmethod
@@ -4265,7 +6166,7 @@ class RasMap:
         )
         project_folder = plan_path.parent
         project_name = _project_name_from_plan_path(plan_path)
-        rasmap_path = project_folder / f"{project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(project_folder, project_name)
         hdf_path = Path(str(plan_path) + ".hdf")
 
         if not hdf_path.exists():
@@ -4309,7 +6210,7 @@ class RasMap:
         layer.set("Expanded", "True" if expanded else "False")
         layer.set("Filename", rel_hdf)
 
-        tree.write(rasmap_path, encoding="utf-8", xml_declaration=False)
+        _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
         record = {
             "name": layer_name,
             "filename": rel_hdf,
@@ -4317,7 +6218,8 @@ class RasMap:
             "expanded": expanded,
             "rasmap_path": rasmap_path,
         }
-        logger.info("Ensured RASResults layer '%s' in %s", layer_name, rasmap_path)
+        logger.info("Ensured RASResults layer '%s'", layer_name)
+        logger.debug("Updated RASMapper file: %s", rasmap_path)
         return record
 
     @staticmethod
@@ -4342,7 +6244,7 @@ class RasMap:
         )
         project_folder = plan_path.parent
         project_name = _project_name_from_plan_path(plan_path)
-        rasmap_path = project_folder / f"{project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(project_folder, project_name)
 
         if rasmap_path.exists():
             try:
@@ -4364,7 +6266,11 @@ class RasMap:
                 root.append(plans)
 
         rel_plan = _rasmap_relative_path(project_folder, plan_path)
-        geom_hdf = Path(geom_hdf_path) if geom_hdf_path is not None else _infer_plan_geometry_hdf(plan_path)
+        geom_hdf = (
+            Path(geom_hdf_path)
+            if geom_hdf_path is not None
+            else _infer_plan_geometry_hdf(plan_path)
+        )
         rel_geom = (
             _rasmap_relative_path(project_folder, geom_hdf)
             if geom_hdf is not None
@@ -4407,8 +6313,9 @@ class RasMap:
             child.set("Type", layer_type)
             child.set("Filename", rel_plan)
 
-        tree.write(rasmap_path, encoding="utf-8", xml_declaration=False)
-        logger.info("Ensured 2D encroachment plan layers in %s", rasmap_path)
+        _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
+        logger.info("Ensured 2D encroachment plan layers")
+        logger.debug("Updated RASMapper file: %s", rasmap_path)
         return rasmap_path
 
     @staticmethod
@@ -4423,7 +6330,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return []
@@ -4460,7 +6367,7 @@ class RasMap:
                     }
                 )
 
-        logger.info(f"Found {len(layers)} result map layer(s) in .rasmap")
+        logger.debug("Found %d result map layer(s) in .rasmap", len(layers))
         return layers
 
     @staticmethod
@@ -4487,7 +6394,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             raise FileNotFoundError(f"RASMapper file not found: {rasmap_path}")
 
@@ -4503,7 +6410,10 @@ class RasMap:
 
         host_layer = None
         for layer in results.findall("Layer"):
-            if layer.get("Type") == "RASResults" and layer.get("Name") == host_plan_name:
+            if (
+                layer.get("Type") == "RASResults"
+                and layer.get("Name") == host_plan_name
+            ):
                 host_layer = layer
                 break
 
@@ -4514,7 +6424,10 @@ class RasMap:
 
         if replace_existing:
             for child in list(host_layer.findall("Layer")):
-                if child.get("Type") == "RASResultsMap" and child.get("Name") == layer_name:
+                if (
+                    child.get("Type") == "RASResultsMap"
+                    and child.get("Name") == layer_name
+                ):
                     host_layer.remove(child)
 
         result_map = ET.SubElement(
@@ -4535,14 +6448,16 @@ class RasMap:
         map_parameters.set("ProfileName", profile_name)
         map_parameters.set("ArrivalDepth", "0")
 
-        tree.write(rasmap_path, encoding="utf-8", xml_declaration=False)
+        _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
         record = {
             "name": layer_name,
             "parent_plan": host_plan_name,
             "checked": checked,
             "map_parameters": dict(map_parameters.attrib),
         }
-        logger.info("Added result map layer '%s' to plan '%s'", layer_name, host_plan_name)
+        logger.info(
+            "Added result map layer '%s' to plan '%s'", layer_name, host_plan_name
+        )
         return record
 
     @staticmethod
@@ -4555,7 +6470,7 @@ class RasMap:
         ``<Layer Type="RASResults">`` blocks.
 
         Args:
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             List[Dict[str, Any]]: List of dicts with keys:
@@ -4578,7 +6493,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return []
@@ -4606,26 +6521,30 @@ class RasMap:
 
                 raster_maps = []
                 for rm in child.findall("RasterMap"):
-                    raster_maps.append({
-                        "result": rm.get("Result", ""),
-                        "map_type": rm.get("MapType", ""),
-                        "profile_index": rm.get("ProfileIndex", ""),
-                        "animation_behavior": rm.get("AnimationBehavior", ""),
-                    })
+                    raster_maps.append(
+                        {
+                            "result": rm.get("Result", ""),
+                            "map_type": rm.get("MapType", ""),
+                            "profile_index": rm.get("ProfileIndex", ""),
+                            "animation_behavior": rm.get("AnimationBehavior", ""),
+                        }
+                    )
 
                 terrains = [t.get("Name", "") for t in child.findall("Terrain")]
 
-                calc_layers.append({
-                    "name": child.get("Name", ""),
-                    "parent_plan": parent_plan,
-                    "filename": child.get("Filename", ""),
-                    "checked": child.get("Checked", "False").lower() == "true",
-                    "profile_index": child.get("ProfileIndex", "0"),
-                    "raster_maps": raster_maps,
-                    "terrains": terrains,
-                })
+                calc_layers.append(
+                    {
+                        "name": child.get("Name", ""),
+                        "parent_plan": parent_plan,
+                        "filename": child.get("Filename", ""),
+                        "checked": child.get("Checked", "False").lower() == "true",
+                        "profile_index": child.get("ProfileIndex", "0"),
+                        "raster_maps": raster_maps,
+                        "terrains": terrains,
+                    }
+                )
 
-        logger.info(f"Found {len(calc_layers)} calculated layer(s) in .rasmap")
+        logger.debug("Found %d calculated layer(s) in .rasmap", len(calc_layers))
         return calc_layers
 
     @staticmethod
@@ -4665,7 +6584,7 @@ class RasMap:
                 indices in the script).
             checked: Whether the layer is visible in RASMapper. Default True.
             profile_index: ProfileIndex attribute for the calculated layer. Default 0.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             bool: True if the layer was successfully added.
@@ -4698,7 +6617,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             raise FileNotFoundError(f"RASMapper file not found: {rasmap_path}")
 
@@ -4717,7 +6636,10 @@ class RasMap:
         # Find the host plan's RASResults layer
         host_layer = None
         for layer in results.findall("Layer"):
-            if layer.get("Type") == "RASResults" and layer.get("Name") == host_plan_name:
+            if (
+                layer.get("Type") == "RASResults"
+                and layer.get("Name") == host_plan_name
+            ):
                 host_layer = layer
                 break
 
@@ -4728,7 +6650,10 @@ class RasMap:
 
         # Remove existing calculated layer with same name (replace-if-exists)
         for child in host_layer.findall("Layer"):
-            if child.get("Type") == "CalculatedLayer" and child.get("Name") == layer_name:
+            if (
+                child.get("Type") == "CalculatedLayer"
+                and child.get("Name") == layer_name
+            ):
                 host_layer.remove(child)
                 logger.info(f"Replacing existing calculated layer '{layer_name}'")
 
@@ -4738,8 +6663,8 @@ class RasMap:
 
         # Write .rasscript file
         script_path = calc_dir / f"{layer_name}.rasscript"
-        script_path.write_text(script_content, encoding='utf-8')
-        logger.info(f"Written script: {script_path.name}")
+        script_path.write_text(script_content, encoding="utf-8")
+        logger.debug("Written script: %s", script_path.name)
 
         # Build relative path with .\ prefix and backslashes
         rel_path_str = f".\\Calculated Layers\\{layer_name}.rasscript"
@@ -4773,7 +6698,9 @@ class RasMap:
             rm_elem = ET.SubElement(calc_elem, "RasterMap")
             rm_elem.set("Result", rm["result"])
             rm_elem.set("MapType", rm.get("map_type", "elevation"))
-            rm_elem.set("AnimationBehavior", rm.get("animation_behavior", "Fixed Profile"))
+            rm_elem.set(
+                "AnimationBehavior", rm.get("animation_behavior", "Fixed Profile")
+            )
             rm_elem.set("ProfileIndex", rm.get("profile_index", "2147483647"))
 
         # Add Terrain inputs
@@ -4782,10 +6709,8 @@ class RasMap:
             t_elem.set("Name", terrain_name)
 
         # Write updated rasmap
-        tree.write(rasmap_path, encoding='utf-8', xml_declaration=False)
-        logger.info(
-            f"Added calculated layer '{layer_name}' to plan '{host_plan_name}'"
-        )
+        _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
+        logger.info(f"Added calculated layer '{layer_name}' to plan '{host_plan_name}'")
         return True
 
     @staticmethod
@@ -4804,7 +6729,7 @@ class RasMap:
             host_plan_name: If provided, only search within that specific RASResults
                 block. If None, searches all RASResults blocks and removes the first match.
             delete_script: If True, also delete the ``.rasscript`` file from disk.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             bool: True if the layer was found and removed, False if not found.
@@ -4817,7 +6742,7 @@ class RasMap:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         if not rasmap_path.exists():
             logger.warning(f"RASMapper file not found: {rasmap_path}")
             return False
@@ -4845,11 +6770,16 @@ class RasMap:
         # Find and remove
         for results_layer in search_layers:
             for child in results_layer.findall("Layer"):
-                if child.get("Type") == "CalculatedLayer" and child.get("Name") == layer_name:
+                if (
+                    child.get("Type") == "CalculatedLayer"
+                    and child.get("Name") == layer_name
+                ):
                     script_filename = child.get("Filename", "")
                     results_layer.remove(child)
 
-                    tree.write(rasmap_path, encoding='utf-8', xml_declaration=False)
+                    _write_ras_xml(
+                        tree, rasmap_path, encoding="utf-8", xml_declaration=False
+                    )
                     logger.info(
                         f"Removed calculated layer '{layer_name}' from "
                         f"'{results_layer.get('Name')}'"
@@ -4860,7 +6790,8 @@ class RasMap:
                         script_rel = script_filename.replace("\\", "/").lstrip("./")
                         script_path = ras_obj.project_folder / script_rel
                         script_path.unlink(missing_ok=True)
-                        logger.info(f"Deleted script file: {script_path}")
+                        logger.debug("Deleted script file: %s", script_path.name)
+                        logger.debug("Deleted script path: %s", script_path)
 
                     return True
 
@@ -4900,7 +6831,7 @@ class RasMap:
                 Default: ``"CompareWSE_{tag}"``.
             host_plan: Which plan to host the calculated layer under — ``"proposed"``
                 (default) or ``"existing"``.
-            ras_object: Optional RasPrj object instance.
+            ras_object (RasPrj, optional): Optional RasPrj object instance.
 
         Returns:
             List[str]: Names of successfully created layers.
@@ -4939,7 +6870,9 @@ class RasMap:
         for pair in plan_pairs:
             for key in ("exist_plan", "prop_plan", "tag"):
                 if key not in pair:
-                    raise ValueError(f"Missing required key '{key}' in plan_pairs entry: {pair}")
+                    raise ValueError(
+                        f"Missing required key '{key}' in plan_pairs entry: {pair}"
+                    )
             if pair["exist_plan"] not in plan_names:
                 raise ValueError(
                     f"Existing plan '{pair['exist_plan']}' not found in .rasmap Results. "
@@ -4952,7 +6885,7 @@ class RasMap:
                 )
 
         # Validate terrain names exist
-        rasmap_path = ras_obj.project_folder / f"{ras_obj.project_name}.rasmap"
+        rasmap_path = expected_rasmap_path(ras_obj.project_folder, ras_obj.project_name)
         terrain_names = RasMap.get_terrain_names(rasmap_path)
         for t_name in (exist_terrain, prop_terrain):
             if t_name not in terrain_names:
@@ -4998,9 +6931,11 @@ class RasMap:
 
             if success:
                 created.append(layer_name)
-                logger.info(f"Created WSE comparison layer: {layer_name}")
+                logger.debug("Created WSE comparison layer: %s", layer_name)
             else:
                 logger.warning(f"Failed to create layer: {layer_name}")
 
-        logger.info(f"Created {len(created)} of {len(plan_pairs)} WSE comparison layers")
+        logger.info(
+            f"Created {len(created)} of {len(plan_pairs)} WSE comparison layers"
+        )
         return created

@@ -7,7 +7,7 @@
 <p align="center">
   <strong>An open-source project of <a href="https://clbengineering.com/">CLB Engineering Corporation</a></strong><br>
   <em>LLM-Forward Engineering Solutions</em><br>
-  <a href="https://ras-commander.readthedocs.io/">RAS Commander Documentation</a>
+  <a href="https://rascommander.info/ras/">RAS Commander Documentation</a>
 </p>
 
 ---
@@ -17,6 +17,71 @@ RAS Commander is a Python library for automating HEC-RAS operations, providing a
 This library was initially conceptualized in the Australian Water School course "AI Tools for Modelling Innovation", and subsequently expanded to cover much of the basic functionality of the HECRASController COM32 interface using open-source python libraries and extend python tooling to the 6.x series of HEC-RAS. This library uses a Test Driven Development strategy, leveraging the publicly-available HEC-RAS Example projects to create repeatable demonstration examples. The "Commander" moniker is inspired by the "Command Line is All You Need" approach to HEC-RAS automation that was first implemented in the HEC-Commander Tools repository.
 
 **March 2026 Update:** RAS Commander now supports a fully agentic engineering experience using CLI coding agents and agent SDK's to extend library functions and assist H&H engineers with common modeling tasks such as importing external data, performing QAQC reviews, validating project file paths, AEP and historic storm modeling, or any of the other functionality supported by, or imminently extendable from existing functions, in composable long form agentic workflows. Agents are instructed to work with humans in the loop: demonstrating their steps, maintaining modeling logs, and creating reproducible deliverables that can be externally verified directly in the HEC-RAS GUI. Long term memory is arranged in a hierarchical knowledge structure with progressive disclosure. Agents, skills, rules and cognitive memory systems are included to assist the user with solidifying LLM-written code into deterministic workflows in a continual learning loop, along with a file-based memory system to assist with long term task planning and execution across many conversations and subagents.
+
+## Native Rust HDF engine
+
+ras-commander reads HEC-RAS HDF files (plan results, geometry, terrain and
+land-cover sidecars) through its native HDF engine, written in Rust and
+published as
+[`ras-commander-fast-hdf`](https://github.com/gpt-cmdr/ras-commander-fast-hdf)
+(MIT). `pip install ras-commander` installs it automatically on Windows x64,
+Linux x64 and macOS arm64; no extra and no code changes are needed.
+
+- **Identical results.** Public `Hdf*` methods return the same values, dtypes,
+  columns, index, CRS, attributes and exceptions as the h5py reference
+  implementation. On Windows and Linux this was checked on 201 public method
+  cases across 137 HEC-RAS 5.x–7.x files (3,800 method × file pairs).
+- **Faster on large models.** Against ras-commander 0.106.1 (before the
+  engine), ras-commander 0.110.1 is 46× faster at building 2D cell polygons,
+  10–16× faster at per-cell and per-face summaries, 7–8× faster at mesh time
+  series on the largest test models, and over 700× faster at the
+  fluvial-pluvial boundary on an 18,066-cell mesh; small calls stay within a few milliseconds
+  ([Performance](https://rascommander.info/fasthdf/performance/)). This makes it practical to extract results from many
+  large 2D models for flood science, research and new kinds of analysis.
+- **h5py fallback.** In the default `auto` mode, any read the engine refuses,
+  and any method not yet proven on the test corpus, uses h5py. Set
+  `RAS_COMMANDER_FAST_HDF=h5py` to turn the engine off. On platforms without
+  a wheel, the engine is not installed and every read uses h5py.
+
+See [Native Rust HDF engine](https://rascommander.info/ras/native-engine/) for
+modes, qualification evidence, performance and limitations.
+
+## Native Rust mapping engine
+
+`RasFim` uses the separate
+[`ras-commander-fast-map`](https://github.com/gpt-cmdr/ras-commander-fast-map)
+engine for horizontal and sloping Depth/WSE mapping of computed physical 2D
+cells. Install `ras-commander[fim]` for its Windows/Linux x64 wheel and Python
+preparation/delivery stack. The compatible command remains `ras2fim-batch`.
+Rust consumers can use the crate or `cargo install ras-commander-fast-map --locked`.
+
+Mapping supports bbox/polygon masks, shared terrain, bounded timestep concurrency,
+and optional cell-face/depth-weighted sloping. Models with 1D river/cross-section
+geometry are rejected. The Rust mapping engine does not require Python, GDAL
+or HEC-RAS; the Commander workflow uses Python for HDF preparation and GeoTIFF
+delivery. Preparing missing stored corner elevations remains an explicit
+Windows/HEC-RAS/pythonnet operation.
+
+See the [Mapping Engine guide](https://rascommander.info/ras/native-mapping-engine/)
+for installation, per-model comparisons, exact-match scopes and terrain-layout
+requirements. The engine's numerical modules are unchanged by this packaging
+extraction; existing timing observations are not new distribution benchmarks.
+
+## Docker, Slurm, and Apptainer
+
+Use `RasDocker` for Wine preprocessing and native Linux unsteady computation
+on Windows or Linux, `RasApptainer` for one prepared native unsteady plan per
+Slurm allocation, or `RasSlurm` for portable execution request pools.
+
+- [Choose an execution backend](https://rascommander.info/ras/user-guide/execution-backends/)
+- [Docker setup and two-stage workflow](https://rascommander.info/ras/user-guide/container-execution/)
+- [Docker Hub images, digests, and qualification](https://rascommander.info/ras/user-guide/container-images/)
+- [Slurm + Apptainer tutorial](https://rascommander.info/ras/user-guide/slurm-apptainer-execution/)
+- [Portable Slurm execution](https://rascommander.info/ras/user-guide/slurm-portable-execution/)
+
+Published matching Wine/native image pairs cover HEC-RAS 6.5, 6.6, and 7.0.1
+on linux/amd64. Docker qualification and live qualification of a specific
+Slurm/SIF workflow are separate; see each guide's limits.
 
 ## LLM Forward Engineering
 
@@ -32,11 +97,11 @@ This library was developed using the **[LLM Forward](https://clbengineering.com/
 - **Multi-Level Verifiability** -- HEC-RAS GUI review + visual outputs + code audit trails
 - **Human-in-the-Loop** -- Licensed professionals in responsible charge at all times
 
-See [LLM Forward Development](https://ras-commander.readthedocs.io/en/latest/development/llm-development/) for full philosophy and best practices.
+See [LLM Forward Development](https://rascommander.info/ras/development/llm-development/) for full philosophy and best practices.
 
-[![Documentation Status](https://readthedocs.org/projects/ras-commander/badge/?version=latest)](https://ras-commander.readthedocs.io/en/latest/?badge=latest)
+[![Documentation](https://img.shields.io/badge/docs-rascommander.info-1a365d)](https://rascommander.info/ras/)
 
-**[📖 Full Documentation](https://ras-commander.readthedocs.io/)** | *[ASFPM Presentation](https://drive.google.com/file/d/1kX0twae8NrpLwR0iQ0Dmd8zAXdq-pYXD/view)* | **[CLB Engineering](https://clbengineering.com/)**
+**[📖 Full Documentation](https://rascommander.info/ras/)** | *[ASFPM Presentation](https://drive.google.com/file/d/1kX0twae8NrpLwR0iQ0Dmd8zAXdq-pYXD/view)* | **[CLB Engineering](https://clbengineering.com/)**
 
 ## Repository Author
 
@@ -54,7 +119,7 @@ This repository has several methods of interaction with Large Language Models an
 
 2. **Codex Support**: Codex reads the canonical `AGENTS.md` hierarchy directly. Shared skills can be exposed through the generated `.agents/skills/` bridge without copying skill content. Claude Code and Codex are the production harnesses for this repository; other tools may still read the markdown context but are not the standard setup.
 
-3. **[Full Documentation on ReadTheDocs](https://ras-commander.readthedocs.io/)**: Comprehensive API documentation, user guides, and example notebooks. Includes installation guide, quick start, and detailed class references.
+3. **[Full Documentation](https://rascommander.info/ras/)**: Comprehensive API documentation, user guides, and example notebooks. Includes installation guide, quick start, and detailed class references.
 
 4. **[RAS Commander Library Assistant on ChatGPT](https://chatgpt.com/g/g-TZRPR3oAO-ras-commander-library-assistant)** _(Deprecated - CLI agents preferred)_: This GPT is no longer actively maintained. For the best experience, use Claude Code or other CLI agents with the repository's built-in cognitive infrastructure.
 
@@ -149,7 +214,7 @@ RAS ASCII File Operations
 
 Note about support for Pipe Networks:  As a relatively new feature, only read access to Pipe Network geometry and results data has been included.  Users will need to code their own methods to modify/add pipe network data, and pull requests are always welcome to incorporate this capability.
 
-Note about version support: The modern HDF-based features target HEC-RAS 6.2+ for optimal compatibility. For legacy versions (3.1, 4.1, 5.0.x), use the RasControl class which provides COM-based access to steady state profile extraction and plan execution (see example notebook 17).
+Note about version support: The modern HDF-based features target HEC-RAS 6.2+ for optimal compatibility. HEC-RAS 5.0.x plan execution is supported through the version-aware `RasCmdr.compute_plan()` command path. For HEC-RAS 3.1/4.1 and legacy steady-profile extraction, use the COM-based `RasControl` class (see [notebook 121](examples/121_legacy_hecrascontroller_and_rascontrol.ipynb)).
 
 ## Installation
 
@@ -165,6 +230,23 @@ pip install ras-commander[all]
 pip install --upgrade ras-commander
 ```
 
+The standard install provides project inventory and direct HDF access, with
+the native Rust HDF engine on Windows x64, Linux x64 and macOS arm64.
+Downloading example projects with `RasExamples` and running the example
+notebooks need the `full` extra (`pip install "ras-commander[full]"`). For a
+lean batch runner that also executes plans through `RasCmdr.compute_plan()`, use:
+
+```bash
+pip install --upgrade "ras-commander[compute]"
+```
+
+The `compute` surface excludes RasControl/COM and the geospatial and plotting
+stacks. HDF result functions that return xarray objects or GeoDataFrames need
+the `full` extra; use `pip install "ras-commander[compute,full]"` to run plans
+and extract those results in one environment. It does not bypass ras-commander: `RasCmdr` still constructs and owns
+the HEC-RAS command-line execution, message handling, verification options, and
+normal post-compute DataFrame refreshes.
+
 If you have dependency issues with pip (especially if you have errors with numpy), try clearing your local pip packages `C:\Users\your_username\AppData\Roaming\Python\` and then creating a new virtual environment.
 
 ### Extras
@@ -173,8 +255,11 @@ Install only what you need using pip extras:
 
 | Extra | What it adds | Install command |
 |-------|-------------|-----------------|
-| `all` | Everything below | `pip install ras-commander[all]` |
-| `remote-all` | All remote backends (SSH, WinRM, Docker, AWS, Azure) | `pip install ras-commander[remote-all]` |
+| `compute` | Lean command-line plan execution and process supervision (no RasControl/COM) | `pip install ras-commander[compute]` |
+| `execution` | Alias for `compute` | `pip install ras-commander[execution]` |
+| `full` | Historical ras-commander feature dependency set | `pip install ras-commander[full]` |
+| `all` | Full feature set plus every optional integration below | `pip install ras-commander[all]` |
+| `remote-all` | All remote worker dependencies (Docker, plus paramiko for SSH-hosted Docker staging) | `pip install ras-commander[remote-all]` |
 | `gui` | GUI automation & screenshots (Pillow) | `pip install ras-commander[gui]` |
 | `usgs` | USGS gauge data (dataretrieval) | `pip install ras-commander[usgs]` |
 | `notebooks` | Example notebook deps (rasterio, pyproj, aiohttp, dataretrieval) | `pip install ras-commander[notebooks]` |
@@ -185,7 +270,12 @@ Combine extras as needed: `pip install ras-commander[notebooks,usgs,dss]`
 
 ### Core Dependencies (installed automatically)
 
-h5py, numpy, pandas, requests, tqdm, scipy, xarray, geopandas, matplotlib, shapely, rasterstats, rtree, fsspec, hms-commander, psutil, and pywin32 (Windows only).
+h5py, numpy, pandas, and, on Windows x64, Linux x64 and macOS arm64, the
+native HDF engine `ras-commander-fast-hdf`. The former `fast` and `fast-hdf`
+extras are no longer needed; they remain so existing install commands keep
+working. The `compute` extra adds psutil and pywin32 on
+Windows for process and dialog supervision. Install `full` or `all` for the
+geospatial, plotting, scientific, precipitation, and remote-data feature stack.
 
 Note: `pathlib` is built into Python 3.4+ and does not need to be installed separately.
 
@@ -285,7 +375,16 @@ RasPlan.set_geom("01", "02")
 
 RAS Commander provides multiple methods for executing HEC-RAS plans:
 
-#### Modern Command-Line Execution (HEC-RAS 6.0+)
+#### Command-Line Execution (HEC-RAS 5.0+)
+
+`RasCmdr.compute_plan()` owns the version-specific command layout. HEC-RAS 5.x
+uses the project-first form and runs the project's current plan; ras-commander
+sets the requested plan current before launch. HEC-RAS 6.0+ uses the explicit
+`-c`, project, and plan form. For unattended Windows runs, the Terms and
+Conditions of Use must be accepted for the exact installed release and current
+user; a definitively unaccepted release fails preflight before launch. A
+model's features may still require a newer HEC-RAS release independently of
+the command layout.
 
 **Single Plan Execution:**
 ```python
@@ -327,7 +426,7 @@ RasCmdr.compute_plan("01")  # Skips if HDF newer than inputs
 RasCmdr.compute_plan("01", force_rerun=True)  # Always executes
 
 # Force complete geometry reprocessing
-RasCmdr.compute_plan("01", force_geompre=True)  # Clears .g##.hdf + .c##
+RasCmdr.compute_plan("01", force_geompre=True)  # Clears caches in place; always executes
 
 # Efficiency: 10 plans, only 2 modified → 80% time savings
 RasCmdr.compute_parallel(["01", ..., "10"])  # Runs only modified plans
@@ -594,12 +693,12 @@ These examples demonstrate practical applications of RAS Commander for automatin
 
 ## Documentation
 
-For detailed usage instructions and API documentation, visit the **[RAS Commander Documentation](https://ras-commander.readthedocs.io/)**:
+For detailed usage instructions and API documentation, visit the **[RAS Commander Documentation](https://rascommander.info/ras/)**:
 
-- [Installation Guide](https://ras-commander.readthedocs.io/en/latest/getting-started/installation/)
-- [Quick Start](https://ras-commander.readthedocs.io/en/latest/getting-started/quickstart/)
-- [User Guide](https://ras-commander.readthedocs.io/en/latest/user-guide/overview/)
-- [API Reference](https://ras-commander.readthedocs.io/en/latest/api/)
+- [Installation Guide](https://rascommander.info/ras/getting-started/installation/)
+- [Quick Start](https://rascommander.info/ras/getting-started/quickstart/)
+- [User Guide](https://rascommander.info/ras/user-guide/overview/)
+- [API Reference](https://rascommander.info/ras/api/)
 
 ## Future Development
 
@@ -610,7 +709,7 @@ The ras-commander library is an ongoing project embodying LLM Forward engineerin
 - Enhanced verifiability and interpretability features for engineering review
 - Community-driven development of new modules following LLM Forward best practices
 
-See [LLM Forward Development Philosophy](https://ras-commander.readthedocs.io/en/latest/development/llm-development/) for contribution guidelines.
+See [LLM Forward Development Philosophy](https://rascommander.info/ras/development/llm-development/) for contribution guidelines.
 
 ## Related Resources
 
@@ -621,7 +720,17 @@ See [LLM Forward Development Philosophy](https://ras-commander.readthedocs.io/en
 
 ## Style Guide
 
-This project follows a specific style guide to maintain consistency across the codebase. Please refer to the [Contributing Guide](https://ras-commander.readthedocs.io/en/latest/development/contributing/) for details on coding conventions, documentation standards, and best practices.
+This project follows a specific style guide to maintain consistency across the codebase. Please refer to the [Contributing Guide](https://rascommander.info/ras/development/contributing/) for details on coding conventions, documentation standards, and best practices.
+
+## Cite and Support RAS Commander
+
+Using RAS Commander? Please consider citing the library in published work or
+mentioning it when sharing results. Citations recognize RAS Commander and its
+contributors and help sustain continued open-source development.
+
+- [Citation, acknowledgment, and sharing guidance](https://rascommander.info/ras/cite/)
+- [Structured citation metadata](CITATION.cff)
+- [Contribute reusable improvements upstream](CONTRIBUTING.md)
 
 ## Acknowledgments
 
@@ -649,7 +758,7 @@ These acknowledgments recognize the contributions and inspirations that have hel
 
 6. Attribution: Glenn Heistand's [`ras-agent`](https://github.com/gheistand/ras-agent) (CHAMP -- Illinois State Water Survey) -- an automated HEC-RAS pipeline that converts pour points into flood maps. The ras-agent pipeline's Linux execution patterns (`runner.py`), HDF results extraction (`results.py`), and Cloud-Optimized GeoTIFF rasterization directly informed the development of several ras-commander methods including `RasCmdr.compute_plan_linux()`, `HdfResultsMesh.get_mesh_max_depth()`, `HdfResultsMesh.export_max_depth_raster()`, `RasUtils.dos2unix()`, and `HdfBase.strip_results()`.
 
-7. Attribution and Contribution: Gyan Basyal's [`pydsstools`](https://github.com/gyanz/pydsstools) and [`rivia`](https://github.com/gyanz/rivia) packages. Gyan's pydsstools was particularly influential in ras-commander's DSS handling approach -- its cross-version DSS6/DSS7 support philosophy, HEC epoch time conversion pattern, catalog-based lazy loading design, and TimeSeriesContainer wrapping informed the architecture of ras-commander's `RasDss` module. Gyan's rivia package is the source of the StoreAllMaps approach implemented in the ras-commander RasProcess module. 
+7. Attribution and Contribution: Gyan Basyal's [`pydsstools`](https://github.com/gyanz/pydsstools) and [`rivia`](https://github.com/gyanz/rivia) packages. Gyan's pydsstools was particularly influential in ras-commander's DSS handling approach -- its cross-version DSS6/DSS7 support philosophy, HEC epoch time conversion pattern, catalog-based lazy loading design, and TimeSeriesContainer wrapping informed the architecture of ras-commander's `RasDss` module. Gyan's rivia package is the source of the StoreAllMaps approach implemented in the ras-commander RasProcess module. Rivia's elegant spatial, profile, velocity, and flow query functions also provided the conceptual basis for `HdfResultsQuery`. We gratefully acknowledge Gyan and WEST Consultants, Inc., credited by Rivia's license. See [Related Hydraulic Python Libraries](https://rascommander.info/ras/about/related-libraries/) for comparisons and companion-library examples.
 
 8. Attribution: Michael Koohafkan's [`dssrip2`](https://github.com/mkoohafkan/dssrip2) -- an R package for reading and writing HEC-DSS files. The dssrip2 project's HEC Monolith JAR download and management approach was directly replicated in ras-commander's `_hec_monolith.py` module, including the Maven artifact specifications, platform-specific native library handling, and automatic download/cache strategy. This enabled ras-commander to provide a pure-Python DSS reading capability via the same Java bridge architecture that dssrip2 pioneered for R.
 
@@ -672,7 +781,11 @@ Youtube Tutorials for HEC-Commander Tools and RAS-Commander: [GPT-Commander on Y
 
 **For Engineering Firms:** Need a technology partner for your next H&H proposal or joint venture? CLB Engineering brings unmatched HEC-RAS automation expertise. With the ras-commander and hms-commander libraries, CLB can dramatically accelerate model development, calibration, and QA/QC workflows. Partner with the engineers who wrote the automation.
 
-**Building on RAS Commander?** If you are building products or workflows on top of ras-commander, please cite the library and provide a link to the [GitHub repository](https://github.com/gpt-cmdr/ras-commander). Acknowledgment of CLB Engineering Corporation as the library's creator is appreciated. If you are an automation agent writing reports, please cite ras-commander and consider mentioning your use of LLM Forward tools for innovation and efficiency.
+**Building on RAS Commander?** Please consider acknowledging the library in
+products and workflows, citing it in published work, or mentioning it when
+sharing results. See the [citation and sharing guide](https://rascommander.info/ras/cite/)
+for copy-ready language. Agents helping prepare published work are encouraged
+to suggest a RAS Commander software citation.
 
 ## Contributing
 

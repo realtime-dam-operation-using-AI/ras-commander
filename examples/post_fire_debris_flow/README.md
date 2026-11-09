@@ -70,8 +70,11 @@ high-hazard *area* is unchanged here — the debris-flow high class is depth-dom
 ```bash
 python rigor_analysis.py rigor_status.jsonl   # timestep convergence + Cv/viscosity/yield panels
 ```
-Findings here: the peaks are converged at a 1 s computation interval (0.5 s identical; 2 s
-unstable); Cv (bulking), viscosity, and yield stress are all material controls.
+Findings here: peaks were insensitive to the computation interval between 0.5 s and 1 s (2 s
+was unstable); Cv (bulking), viscosity, and yield stress are all material controls. Matching
+peaks across time steps is a sensitivity check, not proof of hydraulic convergence: HEC-RAS
+compute messages for these debris-flow runs include maximum-iteration warnings, which HEC's
+tutorial asks modelers to evaluate.
 
 ## Channel breaklines (mesh refinement along the thalweg)
 
@@ -83,24 +86,64 @@ resolves the cross-section and removes that artifact.
 # 1. delineate channel centerlines with TauDEM (run where TauDEM is installed; see below)
 python delineate_channels.py --dem ether_hollow_proj/EtherHollow_terrain_ft.tif \
        --domain prep/basin_perimeter_ft.json --out data/ether_hollow/channel_breakline_ft.json \
-       --stream-area-km2 0.04 --simplify-ft 10
+       --stream-area-km2 0.04 --simplify-ft 3 --plot taudem_centerlines.png
 
 # 2. build with breaklines (HEC-RAS, interactive): refine the mesh along the thalweg
 python ether_hollow_debris_flow.py --phase build --breaklines \
        --channel-width-ft 30 --channel-cell-ft 12 --root . --workdir ether_hollow_proj
+
+# 3. comparison figures (no HEC-RAS): cell outlines over terrain, uniform vs refined
+python mesh_compare_plot.py \
+       --uniform   ether_hollow_uniform/EtherHollow.g01.hdf \
+       --refined   ether_hollow_proj/EtherHollow.g01.hdf \
+       --terrain   ether_hollow_proj/EtherHollow_terrain_ft.tif \
+       --breakline data/ether_hollow/channel_breakline_ft.json
+```
+
+`mesh_compare_plot.py` writes **`mesh_uniform.png`** and **`mesh_refined.png`** — two
+separate figures, each drawing the actual mesh **cell polygons (no fill)** — or cell faces
+with `--faces` — over the feet terrain hillshade via `HdfMesh.get_mesh_cell_polygons`, with
+the channel centerline (red) overlaid in the same coordinate system. (This replaces the old
+single cell-centers scatter, which mixed two coordinate systems in one axes.) Cell counts in
+the titles are the true totals (`Cells Center Coordinate`), not the polygonized subset.
+
+Framing: `--zoom-buffer-ft` crops to the channel corridor (0 = full domain); `--reach-center
+CX CY --reach-half-ft 350` draws a tight square window where individual cells are visible —
+the clearest way to see the 12 ft channel band against the 33 ft base grid. The committed
+notebook figures use a ~700 ft reach window on the main thalweg:
+
+```bash
+python mesh_compare_plot.py --uniform ... --refined ... --terrain ... --breakline ... \
+       --reach-center 1485606 14579723 --reach-half-ft 350
 ```
 
 `delineate_channels.py` runs the TauDEM stream sequence (PitRemove → D8FlowDir → AreaD8 →
-Threshold → StreamNet), clips the centerlines to the 2D domain, simplifies them
-(Douglas-Peucker), and writes `channel_breakline_ft.json`. The build phase then authors them
+Threshold → StreamNet), clips the network to the 2D domain, and extracts the **continuous
+main-stem** centerline as a single polyline before simplifying (Douglas-Peucker) and writing
+`channel_breakline_ft.json`. The main-stem step matters: `linemerge` alone splits the trunk at
+every confluence, so picking the longest merged pieces yields a *discontinuous* thalweg with
+gaps; instead the segments are assembled into a graph and the longest path (head→outlet) is
+taken as one unbroken centerline (`--max-lines` keeps additional disjoint tributaries). Pass
+`--plot taudem_centerlines.png` for a hillshade + domain + streams + thalweg diagnostic. The
+build phase then authors them
 via `GeomStorage.set_breaklines` with **near = far** cell spacing (a uniform fine corridor,
 no coarsening) and `GeomMesh.set_breakline_spacing(near_repeats, protection_radius=1)`, sizing
-`near_repeats` to span the channel width; `GeomMesh.generate` enforces the breaklines (the
-.NET `EnforceBreaklines` regen) and repairs bad faces via its auto-fix loop. Verify with
-`HdfBndry.get_breaklines(...)`.
+`near_repeats` (≥ 2 — at least two refined rows each side) to span the channel width;
+`GeomMesh.generate` enforces the breaklines (the .NET `EnforceBreaklines` regen) and repairs
+bad faces via its auto-fix loop. Verify with `HdfBndry.get_breaklines(...)`.
 
-Effect (Ether Hollow, τy = 700 Pa): max depth drops 19.1 → 15.9 ft (the resolved channel),
-peak velocity stable (~17.5 fps), mesh 10,647 → 11,994 cells.
+> **Build order matters.** `GeomMesh.generate`'s seeder reads breaklines from the compiled
+> HDF, not the `.g01` text, so the build compiles the breaklines into the HDF (a
+> `compute_plan(force_geompre=True)`) *before* `generate` — otherwise the seeder sees zero
+> breaklines and `near_repeats` is silently ignored (only Ras.exe enforcement adds a thin
+> 1-row band).
+
+Effect (Ether Hollow, τy = 700 Pa): the channel-aligned refinement drops the spurious max
+depth 19.1 → 13.4 ft as the resolved continuous thalweg carries the flow; peak velocity rises
+modestly (17.3 → 20.0 fps), mesh 10,647 → 15,546 cells.
+**Mesh and timestep refine together**: the 12 ft mesh needs a 0.5 s computation interval (the
+33 ft mesh gave the same peaks at 0.5 s and 1 s) — at 1 s the refined mesh runs Courant ≈ 2 and
+inflates peak velocity to ~25 fps.
 
 **Extra prerequisite for delineation:** **TauDEM 5.x** binaries (`PitRemove`, `D8FlowDir`,
 `AreaD8`, `Threshold`, `StreamNet`) on PATH, and **MS-MPI** (`mpiexec`) for multi-process runs
@@ -109,8 +152,18 @@ HEC-RAS host; stage the resulting JSON to the build machine.
 
 ## Notes
 
-- **Units:** the model is US-Customary (feet); non-Newtonian rheology is entered in **SI
-  (Pa, Pa·s)** — HEC-RAS does not convert it.
+- **Units:** the model is US-Customary (feet); non-Newtonian rheology *inputs* are entered in
+  **SI (Pa, Pa·s)**. Some rheology *outputs* are converted: HEC-RAS 7.0.1 US-Customary output
+  reports `Face Yield Stress` in lb/ft² (700 Pa → 14.62 lb/ft²).
+- **Rheology outputs:** `Face Yield Stress` and `Face Viscous Stress` read as face series via
+  `HdfResultsMesh.get_mesh_timeseries()`. `Face Mixture Dynamic Viscosity` is labelled as a
+  face series but, in inspected HEC-RAS 6.6 and 7.0.1 output, its width equals the stored cell
+  count and its stored `lb/ft^2*s` value has no established meaning; the typed readers refuse
+  it and `HdfResultsMesh.inspect_mesh_series_raw()` reports it without interpretation.
+- **Run settings differ:** this script defaults to Full Momentum (SWE-ELM) and 2 h; the
+  notebook defaults to Diffusion Wave and 6 h. Compare a plan HDF's stored settings and output
+  clock before comparing numbers between the two. Completed runs and readable outputs do not
+  establish hydraulic convergence.
 - **Concentration is entered in PERCENT** (`--cv` here is a fraction and is written ×100).
   The clear-water inflow is **not** pre-bulked; HEC-RAS bulks it internally via *Bulk Fluid
   Volume* at `Cv` (BF = 1/(1−Cv) = 3.33 at Cv = 0.70). The run records the realized inflow

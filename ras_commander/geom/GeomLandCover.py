@@ -13,7 +13,9 @@ List of Functions:
 - replace_base_mannings_n() - Replace or create a base Manning's n class table
 - get_region_mannings_n() - Read Manning's n region overrides
 - set_region_mannings_n() - Write regional Manning's n overrides
-- override_2d_mannings_n() - EXPERIMENTAL: Override preprocessed Manning's n in geometry HDF
+- set_mannings_region_polygons() - Write regional Manning's n polygon geometry
+- override_2d_mannings_n() - Fail-closed legacy name; use durable text
+  setters, native property-table recomputation, and final-result auditing
 
 Example Usage:
     >>> from ras_commander import GeomLandCover, RasPlan
@@ -28,12 +30,15 @@ Example Usage:
     >>> GeomLandCover.set_base_mannings_n(geom_path, mannings_df)
 """
 
+import math
 from pathlib import Path
 from typing import Any, Optional, Union
 import pandas as pd
 
+from .._ras_text import _write_ras_text
 from ..LoggingConfig import get_logger
 from ..Decorators import log_call
+from .GeomParser import GeomParser
 
 logger = get_logger(__name__)
 
@@ -72,6 +77,27 @@ class GeomLandCover:
         'Mannings n',
     )
 
+    _REGION_NAME_COLUMNS = (
+        'Name',
+        'Region Name',
+        'region_name',
+        'name',
+    )
+
+    _REGION_COORD_FIELD_WIDTH = 16
+    _REGION_COORD_VALUES_PER_LINE = 4
+
+    _REGION_FOLLOWING_PREFIXES = (
+        'LCMann Table=',
+        'LCMann Time=',
+        'LCMann Region Time=',
+        'Chan Stop',
+        'Geom Raster',
+        'GIS ',
+        'Use User',
+        'User Specified',
+    )
+
     @staticmethod
     def _first_existing_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> Optional[str]:
         for candidate in candidates:
@@ -95,16 +121,8 @@ class GeomLandCover:
                 "Manning's n data must include land-cover name and n-value columns"
             )
 
-        if table_number is None:
-            if 'Table Number' in df.columns and not df['Table Number'].dropna().empty:
-                table_number = str(df['Table Number'].dropna().iloc[0])
-            else:
-                table_number = "16"
-        table_number = str(table_number)
-
         normalized = pd.DataFrame(
             {
-                'Table Number': table_number,
                 'Land Cover Name': df[name_col].astype(str).str.strip(),
                 'Base Mannings n Value': pd.to_numeric(df[value_col], errors='coerce'),
             }
@@ -115,7 +133,300 @@ class GeomLandCover:
         ].copy()
         if normalized.empty:
             raise ValueError("Manning's n table has no writable rows")
-        return table_number, normalized
+
+        row_count = len(normalized)
+        if table_number is not None:
+            try:
+                expected_count = int(table_number)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("table_number must be an integer row count") from exc
+            if expected_count != row_count:
+                raise ValueError(
+                    "table_number must equal the number of writable Manning's n "
+                    f"rows ({row_count}), got {expected_count}"
+                )
+
+        row_count_text = str(row_count)
+        normalized.insert(0, 'Table Number', row_count_text)
+        return row_count_text, normalized
+
+    @staticmethod
+    def _region_polygon_count(line: str) -> int:
+        value = line.split("=", 1)[1].strip()
+        return int(value.split(",", 1)[0])
+
+    @staticmethod
+    def _is_region_following_line(line: str) -> bool:
+        stripped = line.strip()
+        return bool(stripped) and any(
+            stripped.startswith(prefix)
+            for prefix in GeomLandCover._REGION_FOLLOWING_PREFIXES
+        )
+
+    @staticmethod
+    def _parse_region_coord_values(line: str) -> list[float]:
+        """Parse one fixed-width Manning's region polygon coordinate line."""
+        stripped = line.strip()
+        if not stripped:
+            return []
+
+        try:
+            fixed_values = GeomParser.parse_fixed_width(
+                line,
+                column_width=GeomLandCover._REGION_COORD_FIELD_WIDTH,
+            )
+        except Exception:
+            fixed_values = []
+
+        split_values = []
+        parts = stripped.split()
+        if len(parts) > 1:
+            try:
+                split_values = [float(part) for part in parts]
+            except ValueError:
+                split_values = []
+
+        return fixed_values if len(fixed_values) >= len(split_values) else split_values
+
+    @staticmethod
+    def _region_polygon_data_end(lines: list[str], polygon_idx: int) -> int:
+        """Return the exclusive end index for an ``LCMann Region Polygon`` block."""
+        try:
+            point_count = GeomLandCover._region_polygon_count(lines[polygon_idx])
+        except (IndexError, ValueError):
+            return polygon_idx + 1
+
+        required_values = point_count * 2
+        values_read = 0
+        idx = polygon_idx + 1
+
+        while idx < len(lines) and values_read < required_values:
+            stripped = lines[idx].strip()
+            if (
+                stripped.startswith("LCMann")
+                or GeomLandCover._is_region_following_line(lines[idx])
+            ):
+                break
+
+            values = GeomLandCover._parse_region_coord_values(lines[idx])
+            if stripped and not values:
+                break
+            values_read += len(values)
+            idx += 1
+
+        return idx
+
+    @staticmethod
+    def _find_region_blocks(lines: list[str]) -> list[dict[str, Any]]:
+        """Locate Manning's n region blocks and their optional polygon ranges."""
+        starts: list[tuple[int, str]] = []
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("LCMann Region Name="):
+                starts.append((idx, stripped.split("=", 1)[1].strip()))
+
+        blocks: list[dict[str, Any]] = []
+        for pos, (start_idx, name) in enumerate(starts):
+            next_region_idx = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
+            end_idx = next_region_idx
+            polygon_idx = None
+            polygon_end_idx = None
+
+            idx = start_idx + 1
+            while idx < next_region_idx:
+                stripped = lines[idx].strip()
+                if stripped.startswith("LCMann Region Polygon="):
+                    polygon_idx = idx
+                    polygon_end_idx = GeomLandCover._region_polygon_data_end(lines, idx)
+                    idx = polygon_end_idx
+                    continue
+
+                if GeomLandCover._is_region_following_line(lines[idx]):
+                    end_idx = idx
+                    break
+                idx += 1
+
+            blocks.append(
+                {
+                    "name": name,
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "polygon_idx": polygon_idx,
+                    "polygon_end_idx": polygon_end_idx,
+                }
+            )
+
+        return blocks
+
+    @staticmethod
+    def _find_region_block(lines: list[str], region_name: str) -> Optional[dict[str, Any]]:
+        matches = [
+            block
+            for block in GeomLandCover._find_region_blocks(lines)
+            if block["name"] == region_name
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple Manning's n region blocks named {region_name!r}; "
+                "duplicate region names cannot be updated unambiguously"
+            )
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _find_region_insert_idx(lines: list[str]) -> int:
+        blocks = GeomLandCover._find_region_blocks(lines)
+        if blocks:
+            return blocks[-1]["end_idx"]
+
+        table_start, table_end, _ = GeomLandCover._find_lcmann_table_bounds(lines)
+        if table_start is not None and table_end is not None:
+            return table_end
+
+        for idx, line in enumerate(lines):
+            if GeomLandCover._is_region_following_line(line):
+                return idx
+        return len(lines)
+
+    @staticmethod
+    def _max_precision_for_field(value: float, column_width: int) -> int:
+        sign_chars = 1 if value < 0 else 0
+        integer_digits = len(str(int(abs(value)))) if abs(value) >= 1 else 1
+        max_precision = max(0, column_width - sign_chars - integer_digits - 1)
+
+        for precision in range(max_precision, -1, -1):
+            if len(f"{value:{column_width}.{precision}f}") <= column_width:
+                return precision
+        return 0
+
+    @staticmethod
+    def _format_region_coord_value(value: float) -> str:
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"Region polygon coordinate must be finite, got {value!r}")
+
+        column_width = GeomLandCover._REGION_COORD_FIELD_WIDTH
+        precision = GeomLandCover._max_precision_for_field(value, column_width)
+        formatted = f"{value:{column_width}.{precision}f}"
+        if len(formatted) > column_width:
+            raise ValueError(
+                f"Region polygon coordinate {value!r} does not fit in "
+                f"{column_width}-character HEC-RAS field"
+            )
+        return formatted
+
+    @staticmethod
+    def _format_region_coord_lines(coords: list[tuple[float, float]]) -> list[str]:
+        flat_values: list[float] = []
+        for x_coord, y_coord in coords:
+            flat_values.extend([float(x_coord), float(y_coord)])
+
+        lines = []
+        values_per_line = GeomLandCover._REGION_COORD_VALUES_PER_LINE
+        for idx in range(0, len(flat_values), values_per_line):
+            row_values = flat_values[idx:idx + values_per_line]
+            lines.append(
+                "".join(
+                    GeomLandCover._format_region_coord_value(value)
+                    for value in row_values
+                ) + "\n"
+            )
+        return lines
+
+    @staticmethod
+    def _polygon_coords_from_geometry(geometry: Any) -> list[tuple[float, float]]:
+        from shapely.geometry import MultiPolygon, Polygon
+
+        if geometry is None or getattr(geometry, "is_empty", False):
+            raise ValueError("Region polygon geometry cannot be empty")
+
+        if isinstance(geometry, Polygon):
+            polygons = [geometry]
+            close_parts = False
+        elif isinstance(geometry, MultiPolygon):
+            polygons = list(geometry.geoms)
+            close_parts = len(polygons) > 1
+        else:
+            geom_type = getattr(geometry, "geom_type", type(geometry).__name__)
+            raise ValueError(
+                "Manning's n region geometry must be a Polygon or MultiPolygon, "
+                f"got {geom_type}"
+            )
+
+        if not polygons:
+            raise ValueError("Region polygon geometry cannot be empty")
+
+        coords: list[tuple[float, float]] = []
+        for polygon in polygons:
+            if polygon.interiors:
+                raise ValueError(
+                    "Plain-text LCMann Region Polygon blocks do not encode "
+                    "interior rings; provide polygons without holes"
+                )
+
+            ring = list(polygon.exterior.coords)
+            if len(ring) > 1 and ring[0] == ring[-1]:
+                ring = ring[:-1]
+            if len(ring) < 3:
+                raise ValueError("Region polygon must have at least three vertices")
+
+            coords.extend((float(x), float(y)) for x, y in ring)
+            if close_parts:
+                coords.append((float(ring[0][0]), float(ring[0][1])))
+
+        return coords
+
+    @staticmethod
+    def _format_region_polygon_block(coords: list[tuple[float, float]]) -> list[str]:
+        return (
+            [f"LCMann Region Polygon={len(coords)}\n"]
+            + GeomLandCover._format_region_coord_lines(coords)
+        )
+
+    @staticmethod
+    def _format_region_table_rows(base_table: pd.DataFrame) -> list[str]:
+        rows = []
+        for _, row in base_table.iterrows():
+            n_value = float(row['Base Mannings n Value'])
+            rows.append(f"{row['Land Cover Name']},{n_value:g}\n")
+        return rows
+
+    @staticmethod
+    def _ensure_region_time_line(lines: list[str], insert_idx: int) -> list[str]:
+        if any(line.strip().startswith("LCMann Region Time=") for line in lines):
+            return lines
+
+        for idx, line in enumerate(lines):
+            if line.strip().startswith("LCMann Time="):
+                return (
+                    lines[:idx + 1]
+                    + ["LCMann Region Time=Dec/30/1899 00:00:00\n"]
+                    + lines[idx + 1:]
+                )
+
+        for idx, line in enumerate(lines):
+            if line.strip().startswith(("LCMann Table=", "LCMann Region Name=")):
+                return (
+                    lines[:idx]
+                    + ["LCMann Region Time=Dec/30/1899 00:00:00\n"]
+                    + lines[idx:]
+                )
+
+        return (
+            lines[:insert_idx]
+            + ["LCMann Region Time=Dec/30/1899 00:00:00\n"]
+            + lines[insert_idx:]
+        )
+
+    @staticmethod
+    def _update_region_time(lines: list[str]) -> list[str]:
+        import datetime
+
+        current_time = datetime.datetime.now().strftime("%b/%d/%Y %H:%M:%S")
+        for idx, line in enumerate(lines):
+            if line.strip().startswith("LCMann Region Time="):
+                lines[idx] = f"LCMann Region Time={current_time}\n"
+                break
+        return lines
 
     @staticmethod
     def _find_lcmann_table_bounds(
@@ -175,6 +486,7 @@ class GeomLandCover:
 
         base_table_rows = []
         table_number = None
+        parse_errors = []
 
         # Read the geometry file
         with open(geom_file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -197,7 +509,7 @@ class GeomLandCover:
             # background raster entries that also contain commas.
             if reading_base_table:
                 _stop = (
-                    not ',' in line
+                    ',' not in line
                     or line.startswith('LCMann')
                     or line.startswith('Chan Stop')
                     or line.startswith('Geom Raster')
@@ -223,9 +535,20 @@ class GeomLandCover:
                 try:
                     base_table_rows.append([table_number, name, float(value)])
                 except ValueError:
-                    # Log the error and continue
-                    logger.warning(f"Error parsing line: {line}")
+                    parse_errors.append(line)
+                    logger.debug(
+                        "Malformed base Manning's n line skipped in %s: %s",
+                        geom_file_path.name,
+                        line,
+                    )
                     continue
+
+        if parse_errors:
+            logger.warning(
+                "Skipped %d malformed base Manning's n line(s) in %s",
+                len(parse_errors),
+                geom_file_path.name,
+            )
 
         # Create DataFrame
         # Note: Column uses "Mannings" (no apostrophe) for simplicity in DataFrame operations,
@@ -335,8 +658,7 @@ class GeomLandCover:
                 break
 
         # Write the updated file
-        with open(geom_file_path, 'w', encoding='utf-8') as f:
-            f.writelines(updated_lines)
+        _write_ras_text(geom_file_path, "".join(updated_lines), encoding="utf-8")
 
         return True
 
@@ -363,9 +685,10 @@ class GeomLandCover:
                 n-values. Accepted name columns include ``Land Cover Name`` and
                 ``class_name``; accepted n-value columns include
                 ``Base Mannings n Value``, ``mannings_n``, and ``n_value``.
-            table_number: Optional ``LCMann Table`` number. Defaults to the
-                first table in the file, the input ``Table Number`` column, or
-                ``16`` for new tables.
+            table_number: Deprecated compatibility argument interpreted as the
+                expected number of writable rows. When provided, it must match
+                the normalized input row count. ``LCMann Table=`` is always
+                authored from the actual emitted row count.
             backup: If True, write ``.bak`` beside the geometry file first.
 
         Returns:
@@ -375,7 +698,7 @@ class GeomLandCover:
         import shutil
 
         geom_file_path = Path(geom_file_path)
-        requested_table_number, normalized = GeomLandCover._normalize_base_table(
+        row_count, normalized = GeomLandCover._normalize_base_table(
             mannings_data,
             table_number=table_number,
         )
@@ -387,20 +710,12 @@ class GeomLandCover:
         with open(geom_file_path, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
 
-        start_idx, end_idx, existing_table_number = GeomLandCover._find_lcmann_table_bounds(
+        start_idx, end_idx, _ = GeomLandCover._find_lcmann_table_bounds(
             lines,
-            table_number=str(table_number) if table_number is not None else None,
+            table_number=None,
         )
-        # If exact table_number wasn't found but one was specified, replace ANY
-        # existing LCMann Table (e.g. disabled "=0") instead of appending a duplicate.
-        if start_idx is None and table_number is not None:
-            start_idx, end_idx, _ = GeomLandCover._find_lcmann_table_bounds(
-                lines, table_number=None,
-            )
-        resolved_table_number = existing_table_number or requested_table_number
-        normalized['Table Number'] = str(resolved_table_number)
 
-        new_content = [f"LCMann Table={resolved_table_number}\n"]
+        new_content = [f"LCMann Table={row_count}\n"]
         for _, row in normalized.iterrows():
             n_value = float(row['Base Mannings n Value'])
             new_content.append(f"{row['Land Cover Name']},{n_value:g}\n")
@@ -428,8 +743,7 @@ class GeomLandCover:
                 updated_lines[i] = f"LCMann Time={current_time}\n"
                 break
 
-        with open(geom_file_path, 'w', encoding='utf-8') as f:
-            f.writelines(updated_lines)
+        _write_ras_text(geom_file_path, "".join(updated_lines), encoding="utf-8")
 
         return True
 
@@ -461,6 +775,7 @@ class GeomLandCover:
         region_rows = []
         current_region = None
         current_table = None
+        parse_errors = []
 
         # Read the geometry file
         with open(geom_file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -483,7 +798,7 @@ class GeomLandCover:
                 continue
 
             # Stop reading when we hit a line without a comma or starting with LCMann
-            if reading_region_table and (not ',' in line or line.startswith('LCMann')):
+            if reading_region_table and (',' not in line or line.startswith('LCMann')):
                 reading_region_table = False
                 continue
 
@@ -501,9 +816,20 @@ class GeomLandCover:
                 try:
                     region_rows.append([current_table, name, float(value), current_region])
                 except ValueError:
-                    # Log the error and continue
-                    logger.warning(f"Error parsing line: {line}")
+                    parse_errors.append(line)
+                    logger.debug(
+                        "Malformed regional Manning's n line skipped in %s: %s",
+                        geom_file_path.name,
+                        line,
+                    )
                     continue
+
+        if parse_errors:
+            logger.warning(
+                "Skipped %d malformed regional Manning's n line(s) in %s",
+                len(parse_errors),
+                geom_file_path.name,
+            )
 
         # Create DataFrame
         if region_rows:
@@ -638,9 +964,139 @@ class GeomLandCover:
                 break
 
         # Write the updated file
-        with open(geom_file_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(geom_file_path, "".join(lines), encoding="utf-8")
 
+        return True
+
+    @staticmethod
+    @log_call
+    def set_mannings_region_polygons(
+        geom_file: Union[str, Path],
+        regions_gdf: Any,
+        create_backup: bool = True,
+    ) -> bool:
+        """
+        Write Manning's n calibration region polygon blocks to a geometry file.
+
+        The plain-text ``.g##`` file is the durable source for Manning's n
+        calibration regions. HEC-RAS regenerates the geometry HDF polygon
+        datasets from these ``LCMann Region Polygon=N`` blocks during geometry
+        preprocessing.
+
+        Args:
+            geom_file: Path to the HEC-RAS geometry text file (``.g##``).
+            regions_gdf: GeoDataFrame-like object with ``Name`` and
+                ``geometry`` columns. Geometry values must be Shapely Polygon
+                or MultiPolygon objects in the project coordinate system.
+                MultiPolygon exteriors are written as consecutive closed rings
+                because the plain-text block has no explicit part-count table.
+                Optional ``Table Number`` values are used when creating new
+                region blocks.
+            create_backup: If True, write ``.bak`` beside the geometry file.
+
+        Returns:
+            True if the geometry text file was updated.
+
+        Raises:
+            FileNotFoundError: If ``geom_file`` does not exist.
+            ValueError: If required columns are missing, region names are
+                duplicated, or polygon coordinates cannot be represented in
+                HEC-RAS fixed-width format.
+        """
+        geom_file_path = Path(geom_file)
+        if not geom_file_path.exists():
+            raise FileNotFoundError(f"Geometry file not found: {geom_file_path}")
+
+        regions_df = pd.DataFrame(regions_gdf).copy()
+        if regions_df.empty:
+            raise ValueError("regions_gdf cannot be empty")
+
+        name_col = GeomLandCover._first_existing_column(
+            regions_df,
+            GeomLandCover._REGION_NAME_COLUMNS,
+        )
+        if name_col is None or "geometry" not in regions_df.columns:
+            raise ValueError("regions_gdf must include Name and geometry columns")
+
+        base_table = GeomLandCover.get_base_mannings_n(geom_file_path)
+        default_table_number = None
+        if not base_table.empty:
+            default_table_number = str(base_table['Table Number'].iloc[0])
+
+        with open(geom_file_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+
+        lines = GeomLandCover._ensure_region_time_line(
+            lines,
+            GeomLandCover._find_region_insert_idx(lines),
+        )
+
+        seen_names: set[str] = set()
+        for _, row in regions_df.iterrows():
+            region_name = str(row[name_col]).strip()
+            if not region_name:
+                raise ValueError("Region Name values cannot be empty")
+            if region_name in seen_names:
+                raise ValueError(
+                    f"Duplicate region name {region_name!r} in regions_gdf"
+                )
+            seen_names.add(region_name)
+
+            coords = GeomLandCover._polygon_coords_from_geometry(row["geometry"])
+            polygon_block = GeomLandCover._format_region_polygon_block(coords)
+
+            existing_block = GeomLandCover._find_region_block(lines, region_name)
+            if existing_block is not None:
+                polygon_idx = existing_block["polygon_idx"]
+                if polygon_idx is not None:
+                    polygon_end_idx = existing_block["polygon_end_idx"] or polygon_idx + 1
+                    lines = lines[:polygon_idx] + polygon_block + lines[polygon_end_idx:]
+                else:
+                    insert_idx = existing_block["end_idx"]
+                    lines = lines[:insert_idx] + polygon_block + lines[insert_idx:]
+                continue
+
+            table_number = row.get('Table Number', default_table_number)
+            if pd.isna(table_number):
+                table_number = default_table_number
+            if table_number is None:
+                raise ValueError(
+                    f"Cannot create region {region_name!r}: geometry file has "
+                    "no base LCMann Table and regions_gdf did not provide "
+                    "a Table Number"
+                )
+            table_number = str(table_number)
+
+            region_base = base_table[
+                base_table['Table Number'].astype(str) == table_number
+            ]
+            if region_base.empty:
+                raise ValueError(
+                    f"Cannot create region {region_name!r}: base LCMann "
+                    f"Table {table_number} was not found in {geom_file_path}"
+                )
+
+            new_region_block = [
+                f"LCMann Region Name={region_name}\n",
+                f"LCMann Region Table={table_number}\n",
+                *GeomLandCover._format_region_table_rows(region_base),
+                *polygon_block,
+            ]
+            insert_idx = GeomLandCover._find_region_insert_idx(lines)
+            lines = lines[:insert_idx] + new_region_block + lines[insert_idx:]
+
+        lines = GeomLandCover._update_region_time(lines)
+        GeomParser.safe_write_geometry(
+            geom_file_path,
+            lines,
+            create_backup=create_backup,
+        )
+
+        logger.info(
+            "Updated Manning's n region polygons in %s for %d region(s)",
+            geom_file_path,
+            len(regions_df),
+        )
         return True
 
     @staticmethod
@@ -650,96 +1106,61 @@ class GeomLandCover:
         mannings_n: float,
         area_name: str = None,
     ) -> bool:
+        """Reject direct writes to solver-owned Manning datasets.
+
+        Use ``set_base_mannings_n`` or ``set_region_mannings_n`` followed by a
+        native HEC-RAS geometry/plan computation.  Generated HDF arrays are
+        outputs, not a supported input contract.
         """
-        EXPERIMENTAL — Override preprocessed Manning's n in a geometry HDF.
+        del geom_hdf_path, mannings_n, area_name
+        raise NotImplementedError(
+            "Direct writes to generated 2D Manning HDF datasets are disabled. "
+            "Use GeomLandCover.set_base_mannings_n() or "
+            "GeomLandCover.set_region_mannings_n(), then let HEC-RAS rebuild "
+            "the property tables."
+        )
 
-        Writes a uniform Manning's n value directly to the preprocessed
-        ``/Geometry/2D Flow Areas/{area}/Mann`` dataset. This dataset is
-        normally generated by the HEC-RAS geometry preprocessor and is
-        OVERWRITTEN on every preprocessing pass.
+    @staticmethod
+    @log_call
+    def restore_mannings_region_mappings(
+        source_geom_hdf_path: str | Path,
+        target_geom_hdf_path: str | Path,
+        hecras_version: str = "6.6",
+    ) -> dict:
+        """Recover a missing native calibration table in a disposable child HDF.
 
-        .. warning::
+        Source and target must have byte-identical native region attributes and
+        polygon coordinates in the same source CRS/units. Only regional
+        dimensionless Manning's n overrides are recovered; finite base-table
+        overrides are rejected. HEC-RAS writes the recovered mappings in an
+        isolated native process. No cell/face hydraulic output is copied.
 
-            **This is NOT an officially supported HEC-RAS workflow.** The
-            geometry HDF per-cell Manning's n is a *generated output* of
-            preprocessing, not a durable input. Any call to ``compute_plan()``
-            with ``clear_geompre=True`` or ``force_geompre=True`` will
-            regenerate these values from the plain-text geometry file and the
-            land cover sidecar HDF, discarding overrides written here.
+        Backs up the target and restores it on failure. Returns source/target
+        table hashes, mapping identity, class count and backup path. Native
+        table storage widths may differ; class names and float32 value bytes
+        must match. The original remains read-only. Native region-name storage
+        may resize and an empty 2D Area Name attribute may be added; existing
+        values and polygons must be unchanged. Run native geometry and
+        property-table computation and normal QA after recovery; this method
+        does not mark an incomplete geometry complete.
 
-        **Intended use — demonstration / research only:**
-
-        1. Preprocess geometry first (run the plan once, or use
-           ``force_geompre=True`` on a prior run).
-        2. Call this function to inject override values into the HDF.
-        3. Run ``compute_plan()`` with ``clear_geompre=False`` and
-           ``force_geompre=False`` so the preprocessor does NOT regenerate.
-        4. Values take effect for that single compute pass only.
-
-        **For production workflows, use these durable APIs instead:**
-
-        - ``GeomLandCover.set_base_mannings_n(geom_file, df)`` — modify the
-          base calibration table in the plain-text .g## file.
-        - ``GeomLandCover.set_region_mannings_n(geom_file, df)`` — modify
-          region-specific overrides in the plain-text .g## file.
-        - ``HdfLandCover.set_landcover_raster_map(sidecar_hdf, mapping)`` —
-          modify the raster class-to-n mapping in the land cover sidecar HDF.
-
-        All three durable methods survive geometry preprocessing because
-        HEC-RAS reads FROM them to generate the per-cell values.
-
-        Parameters:
-            geom_hdf_path (Union[str, Path]): Path to the geometry HDF file (.g##.hdf)
-            mannings_n (float): Manning's n roughness coefficient to set uniformly.
-            area_name (str, optional): Name of specific 2D flow area to update.
-                If None, updates all 2D flow areas in the file.
+        Args:
+            source_geom_hdf_path: Read-only reference geometry HDF with the
+                original regional calibration mappings.
+            target_geom_hdf_path: Disposable geometry HDF with matching native
+                regions and a missing calibration table; mutated in place.
+            hecras_version: Installed native version. Qualified with 6.6.
 
         Returns:
-            bool: True if at least one area was updated, False if no Mann datasets found.
+            Recovery provenance including source/target hashes, backup path,
+            class count, identity checks and required recomputation.
 
         Raises:
-            FileNotFoundError: If the geometry HDF file does not exist.
-            ValueError: If mannings_n is not a positive number.
+            ValueError: Input regions or calibration schema are unsupported.
+            RuntimeError: Native writing or postwrite verification fails.
         """
-        logger.warning(
-            "override_2d_mannings_n() is EXPERIMENTAL. Values written here "
-            "will be overwritten by the geometry preprocessor. Use "
-            "GeomLandCover.set_base_mannings_n() or "
-            "HdfLandCover.set_landcover_raster_map() for durable changes."
+        from ._mannings_region_recovery import restore_region_mappings
+
+        return restore_region_mappings(
+            Path(source_geom_hdf_path), Path(target_geom_hdf_path), hecras_version
         )
-        import h5py
-        import numpy as np
-
-        geom_hdf_path = Path(geom_hdf_path)
-        if not geom_hdf_path.exists():
-            raise FileNotFoundError(f"Geometry HDF file not found: {geom_hdf_path}")
-        if not isinstance(mannings_n, (int, float)) or mannings_n <= 0:
-            raise ValueError(f"mannings_n must be a positive number, got {mannings_n}")
-
-        updated_count = 0
-        with h5py.File(str(geom_hdf_path), "a") as hf:
-            fa_group = hf.get("Geometry/2D Flow Areas")
-            if fa_group is None:
-                logger.warning(f"No 'Geometry/2D Flow Areas' group in {geom_hdf_path.name}")
-                return False
-
-            areas = [area_name] if area_name else list(fa_group.keys())
-            for area in areas:
-                mann_path = f"Geometry/2D Flow Areas/{area}/Mann"
-                if mann_path in hf:
-                    mann = hf[mann_path][:]
-                    mann[:, 1] = mannings_n
-                    hf[mann_path][:] = mann
-                    updated_count += 1
-                    logger.info(
-                        f"Set Manning's n to {mannings_n} in {geom_hdf_path.name}/{area}"
-                    )
-                else:
-                    logger.debug(f"No Mann dataset at {mann_path}")
-
-        if updated_count == 0:
-            logger.warning(f"No Mann datasets found in {geom_hdf_path.name}")
-            return False
-
-        logger.info(f"Updated Manning's n in {updated_count} area(s)")
-        return True

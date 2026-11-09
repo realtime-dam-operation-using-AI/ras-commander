@@ -30,6 +30,10 @@ def _write_face_property_hdf(path: Path) -> Path:
     face_info = np.array([[0, 2], [2, 2], [4, 2]], dtype=np.int32)
 
     with h5py.File(path, "w") as hdf:
+        hdf.attrs["File Type"] = "HEC-RAS Results"
+        hdf.attrs["File Version"] = "HEC-RAS 7.0 April 2026"
+        hdf.attrs["Projection"] = rasterio.crs.CRS.from_epsg(4326).to_wkt()
+        hdf.require_group("Geometry").attrs["Complete Geometry"] = np.bool_(True)
         hdf.create_dataset("Geometry/2D Flow Areas/Attributes", data=attrs)
         mesh_group = hdf.create_group(f"Geometry/2D Flow Areas/{mesh_name}")
         mesh_group.create_dataset("Faces Area Elevation Info", data=face_info)
@@ -98,6 +102,10 @@ def _write_chunked_face_property_hdf(path: Path) -> Path:
     face_info = np.array([[0, 4], [4, 4], [8, 4]], dtype=np.int32)
 
     with h5py.File(path, "w") as hdf:
+        hdf.attrs["File Type"] = "HEC-RAS Results"
+        hdf.attrs["File Version"] = "HEC-RAS 7.0 April 2026"
+        hdf.attrs["Projection"] = rasterio.crs.CRS.from_epsg(4326).to_wkt()
+        hdf.require_group("Geometry").attrs["Complete Geometry"] = np.bool_(True)
         hdf.create_dataset("Geometry/2D Flow Areas/Attributes", data=attrs)
         mesh_group = hdf.create_group(f"Geometry/2D Flow Areas/{mesh_name}")
         mesh_group.create_dataset(
@@ -110,6 +118,10 @@ def _write_chunked_face_property_hdf(path: Path) -> Path:
             "Faces Area Elevation Values",
             data=face_values,
             chunks=(12, 4),
+        )
+        mesh_group.create_dataset(
+            "Faces FacePoint Indexes",
+            data=np.array([[0, 1], [1, 2], [2, 3]], dtype=np.int32),
         )
 
     return path
@@ -139,10 +151,25 @@ def _write_landcover_tif(path: Path) -> Path:
         count=1,
         dtype="int16",
         transform=from_origin(0.0, 2.0, 1.0, 1.0),
+        crs="EPSG:4326",
         nodata=0,
     ) as dst:
         dst.write(np.array([[1, 2], [1, 2]], dtype=np.int16), 1)
     return path
+
+
+def _replacement_face_table(
+    *,
+    mannings_n: float = 0.035,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Elevation": [100.0, 101.0],
+            "Area": [0.0, 5.0],
+            "Wetted Perimeter": [0.0, 2.5],
+            "Manning's n": [mannings_n, mannings_n],
+        }
+    )
 
 
 def _write_reference_line_hdf(path: Path) -> Path:
@@ -197,6 +224,7 @@ def _write_reference_line_hdf(path: Path) -> Path:
     return path
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_face_hydraulic_properties_scalar_stage(tmp_path):
     hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
 
@@ -214,6 +242,7 @@ def test_face_hydraulic_properties_scalar_stage(tmp_path):
     assert ds["conveyance"].sel(face_id=0).item() == pytest.approx(expected_conveyance)
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_face_hydraulic_properties_1d_per_face_and_metric(tmp_path):
     hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
 
@@ -227,6 +256,7 @@ def test_face_hydraulic_properties_1d_per_face_and_metric(tmp_path):
     assert ds["area"].sel(face_id=1).item() == pytest.approx(8.0)
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_face_hydraulic_properties_2d_dry_and_invalid_n(tmp_path):
     hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
 
@@ -244,6 +274,7 @@ def test_face_hydraulic_properties_2d_dry_and_invalid_n(tmp_path):
     assert np.isnan(ds["conveyance"].sel(time=1, face_id=2).item())
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_face_hydraulic_properties_warns_for_above_table_stage(tmp_path, caplog):
     hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
 
@@ -264,6 +295,7 @@ def test_face_hydraulic_properties_warns_for_above_table_stage(tmp_path, caplog)
     assert "Values above the table are clipped" in caplog.text
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_face_hydraulic_properties_above_table_face_count_is_unique(tmp_path):
     hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
 
@@ -287,10 +319,13 @@ def test_face_hydraulic_properties_rejects_wrong_1d_shape(tmp_path):
         )
 
 
-def test_extend_face_property_tables_uses_face_length_above_terrain(tmp_path):
-    hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
+@pytest.mark.synthetic_hdf_layout
+def test_extend_linux_tmp_face_property_tables_uses_face_length_above_terrain(
+    tmp_path,
+):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
 
-    rows_added = HdfMesh.extend_face_property_tables(
+    report = HdfMesh.extend_linux_tmp_face_property_tables(
         hdf_path,
         "MainArea",
         extension_elevation=103.0,
@@ -298,9 +333,13 @@ def test_extend_face_property_tables_uses_face_length_above_terrain(tmp_path):
         face_ids=[0],
         mannings_n_func=lambda depth, base_n: base_n + 0.001 * depth,
         pin_tables=False,
+        acknowledge_unsupported=True,
     )
 
-    assert rows_added == {0: 2}
+    assert report["rows_added"] == {0: 2}
+    assert report["faces_modified"] == 1
+    assert report["total_rows_added"] == 2
+    assert report["backup_path"].exists()
     tables = HdfMesh.get_mesh_face_property_tables(hdf_path)["MainArea"]
     face0 = tables[tables["Face ID"] == 0].tail(2)
     assert list(face0["Area"]) == pytest.approx([26.0, 32.0])
@@ -308,10 +347,13 @@ def test_extend_face_property_tables_uses_face_length_above_terrain(tmp_path):
     assert list(face0["Manning's n"]) == pytest.approx([0.0425, 0.043])
 
 
-def test_extend_face_property_tables_reaches_partial_final_step(tmp_path):
-    hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
+@pytest.mark.synthetic_hdf_layout
+def test_extend_linux_tmp_face_property_tables_reaches_partial_final_step(
+    tmp_path,
+):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
 
-    rows_added = HdfMesh.extend_face_property_tables(
+    report = HdfMesh.extend_linux_tmp_face_property_tables(
         hdf_path,
         "MainArea",
         extension_elevation=102.3,
@@ -319,9 +361,13 @@ def test_extend_face_property_tables_reaches_partial_final_step(tmp_path):
         face_ids=[0],
         mannings_n_func=lambda depth, base_n: base_n,
         pin_tables=False,
+        acknowledge_unsupported=True,
     )
 
-    assert rows_added == {0: 1}
+    assert report["rows_added"] == {0: 1}
+    assert report["faces_modified"] == 1
+    assert report["total_rows_added"] == 1
+    assert report["backup_path"].exists()
     tables = HdfMesh.get_mesh_face_property_tables(hdf_path)["MainArea"]
     face0_last = tables[tables["Face ID"] == 0].iloc[-1]
     assert face0_last["Elevation"] == pytest.approx(102.3)
@@ -329,11 +375,31 @@ def test_extend_face_property_tables_reaches_partial_final_step(tmp_path):
     assert face0_last["Wetted Perimeter"] == pytest.approx(10.0)
 
 
-def test_extend_face_property_tables_rejects_nonpositive_step(tmp_path):
-    hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
+@pytest.mark.synthetic_hdf_layout
+def test_transform_linux_tmp_face_mannings_n_surfaces_backup(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+
+    report = HdfMesh.transform_linux_tmp_face_mannings_n(
+        hdf_path,
+        "MainArea",
+        lambda elevation, depth, current_n: current_n + 0.001 * depth,
+        face_ids=[0],
+        pin_tables=False,
+        acknowledge_unsupported=True,
+    )
+
+    assert report["faces_modified"] == 1
+    assert report["backup_path"].exists()
+    tables = HdfMesh.get_mesh_face_property_tables(hdf_path)["MainArea"]
+    face0 = tables[tables["Face ID"] == 0].sort_values("Elevation")
+    assert list(face0["Manning's n"]) == pytest.approx([0.04, 0.042])
+
+
+def test_extend_linux_tmp_face_property_tables_rejects_nonpositive_step(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
 
     with pytest.raises(ValueError, match="elevation_step"):
-        HdfMesh.extend_face_property_tables(
+        HdfMesh.extend_linux_tmp_face_property_tables(
             hdf_path,
             "MainArea",
             extension_elevation=103.0,
@@ -341,11 +407,220 @@ def test_extend_face_property_tables_rejects_nonpositive_step(tmp_path):
             face_ids=[0],
             mannings_n_func=lambda depth, base_n: base_n,
             pin_tables=False,
+            acknowledge_unsupported=True,
         )
 
 
-def test_set_mesh_face_property_tables_clamps_chunks_for_smaller_tables(tmp_path):
-    hdf_path = _write_chunked_face_property_hdf(tmp_path / "chunked.g01.hdf")
+def test_linux_tmp_writer_requires_explicit_acknowledgement(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+
+    with pytest.raises(
+        RuntimeError,
+        match="EXPERIMENTAL / NOT RECOMMENDED.*acknowledge_unsupported=True",
+    ):
+        HdfMesh.write_linux_tmp_face_property_tables(
+            hdf_path,
+            "MainArea",
+            {0: _replacement_face_table()},
+        )
+
+    assert not list(tmp_path.glob("*.pre-write.*.bak.hdf"))
+
+
+def test_linux_tmp_writer_logs_experimental_notice_after_acknowledgement(
+    caplog,
+):
+    with caplog.at_level("WARNING"):
+        HdfMesh._require_linux_tmp_write_acknowledgement(True)
+
+    assert "EXPERIMENTAL / NOT RECOMMENDED" in caplog.text
+    assert "all other versions and workflows are untested" in caplog.text
+
+
+def test_linux_tmp_writer_rejects_non_tmp_file_role_before_backup(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
+
+    with pytest.raises(ValueError, match=r"\*\.p##\.tmp\.hdf"):
+        HdfMesh.write_linux_tmp_face_property_tables(
+            hdf_path,
+            "MainArea",
+            {0: _replacement_face_table()},
+            acknowledge_unsupported=True,
+        )
+
+    assert not list(tmp_path.glob("*.pre-write.*.bak.hdf"))
+
+
+def test_linux_tmp_writer_rejects_unproven_version_before_backup(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+    with h5py.File(hdf_path, "r+") as hdf:
+        hdf.attrs["File Version"] = "HEC-RAS 7.1 Unknown"
+
+    with pytest.raises(ValueError, match="HEC-RAS 7.0 April 2026"):
+        HdfMesh.write_linux_tmp_face_property_tables(
+            hdf_path,
+            "MainArea",
+            {0: _replacement_face_table()},
+            acknowledge_unsupported=True,
+        )
+
+    assert not list(tmp_path.glob("*.pre-write.*.bak.hdf"))
+
+
+@pytest.mark.parametrize("mannings_n", [np.nan, -0.01])
+def test_linux_tmp_writer_rejects_invalid_hydraulic_values_before_backup(
+    tmp_path,
+    mannings_n,
+):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+
+    with pytest.raises(ValueError, match="NaN|negative"):
+        HdfMesh.write_linux_tmp_face_property_tables(
+            hdf_path,
+            "MainArea",
+            {0: _replacement_face_table(mannings_n=mannings_n)},
+            acknowledge_unsupported=True,
+        )
+
+    assert not list(tmp_path.glob("*.pre-write.*.bak.hdf"))
+
+
+def test_linux_tmp_writer_rejects_out_of_bounds_face_id(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+
+    with pytest.raises(ValueError, match="out of range"):
+        HdfMesh.write_linux_tmp_face_property_tables(
+            hdf_path,
+            "MainArea",
+            {3: _replacement_face_table()},
+            acknowledge_unsupported=True,
+        )
+
+    assert not list(tmp_path.glob("*.pre-write.*.bak.hdf"))
+
+
+def test_linux_tmp_writer_backs_up_and_verifies_exact_tables(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+    with h5py.File(hdf_path, "r") as hdf:
+        original_values = hdf[
+            "Geometry/2D Flow Areas/MainArea/Faces Area Elevation Values"
+        ][()]
+
+    replacement = _replacement_face_table()
+    backup_path = HdfMesh.write_linux_tmp_face_property_tables(
+        hdf_path,
+        "MainArea",
+        {0: replacement},
+        acknowledge_unsupported=True,
+    )
+
+    assert backup_path.exists()
+    with h5py.File(backup_path, "r") as backup:
+        backup_values = backup[
+            "Geometry/2D Flow Areas/MainArea/Faces Area Elevation Values"
+        ][()]
+        assert np.array_equal(backup_values, original_values)
+    with h5py.File(hdf_path, "r") as hdf:
+        info = hdf[
+            "Geometry/2D Flow Areas/MainArea/Faces Area Elevation Info"
+        ][()]
+        values = hdf[
+            "Geometry/2D Flow Areas/MainArea/Faces Area Elevation Values"
+        ][()]
+        assert np.array_equal(info, np.array([[0, 2], [2, 2], [4, 2]]))
+        assert np.array_equal(values[:2], replacement.to_numpy(dtype=float))
+        assert bool(
+            hdf["Geometry/2D Flow Areas/MainArea"].attrs.get("Pinned")
+        )
+
+
+def test_set_mesh_pinned_attribute_backs_up_and_reads_back(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+
+    pin_backup = HdfMesh.set_mesh_pinned_attribute(
+        hdf_path,
+        "MainArea",
+        acknowledge_unsupported=True,
+    )
+    with h5py.File(hdf_path, "r") as hdf:
+        assert bool(
+            hdf["Geometry/2D Flow Areas/MainArea"].attrs.get("Pinned")
+        )
+
+    unpin_backup = HdfMesh.set_mesh_pinned_attribute(
+        hdf_path,
+        "MainArea",
+        pinned=False,
+        acknowledge_unsupported=True,
+    )
+    with h5py.File(hdf_path, "r") as hdf:
+        assert "Pinned" not in hdf["Geometry/2D Flow Areas/MainArea"].attrs
+
+    assert pin_backup.exists()
+    assert unpin_backup.exists()
+    assert pin_backup != unpin_backup
+
+
+def test_deprecated_pin_property_tables_delegates_to_guarded_api(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
+
+    with pytest.warns(DeprecationWarning, match="informational"):
+        result = HdfMesh.pin_property_tables(
+            hdf_path,
+            "MainArea",
+            acknowledge_unsupported=True,
+        )
+
+    assert result is None
+    assert len(list(tmp_path.glob("*.pre-write.*.bak.hdf"))) == 1
+
+
+def test_deprecated_face_table_writer_wrappers_preserve_return_shapes(tmp_path):
+    set_path = _write_face_property_hdf(tmp_path / "set.p01.tmp.hdf")
+    with pytest.warns(DeprecationWarning, match="write_linux_tmp"):
+        set_result = HdfMesh.set_mesh_face_property_tables(
+            set_path,
+            "MainArea",
+            {0: _replacement_face_table()},
+            pin_tables=False,
+            acknowledge_unsupported=True,
+        )
+    assert set_result is None
+
+    extend_path = _write_face_property_hdf(tmp_path / "extend.p01.tmp.hdf")
+    with pytest.warns(DeprecationWarning, match="extend_linux_tmp"):
+        extend_result = HdfMesh.extend_face_property_tables(
+            extend_path,
+            "MainArea",
+            extension_elevation=103.0,
+            mannings_n_func=lambda depth, base_n: base_n,
+            face_ids=[0],
+            pin_tables=False,
+            acknowledge_unsupported=True,
+        )
+    assert extend_result == {0: 2}
+
+    transform_path = _write_face_property_hdf(
+        tmp_path / "transform.p01.tmp.hdf"
+    )
+    with pytest.warns(DeprecationWarning, match="transform_linux_tmp"):
+        transform_result = HdfMesh.set_face_mannings_n_values(
+            transform_path,
+            "MainArea",
+            lambda elevation, depth, current_n: current_n,
+            face_ids=[0],
+            pin_tables=False,
+            acknowledge_unsupported=True,
+        )
+    assert transform_result == 1
+
+
+def test_write_linux_tmp_face_property_tables_clamps_chunks_for_smaller_tables(
+    tmp_path,
+):
+    hdf_path = _write_chunked_face_property_hdf(
+        tmp_path / "chunked.p01.tmp.hdf"
+    )
     replacement = pd.DataFrame(
         {
             "Elevation": [100.0],
@@ -355,13 +630,15 @@ def test_set_mesh_face_property_tables_clamps_chunks_for_smaller_tables(tmp_path
         }
     )
 
-    HdfMesh.set_mesh_face_property_tables(
+    backup_path = HdfMesh.write_linux_tmp_face_property_tables(
         hdf_path,
         "MainArea",
         {0: replacement},
         pin_tables=False,
+        acknowledge_unsupported=True,
     )
 
+    assert backup_path.exists()
     with h5py.File(hdf_path, "r") as hdf:
         info = hdf["Geometry/2D Flow Areas/MainArea/Faces Area Elevation Info"]
         values = hdf["Geometry/2D Flow Areas/MainArea/Faces Area Elevation Values"]
@@ -390,8 +667,9 @@ def test_build_landcover_depth_roughness_curves_reads_v5_sidecar(tmp_path):
     assert list(grass["mannings_n"]) == pytest.approx([0.10, 0.12])
 
 
-def test_recompute_face_mannings_n_from_landcover_curves(tmp_path):
-    hdf_path = _write_face_property_hdf(tmp_path / "mesh.g01.hdf")
+@pytest.mark.synthetic_hdf_layout
+def test_sample_linux_tmp_face_mannings_n_from_landcover_curves(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "mesh.p01.tmp.hdf")
     landcover_hdf = _write_landcover_sidecar(tmp_path / "landcover.hdf")
     _write_landcover_tif(landcover_hdf.with_suffix(".tif"))
     curves = HdfLandCover.build_landcover_depth_roughness_curves(
@@ -400,17 +678,21 @@ def test_recompute_face_mannings_n_from_landcover_curves(tmp_path):
         mannings_n_func=lambda depth, base_n, class_name: base_n + 0.01 * depth,
     )
 
-    modified_count = HdfMesh.recompute_face_mannings_n_from_landcover_curves(
-        hdf_path,
-        "MainArea",
-        curves,
-        landcover_hdf_path=landcover_hdf,
-        face_ids=[0],
-        sample_spacing=10.0,
-        pin_tables=False,
+    report = (
+        HdfMesh.sample_linux_tmp_face_mannings_n_from_landcover_curves(
+            hdf_path,
+            "MainArea",
+            curves,
+            landcover_hdf_path=landcover_hdf,
+            face_ids=[0],
+            sample_spacing=10.0,
+            pin_tables=False,
+            acknowledge_unsupported=True,
+        )
     )
 
-    assert modified_count == 1
+    assert report["faces_modified"] == 1
+    assert report["backup_path"].exists()
     tables = HdfMesh.get_mesh_face_property_tables(hdf_path)["MainArea"]
     face0 = tables[tables["Face ID"] == 0].sort_values("Elevation")
     expected_depth0 = ((0.10 ** 1.5 + 0.20 ** 1.5) / 2.0) ** (2.0 / 3.0)
@@ -420,6 +702,78 @@ def test_recompute_face_mannings_n_from_landcover_curves(tmp_path):
     assert list(face0["Wetted Perimeter"]) == pytest.approx([0.0, 10.0])
 
 
+@pytest.mark.synthetic_hdf_layout
+def test_deprecated_landcover_curve_wrapper_preserves_count(tmp_path):
+    hdf_path = _write_face_property_hdf(tmp_path / "curve.p01.tmp.hdf")
+    landcover_hdf = _write_landcover_sidecar(tmp_path / "landcover.hdf")
+    _write_landcover_tif(landcover_hdf.with_suffix(".tif"))
+    curves = HdfLandCover.build_landcover_depth_roughness_curves(
+        landcover_hdf,
+        depths=[0.0, 2.0],
+        mannings_n_func=lambda depth, base_n, class_name: base_n,
+    )
+
+    with pytest.warns(DeprecationWarning, match="not conveyance-weighted"):
+        result = HdfMesh.recompute_face_mannings_n_from_landcover_curves(
+            hdf_path,
+            "MainArea",
+            curves,
+            landcover_hdf_path=landcover_hdf,
+            face_ids=[0],
+            pin_tables=False,
+            acknowledge_unsupported=True,
+        )
+
+    assert result == 1
+    assert len(list(tmp_path.glob("curve.p01.tmp.pre-write.*.bak.hdf"))) == 1
+
+
+@pytest.mark.synthetic_hdf_layout
+def test_landcover_curve_sampling_empty_faces_preserves_return_contract(
+    tmp_path, monkeypatch
+):
+    hdf_path = _write_face_property_hdf(tmp_path / "empty.p01.tmp.hdf")
+    landcover_hdf = _write_landcover_sidecar(tmp_path / "landcover.hdf")
+    _write_landcover_tif(landcover_hdf.with_suffix(".tif"))
+    curves = HdfLandCover.build_landcover_depth_roughness_curves(
+        landcover_hdf,
+        depths=[0.0, 2.0],
+        mannings_n_func=lambda depth, base_n, class_name: base_n,
+    )
+    monkeypatch.setattr(
+        HdfMesh,
+        "get_mesh_cell_faces",
+        staticmethod(lambda *_args, **_kwargs: pd.DataFrame()),
+    )
+
+    report = (
+        HdfMesh.sample_linux_tmp_face_mannings_n_from_landcover_curves(
+            hdf_path,
+            "MainArea",
+            curves,
+            landcover_hdf_path=landcover_hdf,
+            pin_tables=False,
+            acknowledge_unsupported=True,
+        )
+    )
+    with pytest.warns(DeprecationWarning, match="not conveyance-weighted"):
+        compatibility_count = (
+            HdfMesh.recompute_face_mannings_n_from_landcover_curves(
+                hdf_path,
+                "MainArea",
+                curves,
+                landcover_hdf_path=landcover_hdf,
+                pin_tables=False,
+                acknowledge_unsupported=True,
+            )
+        )
+
+    assert report == {"faces_modified": 0, "backup_path": None}
+    assert compatibility_count == 0
+    assert not list(tmp_path.glob("empty.p01.tmp.pre-write.*.bak.hdf"))
+
+
+@pytest.mark.synthetic_hdf_layout
 def test_reference_line_internal_faces_returns_face_chain(tmp_path):
     hdf_path = _write_reference_line_hdf(tmp_path / "ref.g01.hdf")
 
@@ -444,3 +798,70 @@ def test_reference_line_internal_faces_missing_group_is_empty(tmp_path):
 
     assert df.empty
     assert "reference_line_id" in df.columns
+
+
+@pytest.mark.parametrize("version", [
+    "HEC-RAS 7.0 April 2026", "HEC-RAS 7.0.1 June 2026",
+    "HEC-RAS 7.0.2 October 2026",
+])
+def test_linux_tmp_writer_exact_qualified_versions_roundtrip(tmp_path, version):
+    source = _write_face_property_hdf(tmp_path / "qualified.p01.tmp.hdf")
+    with h5py.File(source, "r+") as hdf:
+        hdf.attrs["File Version"] = version
+    before = source.read_bytes()
+    replacement = _replacement_face_table()
+    backup = HdfMesh.write_linux_tmp_face_property_tables(
+        source, "MainArea", {0: replacement}, acknowledge_unsupported=True,
+    )
+    assert backup.read_bytes() == before
+    with h5py.File(source) as changed, h5py.File(backup) as original:
+        group = "Geometry/2D Flow Areas/MainArea/"
+        actual = changed[group + "Faces Area Elevation Values"][()]
+        np.testing.assert_array_equal(actual[:2], replacement.to_numpy())
+        np.testing.assert_array_equal(actual[2:], original[group + "Faces Area Elevation Values"][()][2:])
+
+
+@pytest.mark.parametrize(("fixture_variable", "version"), [
+    ("RAS_COMMANDER_701_TMP_HDF", "HEC-RAS 7.0.1 June 2026"),
+    ("RAS_COMMANDER_702_TMP_HDF", "HEC-RAS 7.0.2 October 2026"),
+])
+def test_linux_tmp_writer_native_7x_roundtrip(tmp_path, fixture_variable, version):
+    """Opt-in schema/write qualification on an immutable native temporary result."""
+    import hashlib
+    import os
+    import shutil
+
+    fixture = os.environ.get(fixture_variable)
+    if not fixture:
+        pytest.skip(f"Set {fixture_variable} to a native temporary result")
+    fixture = Path(fixture)
+    source_digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    target = tmp_path / "qualified.p01.tmp.hdf"
+    shutil.copy2(fixture, target)
+    with h5py.File(target) as hdf:
+        assert HdfMesh._decode_hdf_attr(hdf.attrs["File Version"]) == version
+        areas = hdf["Geometry/2D Flow Areas"]
+        mesh = next(name for name, obj in areas.items() if isinstance(obj, h5py.Group))
+        base = f"Geometry/2D Flow Areas/{mesh}/"
+        info = hdf[base + "Faces Area Elevation Info"][()]
+        values = hdf[base + "Faces Area Elevation Values"][()]
+        face_ids = sorted({0, len(info) // 2, len(info) - 1})
+        replacements = {}
+        for face in face_ids:
+            start, count = map(int, info[face])
+            table = values[start:start + count].copy()
+            table[:, 3] = 0.045
+            replacements[face] = pd.DataFrame(table, columns=HdfMesh._FACE_PROPERTY_COLUMNS)
+    backup = HdfMesh.write_linux_tmp_face_property_tables(
+        target, mesh, replacements, acknowledge_unsupported=True,
+    )
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == source_digest
+    with h5py.File(target) as hdf:
+        np.testing.assert_array_equal(hdf[base + "Faces Area Elevation Info"][()], info)
+        actual = hdf[base + "Faces Area Elevation Values"][()]
+        expected = values.copy()
+        for face, replacement in replacements.items():
+            start, count = map(int, info[face])
+            expected[start:start + count] = replacement.to_numpy()
+        np.testing.assert_array_equal(actual, expected)
+    assert hashlib.sha256(fixture.read_bytes()).hexdigest() == source_digest

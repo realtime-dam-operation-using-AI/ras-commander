@@ -7,6 +7,8 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
+import threading
 from contextlib import contextmanager
 from importlib import resources
 from importlib.metadata import PackageNotFoundError, version
@@ -21,7 +23,40 @@ logger = get_logger(__name__)
 _NATIVE_PACKAGE = "ras_commander.native"
 _HELPER_EXE_NAME = "RasStoreMapHelper.exe"
 _HELPER_CS_NAME = "RasStoreMapHelper.cs"
+# Enables loadFromRemoteSources so the CLR can load the HEC-RAS mapping runtime
+# when the helper executable itself lives on a network filesystem.
+_HELPER_CONFIG_NAME = f"{_HELPER_EXE_NAME}.config"
+_REMOTE_FILESYSTEM_TYPES = frozenset(
+    {
+        "9p",
+        "afs",
+        "beegfs",
+        "ceph",
+        "cifs",
+        "fuse.sshfs",
+        "fuse.glusterfs",
+        "fuse.rclone",
+        "fuse.s3fs",
+        "gpfs",
+        "lustre",
+        "nfs",
+        "nfs3",
+        "nfs4",
+        "smb2",
+        "smb3",
+        "smbfs",
+    }
+)
 _IS_LINUX = platform.system() == "Linux"
+_MAPPING_RUNTIME_LIBRARIES = (
+    "RasMapperLib.dll",
+    "Geospatial.Core.dll",
+    "Geospatial.GDALAssist.dll",
+    "HDF.PInvoke.dll",
+    "H5Assist.dll",
+)
+_HELPER_STAGE_LOCK = threading.Lock()
+_WINE_HELPER_AFFINITY_LOCK = threading.RLock()
 
 
 def _env_flag(name: str) -> bool:
@@ -29,6 +64,143 @@ def _env_flag(name: str) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_wine_helper_runtime() -> bool:
+    """Return whether helper execution will occur through Wine."""
+    if _IS_LINUX:
+        return True
+    if platform.system() != "Windows":
+        return False
+
+    # Windows Python running inside Wine reports itself as Windows. Wine's
+    # ntdll export is the reliable discriminator and is absent on native
+    # Windows.
+    try:
+        import ctypes
+
+        getattr(ctypes.windll.ntdll, "wine_get_version")
+    except (AttributeError, OSError):
+        return False
+    return True
+
+
+class _WindowsAffinityApi:
+    """Read full native masks without psutil's CPU-count-based enumeration."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.GetCurrentProcess.argtypes = []
+        self.kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        self.kernel.GetProcessAffinityMask.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t),
+        ]
+        self.kernel.GetProcessAffinityMask.restype = wintypes.BOOL
+        self.kernel.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+        self.kernel.SetProcessAffinityMask.restype = wintypes.BOOL
+        self.process = self.kernel.GetCurrentProcess()
+
+    def get(self):
+        process_mask, system_mask = self.ctypes.c_size_t(), self.ctypes.c_size_t()
+        if not self.kernel.GetProcessAffinityMask(self.process, self.ctypes.byref(process_mask), self.ctypes.byref(system_mask)):
+            raise OSError(self.ctypes.get_last_error(), "Cannot read native Wine CPU affinity masks")
+        return process_mask.value, system_mask.value
+
+    def set(self, mask):
+        if not self.kernel.SetProcessAffinityMask(self.process, mask):
+            raise OSError(self.ctypes.get_last_error(), "Cannot set native Wine CPU affinity mask")
+
+
+@contextmanager
+def _windows_wine_single_cpu_affinity() -> Iterator[None]:
+    # Wine can expose ProcessorCount=1 while the inherited native mask selects
+    # CPU4, for example under Slurm. psutil enumerates range(ProcessorCount)
+    # and can therefore return [] despite a valid nonzero mask. Use the full
+    # Win32 mask and verify the change; never guess an available CPU.
+    api = _WindowsAffinityApi()
+    previous, system = api.get()
+    if not previous or not system or previous & system != previous:
+        raise RuntimeError(f"Wine helper requires valid nonempty native CPU affinity masks (process={previous:#x}, system={system:#x})")
+    selected = previous & -previous
+    try:
+        api.set(selected)
+        observed, _ = api.get()
+        if observed != selected:
+            raise RuntimeError("Wine helper single-CPU affinity readback did not match")
+        logger.debug("Constrained Wine helper to native CPU mask %#x (previous=%#x)", selected, previous)
+        yield
+    finally:
+        try:
+            api.set(previous)
+            observed, _ = api.get()
+            if observed != previous:
+                raise RuntimeError("Wine helper original CPU affinity readback did not match")
+        except (OSError, RuntimeError):
+            logger.warning("Could not restore the Python process native CPU affinity after Wine helper execution", exc_info=True)
+
+
+@contextmanager
+def _wine_helper_single_cpu_affinity() -> Iterator[None]:
+    """Serialize Wine mapper helpers on one inherited CPU.
+
+    RasMapperLib's stored-map path is nondeterministic under Wine when the
+    helper can schedule across multiple CPUs: calls can remain in
+    ``poll_schedule_timeout`` or terminate with CLR exception 0xe0434352.
+    Constraining the parent while the child runs makes the helper inherit a
+    one-CPU mask. The process-wide lock is required because affinity belongs
+    to the Python process, not to the calling thread.
+    """
+    if not _is_wine_helper_runtime():
+        yield
+        return
+
+    with _WINE_HELPER_AFFINITY_LOCK:
+        if platform.system() == "Windows":
+            with _windows_wine_single_cpu_affinity():
+                yield
+            return
+
+        import psutil
+
+        process = psutil.Process()
+        previous_affinity = process.cpu_affinity()
+        if not previous_affinity:
+            raise RuntimeError(
+                "Wine stored-map helper requires a non-empty CPU affinity mask"
+            )
+        selected_cpu = previous_affinity[0]
+        try:
+            process.cpu_affinity([selected_cpu])
+        except (OSError, psutil.Error) as exc:
+            raise RuntimeError(
+                "Wine stored-map helper requires single-CPU affinity, but the "
+                "current process affinity could not be constrained"
+            ) from exc
+
+        logger.debug(
+            "Constrained Wine stored-map helper to CPU %s (available=%s)",
+            selected_cpu,
+            previous_affinity,
+        )
+        try:
+            yield
+        finally:
+            try:
+                process.cpu_affinity(previous_affinity)
+            except (OSError, psutil.Error):
+                logger.warning(
+                    "Could not restore the Python process CPU affinity after "
+                    "Wine stored-map execution."
+                )
+                logger.debug(
+                    "Failed restoring CPU affinity to %s",
+                    previous_affinity,
+                    exc_info=True,
+                )
 
 
 def _package_version() -> str:
@@ -53,8 +225,144 @@ def _resource(filename: str):
     return resources.files(_NATIVE_PACKAGE).joinpath(filename)
 
 
+def _linux_filesystem_type(path: Path) -> Optional[str]:
+    """Return the mounted filesystem type for ``path`` from /proc/self/mountinfo."""
+    try:
+        entries = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    try:
+        target = os.path.realpath(str(path))
+    except OSError:
+        target = str(path)
+
+    best_mount = ""
+    best_type = None
+    for entry in entries:
+        separator = entry.find(" - ")
+        if separator == -1:
+            continue
+        fields = entry[:separator].split()
+        remainder = entry[separator + 3 :].split()
+        if len(fields) < 5 or not remainder:
+            continue
+        mount_point = fields[4]
+        filesystem_type = remainder[0]
+        if target == mount_point or target.startswith(mount_point.rstrip("/") + "/"):
+            if len(mount_point) >= len(best_mount):
+                best_mount = mount_point
+                best_type = filesystem_type
+    return best_type
+
+
+def is_remote_path(path: Union[str, Path]) -> bool:
+    """Return whether ``path`` resides on a network filesystem.
+
+    A .NET Framework executable loaded from a network location cannot load its
+    dependencies unless ``loadFromRemoteSources`` is enabled, so the helper is
+    copied to local storage when this returns True. Windows UNC paths and
+    mapped network drives are remote; on Linux the mounted filesystem type
+    decides (NFS, CIFS/SMB, and similar).
+    """
+    candidate = Path(path)
+    try:
+        raw = os.path.abspath(str(candidate))
+    except (OSError, ValueError):
+        raw = str(candidate)
+
+    if platform.system() == "Windows":
+        if raw.upper().startswith("\\\\?\\UNC\\"):
+            return True
+        stripped = raw[4:] if raw.startswith("\\\\?\\") else raw
+        if stripped.startswith("\\\\"):
+            return True
+        drive = os.path.splitdrive(stripped)[0]
+        if not drive:
+            return False
+        try:
+            import ctypes
+
+            # DRIVE_REMOTE == 4
+            return ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\") == 4
+        except (AttributeError, OSError, ValueError):
+            return False
+
+    filesystem_type = _linux_filesystem_type(candidate)
+    if filesystem_type is None:
+        return False
+    return filesystem_type in _REMOTE_FILESYSTEM_TYPES
+
+
+def _local_stage_root(stage_dir: Optional[Union[str, Path]] = None) -> Optional[Path]:
+    """Return the first writable local directory usable for helper staging."""
+    candidates = []
+    if stage_dir is not None:
+        candidates.append(Path(stage_dir).expanduser())
+    candidates.append(_default_stage_dir())
+    candidates.append(Path(tempfile.gettempdir()) / "ras-commander" / "bin")
+
+    for candidate in candidates:
+        if is_remote_path(candidate):
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        return candidate
+    return None
+
+
 def _helper_has_sibling_gdal(helper_path: Path) -> bool:
     return (helper_path.parent / "GDAL").is_dir()
+
+
+def _file_identity(path: Path) -> dict:
+    """Return a reproducible content identity plus audit path for one file."""
+
+    path = Path(path).resolve()
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    return {
+        "source_file": str(path),
+        "sha256": digest.hexdigest(),
+        "size_bytes": size_bytes,
+    }
+
+
+def store_maps_runtime_provenance(hecras_dir: Union[str, Path]) -> dict:
+    """Identify the helper and HEC mapping libraries used by StoreMaps.
+
+    Paths are retained for auditability. Consumers that need portable cache
+    keys should hash the content fields and omit ``source_file`` and
+    ``hecras_dir``.
+    """
+
+    hecras_dir = Path(hecras_dir).resolve()
+    mapper_library = hecras_dir / "RasMapperLib.dll"
+    if not mapper_library.is_file():
+        raise FileNotFoundError(f"HEC-RAS mapping library not found: {mapper_library}")
+
+    libraries = {}
+    for filename in _MAPPING_RUNTIME_LIBRARIES:
+        candidate = hecras_dir / filename
+        if candidate.is_file():
+            libraries[filename] = _file_identity(candidate)
+
+    with packaged_helper_executable_path() as helper_path:
+        helper = _file_identity(Path(helper_path))
+
+    return {
+        "runner": "RasStoreMapHelper",
+        "helper": helper,
+        "hecras_dir": str(hecras_dir),
+        "libraries": libraries,
+        "ras_commander_version": _package_version(),
+    }
 
 
 def _bundle_name(helper_path: Path, hecras_dir: Optional[Path] = None) -> str:
@@ -80,12 +388,13 @@ def _link_or_copy_gdal_tree(source_dir: Path, dest_dir: Path) -> None:
             os.symlink(source_dir, dest_dir, target_is_directory=True)
             return
         except OSError as exc:
-            logger.warning(
-                "Could not symlink GDAL runtime from %s to %s; copying instead. "
-                "Error: %s",
+            logger.warning("Could not symlink GDAL runtime; copying instead.")
+            logger.debug(
+                "Could not symlink GDAL runtime from %s to %s: %s",
                 source_dir,
                 dest_dir,
                 exc,
+                exc_info=True,
             )
     elif platform.system() == "Windows":
         try:
@@ -97,12 +406,18 @@ def _link_or_copy_gdal_tree(source_dir: Path, dest_dir: Path) -> None:
             )
             return
         except (OSError, subprocess.CalledProcessError) as exc:
-            logger.warning(
-                "Could not create GDAL junction from %s to %s; copying instead. "
-                "Error: %s",
+            # Another Python process may have won the same junction race.
+            # Treat the now-present runtime as success instead of copying over
+            # files that an already-running helper may have open.
+            if dest_dir.exists() or dest_dir.is_symlink():
+                return
+            logger.warning("Could not create GDAL junction; copying instead.")
+            logger.debug(
+                "Could not create GDAL junction from %s to %s: %s",
                 source_dir,
                 dest_dir,
                 exc,
+                exc_info=True,
             )
 
     shutil.copytree(source_dir, dest_dir, dirs_exist_ok=True)
@@ -124,6 +439,54 @@ def _hecras_gdal_subprocess_env(hecras_dir: Path) -> dict:
     return env
 
 
+def _normalize_gdal_num_threads(
+    value: Optional[Union[int, str]],
+) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().upper()
+    if normalized == "ALL_CPUS":
+        return normalized
+    if normalized.isdigit() and int(normalized) >= 1:
+        return str(int(normalized))
+    raise ValueError("gdal_num_threads must be a positive integer, 'ALL_CPUS', or None")
+
+
+def _normalize_gdal_cachemax_mb(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or int(value) < 1:
+        raise ValueError("gdal_cachemax_mb must be a positive integer or None")
+    return int(value)
+
+
+def _apply_gdal_performance_env(
+    env: dict,
+    gdal_num_threads: Optional[Union[int, str]],
+    gdal_cachemax_mb: Optional[int],
+    native_cpu_limit: Optional[int] = None,
+) -> None:
+    """Apply scoped GDAL and native CPU settings to a child environment."""
+    if native_cpu_limit is not None and (
+        isinstance(native_cpu_limit, bool) or not isinstance(native_cpu_limit, int)
+        or not 1 <= native_cpu_limit <= 64
+    ):
+        raise ValueError("native_cpu_limit must be an integer from 1 to 64 or None")
+    key = "RAS_COMMANDER_STORE_MAP_CPU_LIMIT"
+    if native_cpu_limit is None:
+        env.pop(key, None)
+    else:
+        env[key] = str(native_cpu_limit)
+    if gdal_num_threads is None:
+        env.pop("GDAL_NUM_THREADS", None)
+    else:
+        env["GDAL_NUM_THREADS"] = str(gdal_num_threads)
+    if gdal_cachemax_mb is None:
+        env.pop("GDAL_CACHEMAX", None)
+    else:
+        env["GDAL_CACHEMAX"] = str(gdal_cachemax_mb)
+
+
 def normalize_store_map_render_mode(
     render_mode: Optional[Union[str, dict]],
     default: str = "horizontal",
@@ -132,8 +495,11 @@ def normalize_store_map_render_mode(
     if render_mode is None:
         render_mode = default
 
+    options = render_mode if isinstance(render_mode, dict) else {}
     if isinstance(render_mode, dict):
-        render_mode = render_mode.get("mode", default)
+        render_mode = options.get("mode", default)
+
+    parts = str(render_mode).strip().split(":")
 
     mode_map = {
         "horizontal": "horizontal",
@@ -142,12 +508,28 @@ def normalize_store_map_render_mode(
         "sloped": "sloping",
     }
 
-    normalized = mode_map.get(str(render_mode).strip().lower())
+    normalized = mode_map.get(parts[0].lower())
     if normalized is None:
         raise ValueError(
             f"Invalid render_mode: {render_mode}. "
             "Valid values: horizontal, sloping, slopingPretty"
         )
+    flag_names = ("reduce_shallow_to_horizontal", "use_depth_weighted_faces")
+    if len(parts) > 1:
+        # Normalization runs at both the public-call and helper boundaries.
+        # Preserve the validated helper flags on the second pass.
+        if normalized != "slopingPretty" or len(parts) != 3 or any(
+            flag.lower() not in ("true", "false") for flag in parts[1:]
+        ):
+            raise ValueError("Sloping helper flags require slopingPretty:true|false:true|false")
+        if any(name in options for name in flag_names):
+            raise ValueError("Specify sloping flags in the mode or the dictionary, not both")
+        return ":".join([normalized, *(flag.lower() for flag in parts[1:])])
+    if normalized == "slopingPretty" and any(name in options for name in flag_names):
+        flags = [options.get(flag_names[0], True), options.get(flag_names[1], False)]
+        if any(not isinstance(flag, bool) for flag in flags):
+            raise ValueError("Sloping rendering options must be booleans")
+        return ":".join([normalized, *(str(flag).lower() for flag in flags)])
     return normalized
 
 
@@ -176,6 +558,44 @@ def packaged_helper_executable_path() -> Iterator[Path]:
 
 
 @contextmanager
+def packaged_helper_config_path() -> Iterator[Path]:
+    """Yield the packaged ``RasStoreMapHelper.exe.config`` path."""
+    with resources.as_file(_resource(_HELPER_CONFIG_NAME)) as config_path:
+        config_path = Path(config_path)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"{_HELPER_CONFIG_NAME} not found in packaged resources at "
+                f"{config_path}"
+            )
+        yield config_path
+
+
+def _copy_helper_config(staged_helper: Path) -> Optional[Path]:
+    """Place the loadFromRemoteSources config beside a staged helper copy."""
+    destination = staged_helper.with_name(f"{staged_helper.name}.config")
+    try:
+        with packaged_helper_config_path() as config_path:
+            if (
+                destination.exists()
+                and destination.read_bytes() == config_path.read_bytes()
+            ):
+                return destination
+            shutil.copy2(config_path, destination)
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning(
+            "Could not place %s beside the staged helper at %s: %s. Stored maps "
+            "may fail with HRESULT 0x80131515 when files are read over a "
+            "network filesystem.",
+            _HELPER_CONFIG_NAME,
+            staged_helper,
+            exc,
+        )
+        return None
+    logger.debug("Staged helper configuration to %s", destination)
+    return destination
+
+
+@contextmanager
 def packaged_helper_source_path() -> Iterator[Path]:
     """Yield the packaged helper C# source path."""
     with resources.as_file(_resource(_HELPER_CS_NAME)) as source_path:
@@ -193,15 +613,27 @@ def stage_helper_executable(
     stage_dir: Optional[Union[str, Path]] = None,
     hecras_dir: Optional[Union[str, Path]] = None,
 ) -> Path:
+    """Serialize helper/GDAL cache creation within the Python process."""
+    with _HELPER_STAGE_LOCK:
+        return _stage_helper_executable_locked(
+            helper_path=helper_path,
+            stage_dir=stage_dir,
+            hecras_dir=hecras_dir,
+        )
+
+
+def _stage_helper_executable_locked(
+    helper_path: Path,
+    stage_dir: Optional[Union[str, Path]] = None,
+    hecras_dir: Optional[Union[str, Path]] = None,
+) -> Path:
     """Copy the helper to a user-writable directory for execution."""
     helper_path = Path(helper_path)
     if not helper_path.exists():
         raise FileNotFoundError(f"Helper executable not found: {helper_path}")
 
     stage_root = (
-        Path(stage_dir).expanduser()
-        if stage_dir is not None
-        else _default_stage_dir()
+        Path(stage_dir).expanduser() if stage_dir is not None else _default_stage_dir()
     )
     stage_root.mkdir(parents=True, exist_ok=True)
 
@@ -211,7 +643,8 @@ def stage_helper_executable(
         staged_path = stage_root / staged_name
         if not staged_path.exists():
             shutil.copy2(helper_path, staged_path)
-            logger.info(f"Staged RasStoreMapHelper.exe to {staged_path}")
+            logger.debug(f"Staged RasStoreMapHelper.exe to {staged_path}")
+        _copy_helper_config(staged_path)
         return staged_path
 
     hecras_dir = Path(hecras_dir)
@@ -221,7 +654,8 @@ def stage_helper_executable(
     staged_path = bundle_dir / _HELPER_EXE_NAME
     if not staged_path.exists():
         shutil.copy2(helper_path, staged_path)
-        logger.info(f"Staged RasStoreMapHelper.exe to {staged_path}")
+        logger.debug(f"Staged RasStoreMapHelper.exe to {staged_path}")
+    _copy_helper_config(staged_path)
 
     gdal_source = hecras_dir / "GDAL"
     if gdal_source.is_dir():
@@ -234,6 +668,45 @@ def stage_helper_executable(
         )
 
     return staged_path
+
+
+def _local_helper_executable(
+    helper_path: Path,
+    hecras_dir: Optional[Union[str, Path]] = None,
+    stage_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Return a helper path on local storage, copying it there when needed.
+
+    .NET Framework blocks dependency loads for an assembly that runs from a
+    network location (HRESULT 0x80131515), which is how a project or an
+    installation on an NFS/SMB mount previously broke stored maps.
+    """
+    if not is_remote_path(helper_path):
+        return helper_path
+
+    local_root = _local_stage_root(stage_dir)
+    if local_root is None:
+        logger.warning(
+            "RasStoreMapHelper is on a network filesystem (%s) and no local "
+            "staging directory is available; relying on %s to permit remote "
+            "assembly loads.",
+            helper_path,
+            _HELPER_CONFIG_NAME,
+        )
+        return helper_path
+
+    staged = stage_helper_executable(
+        helper_path,
+        stage_dir=local_root,
+        hecras_dir=hecras_dir,
+    )
+    logger.debug(
+        "Copied RasStoreMapHelper from network location %s to local staging "
+        "directory %s.",
+        helper_path,
+        staged,
+    )
+    return staged
 
 
 def _filter_helper_stderr(
@@ -259,6 +732,106 @@ def _filter_helper_stderr(
     )
 
 
+def _configure_suspended_child(pid: int, native_cpu_limit: int) -> None:
+    """Constrain only a suspended Windows child's mask, then resume its thread.
+
+    CREATE_SUSPENDED keeps the primary thread from entering the CLR. Python's
+    affinity is never changed. Ambiguous masks/thread state fail before resume.
+    """
+    import ctypes
+    from ctypes import wintypes
+    import psutil
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "GetProcessAffinityMask": ([wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                    ctypes.POINTER(ctypes.c_size_t)], wintypes.BOOL),
+        "SetProcessAffinityMask": ([wintypes.HANDLE, ctypes.c_size_t], wintypes.BOOL),
+        "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
+    }
+    for name, (args, result) in signatures.items():
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = args, result
+
+    def failed(operation):
+        return OSError(ctypes.get_last_error(), f"Pre-CLR helper CPU affinity: {operation}")
+
+    # PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION. No parent handle.
+    process = kernel.OpenProcess(0x0400 | 0x0200, False, pid)
+    if not process:
+        raise failed("OpenProcess failed")
+    thread = None
+    try:
+        inherited, system = ctypes.c_size_t(), ctypes.c_size_t()
+        if not kernel.GetProcessAffinityMask(process, ctypes.byref(inherited), ctypes.byref(system)):
+            raise failed("cannot read inherited mask")
+        selected = _select_native_cpu_mask(inherited.value, system.value, native_cpu_limit)
+        if not kernel.SetProcessAffinityMask(process, selected):
+            raise failed("cannot set child mask")
+        actual = ctypes.c_size_t()
+        if not kernel.GetProcessAffinityMask(process, ctypes.byref(actual), ctypes.byref(system)):
+            raise failed("cannot verify child mask")
+        if actual.value != selected:
+            raise RuntimeError("Pre-CLR helper CPU affinity readback did not match")
+        threads = psutil.Process(pid).threads()
+        if len(threads) != 1:
+            raise RuntimeError("Suspended helper must have exactly one primary thread before CLR startup")
+        # THREAD_SUSPEND_RESUME; the primary thread must have suspend count one.
+        thread = kernel.OpenThread(0x0002, False, threads[0].id)
+        if not thread:
+            raise failed("OpenThread failed")
+        count = kernel.ResumeThread(thread)
+        if count == 0xFFFFFFFF:
+            raise failed("ResumeThread failed")
+        if count != 1:
+            raise RuntimeError(f"Unexpected helper primary-thread suspend count: {count}")
+    finally:
+        if thread:
+            kernel.CloseHandle(thread)
+        kernel.CloseHandle(process)
+
+
+def _select_native_cpu_mask(inherited: int, system: int, limit: int) -> int:
+    """Select the lowest allowed CPUs without expanding the inherited mask."""
+    if not inherited or inherited & ~system:
+        raise RuntimeError("Pre-CLR helper requires an unambiguous nonempty CPU affinity mask")
+    available, selected = inherited, 0
+    for _ in range(limit):
+        if not available:
+            raise ValueError("native_cpu_limit exceeds the helper's inherited CPU mask")
+        lowest = available & -available
+        selected |= lowest
+        available &= ~lowest
+    return selected
+
+
+def _run_store_map_process(cmd, *, native_cpu_limit=None, **kwargs):
+    """Run an opt-in Windows helper suspended until its CPU mask is verified."""
+    if native_cpu_limit is None or platform.system() != "Windows" or _is_wine_helper_runtime():
+        return subprocess.run(cmd, **kwargs)
+    # Both callers use capture_output/text. Keep subprocess.run timeout/error
+    # semantics, and always terminate/reap an owned child on configuration errors.
+    timeout = kwargs.pop("timeout", None)
+    kwargs.pop("capture_output", None)
+    kwargs["stdout"], kwargs["stderr"] = subprocess.PIPE, subprocess.PIPE
+    with subprocess.Popen(cmd, creationflags=0x00000004, **kwargs) as child:
+        try:
+            _configure_suspended_child(child.pid, native_cpu_limit)
+            stdout, stderr = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            child.kill()
+            exc.stdout, exc.stderr = child.communicate()
+            raise
+        except BaseException:
+            child.kill()
+            child.communicate()
+            raise
+        return subprocess.CompletedProcess(cmd, child.returncode, stdout, stderr)
+
+
 def _run_store_all_maps_once(
     helper_path: Path,
     hecras_dir: Path,
@@ -267,6 +840,9 @@ def _run_store_all_maps_once(
     result_hdf_path: Path,
     timeout: int,
     working_dir: Optional[Path],
+    gdal_num_threads: Optional[Union[int, str]] = 1,
+    gdal_cachemax_mb: Optional[int] = None,
+    native_cpu_limit: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
     if _IS_LINUX:
         from .RasProcess import RasProcess
@@ -292,14 +868,22 @@ def _run_store_all_maps_once(
             "DISPLAY": "",
             "WINEDEBUG": "-all",
         }
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(working_dir) if working_dir else None,
-            env=env,
+        _apply_gdal_performance_env(
+            env,
+            gdal_num_threads,
+            gdal_cachemax_mb,
+            native_cpu_limit,
         )
+        with _wine_helper_single_cpu_affinity():
+            result = _run_store_map_process(
+                cmd,
+                native_cpu_limit=native_cpu_limit,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(working_dir) if working_dir else None,
+                env=env,
+            )
         return _filter_helper_stderr(result)
 
     cmd = [
@@ -309,14 +893,100 @@ def _run_store_all_maps_once(
         str(rasmap_path),
         str(result_hdf_path),
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd=str(working_dir) if working_dir else None,
-        env=_hecras_gdal_subprocess_env(hecras_dir),
+    env = _hecras_gdal_subprocess_env(hecras_dir)
+    _apply_gdal_performance_env(
+        env,
+        gdal_num_threads,
+        gdal_cachemax_mb,
+        native_cpu_limit,
     )
+    with _wine_helper_single_cpu_affinity():
+        result = _run_store_map_process(
+            cmd,
+            native_cpu_limit=native_cpu_limit,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(working_dir) if working_dir else None,
+            env=env,
+        )
+    return _filter_helper_stderr(result)
+
+
+def _run_store_map_once(
+    helper_path: Path,
+    hecras_dir: Path,
+    helper_mode: str,
+    map_type: str,
+    result_hdf_path: Path,
+    profile_name: str,
+    output_base_path: Optional[Path],
+    timeout: int,
+    working_dir: Optional[Path],
+    gdal_num_threads: Optional[Union[int, str]] = 1,
+    gdal_cachemax_mb: Optional[int] = None,
+    native_cpu_limit: Optional[int] = None,
+) -> subprocess.CompletedProcess:
+    """Run one isolated StoreMap helper process."""
+    if _IS_LINUX:
+        from .RasProcess import RasProcess
+
+        wine_config = RasProcess._get_wine_config()
+        if wine_config is None:
+            raise RuntimeError(
+                "Wine not configured on Linux. "
+                "Call RasProcess.configure_wine() or set WINEPREFIX."
+            )
+
+        cmd = [
+            wine_config.wine_executable,
+            str(helper_path),
+            RasProcess._resolve_path_for_rasprocess(hecras_dir),
+            helper_mode,
+            "StoreMap",
+            map_type,
+            RasProcess._resolve_path_for_rasprocess(result_hdf_path),
+            profile_name,
+        ]
+        if output_base_path is not None:
+            cmd.append(RasProcess._resolve_path_for_rasprocess(output_base_path))
+        env = {
+            **os.environ,
+            "WINEPREFIX": str(wine_config.wine_prefix),
+            "DISPLAY": "",
+            "WINEDEBUG": "-all",
+        }
+    else:
+        cmd = [
+            str(helper_path),
+            str(hecras_dir),
+            helper_mode,
+            "StoreMap",
+            map_type,
+            str(result_hdf_path),
+            profile_name,
+        ]
+        if output_base_path is not None:
+            cmd.append(str(output_base_path))
+        env = _hecras_gdal_subprocess_env(hecras_dir)
+
+    _apply_gdal_performance_env(
+        env,
+        gdal_num_threads,
+        gdal_cachemax_mb,
+        native_cpu_limit,
+    )
+
+    with _wine_helper_single_cpu_affinity():
+        result = _run_store_map_process(
+            cmd,
+            native_cpu_limit=native_cpu_limit,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(working_dir) if working_dir else None,
+            env=env,
+        )
     return _filter_helper_stderr(result)
 
 
@@ -327,6 +997,9 @@ def run_store_all_maps_helper(
     result_hdf_path: Union[str, Path],
     timeout: int = 600,
     working_dir: Optional[Union[str, Path]] = None,
+    gdal_num_threads: Optional[Union[int, str]] = 1,
+    gdal_cachemax_mb: Optional[int] = None,
+    native_cpu_limit: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
     """Run the packaged helper without mutating the HEC-RAS install folder."""
     if _env_flag("RAS_COMMANDER_MAP_HELPER_DISABLE"):
@@ -334,6 +1007,9 @@ def run_store_all_maps_helper(
             "RasStoreMapHelper execution is disabled via "
             "RAS_COMMANDER_MAP_HELPER_DISABLE."
         )
+
+    gdal_num_threads = _normalize_gdal_num_threads(gdal_num_threads)
+    gdal_cachemax_mb = _normalize_gdal_cachemax_mb(gdal_cachemax_mb)
 
     hecras_dir = Path(hecras_dir)
     rasmap_path = Path(rasmap_path)
@@ -351,11 +1027,16 @@ def run_store_all_maps_helper(
                 stage_dir=stage_dir_override,
                 hecras_dir=hecras_dir,
             )
-            logger.info(
+            logger.debug(
                 "Using staged RasStoreMapHelper runtime at %s because the "
                 "packaged helper has no sibling GDAL directory.",
                 helper_to_run,
             )
+        helper_to_run = _local_helper_executable(
+            helper_to_run,
+            hecras_dir=hecras_dir,
+            stage_dir=stage_dir_override,
+        )
 
         try:
             return _run_store_all_maps_once(
@@ -366,6 +1047,9 @@ def run_store_all_maps_helper(
                 result_hdf_path=result_hdf_path,
                 timeout=timeout,
                 working_dir=working_dir,
+                gdal_num_threads=gdal_num_threads,
+                gdal_cachemax_mb=gdal_cachemax_mb,
+                native_cpu_limit=native_cpu_limit,
             )
         except (OSError, PermissionError, FileNotFoundError) as exc:
             staged_helper = stage_helper_executable(
@@ -377,11 +1061,15 @@ def run_store_all_maps_helper(
                 raise
 
             logger.warning(
+                "Direct RasStoreMapHelper execution failed; retrying from staged path."
+            )
+            logger.debug(
                 "Direct RasStoreMapHelper execution failed from %s; retrying "
-                "from staged path %s. Error: %s",
+                "from staged path %s: %s",
                 helper_to_run,
                 staged_helper,
                 exc,
+                exc_info=True,
             )
             return _run_store_all_maps_once(
                 helper_path=staged_helper,
@@ -391,4 +1079,105 @@ def run_store_all_maps_helper(
                 result_hdf_path=result_hdf_path,
                 timeout=timeout,
                 working_dir=working_dir,
+                gdal_num_threads=gdal_num_threads,
+                gdal_cachemax_mb=gdal_cachemax_mb,
+                native_cpu_limit=native_cpu_limit,
+            )
+
+
+def run_store_map_helper(
+    hecras_dir: Union[str, Path],
+    render_mode: Optional[Union[str, dict]],
+    map_type: str,
+    result_hdf_path: Union[str, Path],
+    profile_name: str,
+    output_base_path: Optional[Union[str, Path]] = None,
+    timeout: int = 600,
+    working_dir: Optional[Union[str, Path]] = None,
+    gdal_num_threads: Optional[Union[int, str]] = 1,
+    gdal_cachemax_mb: Optional[int] = None,
+    native_cpu_limit: Optional[int] = None,
+) -> subprocess.CompletedProcess:
+    """Generate one stored map in an isolated helper process.
+
+    Independent calls can run concurrently when each call uses a unique output
+    base path. ``gdal_num_threads`` defaults to one because HEC-RAS 6.x/7.0
+    bundles GDAL 3.0.2 and nested GDAL threading did not improve StoreMap
+    throughput in validation; process-level map parallelism supplies the useful
+    concurrency while keeping memory use predictable.
+    """
+    if _env_flag("RAS_COMMANDER_MAP_HELPER_DISABLE"):
+        raise RuntimeError(
+            "RasStoreMapHelper execution is disabled via "
+            "RAS_COMMANDER_MAP_HELPER_DISABLE."
+        )
+
+    if not str(map_type).strip():
+        raise ValueError("map_type must not be empty")
+    if not str(profile_name).strip():
+        raise ValueError("profile_name must not be empty")
+    gdal_num_threads = _normalize_gdal_num_threads(gdal_num_threads)
+    gdal_cachemax_mb = _normalize_gdal_cachemax_mb(gdal_cachemax_mb)
+    hecras_dir = Path(hecras_dir)
+    result_hdf_path = Path(result_hdf_path)
+    output_base_path = Path(output_base_path) if output_base_path is not None else None
+    working_dir = Path(working_dir) if working_dir is not None else None
+    helper_mode = normalize_store_map_render_mode(render_mode)
+    stage_dir_override = os.environ.get("RAS_COMMANDER_MAP_HELPER_STAGE_DIR")
+
+    with packaged_helper_executable_path() as helper_path:
+        helper_to_run = helper_path
+        if not _helper_has_sibling_gdal(helper_path) and (hecras_dir / "GDAL").is_dir():
+            helper_to_run = stage_helper_executable(
+                helper_path,
+                stage_dir=stage_dir_override,
+                hecras_dir=hecras_dir,
+            )
+            logger.debug(
+                "Using staged RasStoreMapHelper runtime at %s because the "
+                "packaged helper has no sibling GDAL directory.",
+                helper_to_run,
+            )
+
+        run_kwargs = {
+            "hecras_dir": hecras_dir,
+            "helper_mode": helper_mode,
+            "map_type": str(map_type),
+            "result_hdf_path": result_hdf_path,
+            "profile_name": str(profile_name),
+            "output_base_path": output_base_path,
+            "timeout": timeout,
+            "working_dir": working_dir,
+            "gdal_num_threads": gdal_num_threads,
+            "gdal_cachemax_mb": gdal_cachemax_mb,
+            "native_cpu_limit": native_cpu_limit,
+        }
+        try:
+            return _run_store_map_once(
+                helper_path=helper_to_run,
+                **run_kwargs,
+            )
+        except (OSError, PermissionError, FileNotFoundError) as exc:
+            staged_helper = stage_helper_executable(
+                helper_path,
+                stage_dir=stage_dir_override,
+                hecras_dir=hecras_dir,
+            )
+            if staged_helper == helper_to_run:
+                raise
+
+            logger.warning(
+                "Direct RasStoreMapHelper execution failed; retrying from staged path."
+            )
+            logger.debug(
+                "Direct RasStoreMapHelper execution failed from %s; retrying "
+                "from staged path %s: %s",
+                helper_to_run,
+                staged_helper,
+                exc,
+                exc_info=True,
+            )
+            return _run_store_map_once(
+                helper_path=staged_helper,
+                **run_kwargs,
             )

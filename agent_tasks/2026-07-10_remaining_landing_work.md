@@ -1,0 +1,283 @@
+# Remaining Work To Land On Main
+
+Date: 2026-07-10
+
+Status: **Selective landing work through the JOSS paper follow-up completed.**
+PR #275 merged the selective DSS, MRMS, stored-map, and notebook payload on
+2026-07-11. PR #276 merged the HRRR temporal contract and end-to-end HEC-RAS
+forecast demonstration as `6c8090c7` on 2026-07-12. PRs #279 and #280 then
+landed the reconstructed JOSS paper and complete MIT license. No replay PR
+remains open; the remaining items are independent backlogs.
+
+## Goal
+
+Preserve useful unlanded work without replaying stale feature branches over
+current `main`. Every candidate must be reassessed against the APIs, notebooks,
+and fixes that have already landed, then delivered through a focused branch and
+independently validated.
+
+## Main State At HRRR Follow-Up Start
+
+- `origin/main` was `f814a9e0`, including PR #275.
+- There were no open pull requests.
+- PR #260 was closed and its approved slices landed through PRs #262-#273.
+- PR #251 was superseded by PR #274.
+- The notebook 710 and 711 follow-ups were closed by PRs #272 and #271.
+
+## Completed Precipitation Replay Tranche
+
+Selective replay of `origin/feature/dss-container-qpkit-notebooks`:
+
+- audit the six branch commits against current `main`;
+- port only still-needed `RasProcess` and `PrecipMrms` fixes with focused tests;
+- separate notebook input-cell improvements from stored-output churn in
+  notebooks 916 and 917;
+- reconcile the workflows with the precipitation and asynchronous HDF fixes
+  landed in PR #274;
+- add a uniquely numbered WPC QPF-to-DSS example as notebook 926;
+- execute notebooks 916, 917, and 926 and require independent notebook review
+  before publication; and
+- prepare a focused PR rather than merging the source branch wholesale.
+
+### Branch Audit Findings
+
+The six branch commits must be ported manually. No commit is safe to
+cherry-pick wholesale:
+
+- `985d6ca7` addresses a real stored-map move failure, but its extended-path
+  conversion is invalid for UNC paths and must preserve newer `main` behavior
+  around logging and `PostProcessing.hdf`.
+- `fbbbd7fa` and `ab11a3ae` add useful common-grid reconciliation and early
+  frame limiting, but they treat each raster as a separate timestep. They do
+  not mosaic multiple terrain rasters produced for the same timestep.
+- The executed New Orleans run proves that grouped-tile support is required:
+  of 361 timesteps, 39 produced one depth raster, 120 produced two, and 202
+  produced three. Notebook 917 selected only `maps["depth"][0]`, omitting valid
+  hydraulic results from the remaining terrain tiles.
+- The branch's new `915_wpc_qpf_precipitation_forecast.ipynb` conflicts with
+  the existing notebook 915 and does not write DSS grids. Its purported writer
+  cells only build and print pathname strings.
+- Historical outputs from `3fdee719` and `6ed11d02` predate the current logging
+  and precipitation fixes and must not be replayed.
+
+### qpkit Verification
+
+- Upstream qpkit merged the WPC QPF writer as commit `64455cb9` and tag
+  `v0.1.0`.
+- The focused QPF writer suite passes (`7 passed`), including a real DSS
+  round-trip test.
+- The broader upstream qpkit API/DSS/model suite currently reports `14 failed,
+  30 passed`; the failures are concentrated in stale HRRR/QPE expectations
+  that no longer match the implementation. Do not represent the full release
+  as clean or silently change the existing HRRR/MRMS notebook pin without live
+  validation.
+- Any qpkit notebook section must suppress qpkit's per-file INFO chatter and
+  print a concise download/write/catalog summary instead.
+
+### Approved Implementation Scope
+
+The user approved this full scope, including notebook 926, on 2026-07-10:
+
+1. Harden `RasProcess.store_maps()` move paths for drive and UNC locations.
+2. Add a public `PrecipMrms` stored-map loader that mosaics all terrain tiles
+   per timestep, reconciles frames, and limits frames before raster reads.
+3. Add focused path, mosaic, resolution, CRS, and frame-limit tests.
+4. Update notebook 917 to retain every terrain tile and use `RasDss` for DSS
+   catalog verification.
+5. Add live-verified optional qpkit sections to notebooks 916 and 917 without
+   replaying historical outputs.
+6. Rewrite the WPC workflow as a real, uniquely numbered notebook 926 using
+   qpkit `v0.1.0`.
+
+### Validation Record
+
+- Focused `RasProcess`, `PrecipMrms`, and HRRR regression suite: 44 passed,
+  with two known environment/test-fixture warnings.
+- Final stored-map regression rerun: 30 passed with `MPLBACKEND=Agg`. The
+  default Tk backend in the local UV Python is incomplete, and the successful
+  run still emits the known netCDF/numpy binary warning plus a post-exit
+  Windows `0xc0000139` diagnostic; pytest itself exits 0.
+- Notebook 916 as merged in PR #275: 13/13 code cells executed; independent
+  review PASS. PR #276 later superseded this forcing-only execution with the
+  end-to-end hydraulic workflow recorded below.
+- Notebook 926: 5/5 code cells executed; independent review PASS.
+- Notebook 917: 8/8 code cells executed from source in 4,040.7 seconds;
+  independent review PASS. The executed notebook, terminal log, and six MP4s
+  are under `H:/Symphony/ras-commander/PR-DSS-QPKIT-PRECIP/`.
+- Final focused MRMS suite: 19 passed with one known netCDF/numpy binary
+  compatibility warning; pytest exited 0 before the known Windows post-exit
+  diagnostic.
+- Focused sequential-precipitation and DSS-grid suite: 56 passed with four
+  pre-existing unregistered `slow` marker warnings.
+- Final combined `RasProcess`, MRMS, sequential-precipitation, and DSS-grid
+  regression run: 87 passed with six known environment/fixture warnings;
+  pytest exited 0.
+
+### Notebook 917 Corrective Record
+
+- The first complete rerun was rejected even though the notebook process
+  exited 0. A July 2026 regression serialized precipitation as interleaved
+  `(hour, depth)` fields while HEC-RAS expects exactly one incremental depth
+  per `Interval=` step. HEC-RAS therefore consumed hour values as rainfall,
+  producing hydraulically invalid peak rates and cumulative depths.
+- `RasUnsteady`, `RasPrj`, and the USGS boundary replacement parser now read
+  and write the native sequential-depth format. The final HDF forcing checks
+  match the rounded serialized inputs exactly: Davis `0.22 in/hr` and
+  `1.73 in`; New Orleans `0.95 in/hr` and `4.10 in`. Both no-rain baselines
+  remain zero.
+- `RasDss.read_grid()` now provides exact spatial-grid value and metadata
+  readback. The qpkit verification catalog contains 37 records and its
+  deterministic peak-hour record reads row 3, column 5 as
+  `6.900000095367432 mm`, `PER-CUM`, Albers, with the complete CRS, cell size,
+  shape, origin, lower-left cell, missing-value count, and nodata value stored
+  in notebook output.
+- Hydraulic comparison cells are selected by maximum concurrent
+  event-minus-baseline depth. Davis cell 600 increases `2.568577 ft`; New
+  Orleans cell 17519 increases `19.675402 ft`. Pump flow and WSE comparisons
+  provide additional response evidence.
+- The final raster audit produced 30 consolidated frames per case. Davis
+  preserved its native `28.845-ft` cells with two whole-timestamp HDF fills;
+  New Orleans consolidated 76 retained multi-terrain tiles at `10 ft` with
+  three whole-timestamp HDF fills. Every final frame matched HDF wetness.
+- The independent review rated model context Thorough, hydraulic relevancy
+  Pass, visual quality Acceptable, and demonstration completeness Complete.
+  Its overall verdict was PASS with no required revisions.
+
+### Notebook 917 Terrain And Output Policy
+
+- Terrain discovery is limited to the terrain HDF layers registered in the
+  project's `.rasmap`; unrelated TIFFs in the Terrain folder are excluded.
+- The dominant active terrain is selected by valid-data coverage, not by the
+  rectangular raster extent. Davis therefore preserves its native
+  28.845245-ft cells.
+- Multi-terrain New Orleans frames are written broad/coarse first and then
+  overwritten by finer/local valid pixels. Its dominant source is 3.28 ft, so
+  the approved sub-10-ft policy consolidates the selected frames at 10 ft.
+- At most 30 representative frames are selected across each full consecutive
+  five-minute event window, including both endpoints. Every selected timestamp
+  is written as one consolidated GeoTIFF.
+- HDF gap fills use the same case-specific consolidation resolution. Every
+  final GeoTIFF is reopened and checked for CRS, transform, resolution,
+  dimensions, nodata, and timestamp metadata.
+- Real-file smoke tests passed for both projects before execution. The final
+  source-matching execution and independent artifact review also passed.
+
+## Completed HRRR Temporal Contract And Hydraulic Follow-Up
+
+`PrecipHrrr.get_basin_average()` previously labeled its sequential row index
+as `forecast_hour` and logged every record as one hour. That was incorrect for
+HRRR `wrfsubhf`, which returned four 15-minute records per forecast hour in the
+live notebook validation.
+
+The focused correction:
+
+- preserves `forecast_hour` as a documented legacy 1-based record index;
+- adds source-derived `valid_time` and fractional `forecast_lead_hours`;
+- requires one coherent forecast cycle, strictly increasing leads, unique
+  chronological valid times, and agreement between `time + step` and
+  `valid_time`; and
+- logs record count, valid-time spacing, and lead range instead of calling the
+  record count hours.
+
+Validation evidence:
+
+- focused HRRR basin-average suite: 10 passed;
+- notebook 916: 12/12 code cells executed from source in 961.01 seconds with
+  no errors or warning output and four embedded figures;
+- live `wrfsubhf` timing analysis: 72 quarter-hour records covering lead hours
+  0.25-18.00, with 0.066 inches over the rectangular analysis window;
+- qpkit `v0.1.0` used hourly `wrfsfc` APCP from the same forecast cycle to
+  write and catalog 18 contiguous hourly `PER-CUM` SHG grids over the exact
+  simulation period; `wrfsubhf` and `wrfsfc` are related but distinct products,
+  so the 0.066-inch analysis average is not the DSS forcing total;
+- the DSS footprint covered all 19,597 result/cell centers and all 37,594 mesh
+  faces;
+- HEC-RAS 7.0 completed both the no-rain `p07` and live-HRRR `p08` plans at a
+  10-second computation interval;
+- both plans reported `Complete Process`, maximum cell WSEL error of 0.0099
+  feet, zero cells above 0.01 feet WSEL error, and approximately 0.000002
+  percent volume error;
+- the selected live cycle was dry over the hydraulic model, so HEC-RAS applied
+  zero precipitation at model cells and the verified hydraulic difference was
+  zero; and
+- independent notebook review, hydraulic consistency audit, and notebook
+  schema/metadata validation all passed.
+
+Notebook 916 now demonstrates forecast acquisition through hydraulic result
+comparison. It remains an automation and hydraulic-evaluation example rather
+than an operational forecast: the averaging window is rectangular rather than
+a delineated watershed, precipitation is the only live forecast input, the
+upstream hydrograph is synthetic, Sayers Dam Gate #1 retains the supplied
+2.0-foot opening because operating data are unavailable, and the instructional
+diffusion-wave model is not calibrated for forecasting.
+
+## Completed Notebook Inventory Integrity Follow-Up
+
+The July 2026 inventory follow-up resolved repository bookkeeping without
+changing notebook input or output cells:
+
+- renamed the newer Manning-region authoring notebook from duplicate prefix
+  `219` to `233` and preserved the old published route with a redirect;
+- added missing notebook 229 metadata and refreshed stale factual counts;
+- made template-like 900-series summaries state what is and is not executed;
+- enforced unique numeric prefixes and complete metadata in documentation CI;
+  and
+- synchronized the 127-notebook README and published example index.
+
+Substantive upgrades to the template-like forecast, validation, and terrain
+examples remain independent work; they are no longer conflated with inventory
+or numbering defects.
+
+## Completed JOSS Paper And License Follow-Up
+
+The stale `origin/claude/joss-paper-ras-commander-KXMbR` branch was used only
+as historical source material. It was not merged or cherry-picked because its
+module counts, notebook counts, agent architecture, test claims, related-work
+metadata, performance claims, and operational claims no longer matched current
+`main`.
+
+- PR #279 reconstructed the paper on current `main` and merged as `4116d86f`
+  on 2026-07-12.
+- The 1,111-word manuscript contains all eight current JOSS sections and nine
+  audited references. It replaces the historical false pyHMT2D DOI and removes
+  unsupported benchmark, adoption, and feature-completeness claims.
+- `paper/architecture.py` writes repository-relative output and provides a
+  deterministic `--check` mode. The committed PNG is 3000 by 1860 pixels.
+- The official Open Journals draft action compiled a four-page PDF successfully
+  in run `29196158022`; all pages and the architecture figure were inspected.
+- PR #280 restored the complete canonical MIT license and merged as `60f99ba4`
+  on 2026-07-12. GitHub now identifies the repository license as SPDX `MIT`.
+- No API or notebook files changed in either PR. Persistent paper, PDF, rendered
+  page, and git review artifacts are under
+  `H:/Symphony/ras-commander/JOSS-paper-2026-07-12/`.
+
+## Remaining Independent Backlogs
+
+- `2026-04-29_ebfe_validation_matrix_completion_plan.md`: real eBFE validation
+  and model-delivery work; substantial and independent of precipitation.
+- `notebook_inventory_audit_2026-06-26.md`: numbering and manifest integrity
+  are complete; substantive template-like 900-series example upgrades remain.
+- `2026-06-22_docs_navigability_audit.md`: residual public-doc navigation,
+  consistency, and landing-page work requires a fresh verification pass.
+- JOSS paper-build CI: decide whether to retain the official Open Journals
+  draft workflow used for the temporary validation branch.
+- JOSS test readiness: audit the current test suite and define a reliable CI
+  subset without pretending Windows/HEC-RAS integration tests run on Linux.
+- JOSS archiving: create an immutable software release archive and DOI before
+  final acceptance, then replace the repository-only software citation.
+- JOSS research impact: preserve public evidence of external use, integrations,
+  publications, or case studies as it becomes available; do not substitute
+  aspirational adoption language.
+- `origin/feature/711-rasremote-mannings-sensitivity`: optional advanced remote
+  and Sabinal-specific 711 concepts only. Do not merge the branch wholesale;
+  the public notebook refresh already landed in PR #271.
+
+## Branch Triage Rules
+
+- Treat merged PR heads as cleanup candidates, not sources of new work.
+- Treat closed superseded branches as historical evidence unless an exact hunk
+  is proven absent from current `main`.
+- Compare notebook input cells independently from output and metadata changes.
+- Rerun changed notebooks from a clean environment and preserve faithful
+  outputs; do not rewrite outputs in the docs build.
+- Keep generated model data and temporary execution artifacts untracked.

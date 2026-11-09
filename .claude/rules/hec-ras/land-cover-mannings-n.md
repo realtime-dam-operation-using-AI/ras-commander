@@ -44,7 +44,10 @@ Grassland-Herbaceous,0.03125
 ...
 ```
 
-- `LCMann Table=0` means **no overrides defined** (empty table)
+- The integer in `LCMann Table=N` is the number of following override rows
+- `LCMann Table=0` means **no overrides defined** and must not be followed by rows
+- A non-empty block whose header count does not match its emitted rows is invalid;
+  HEC-RAS 7.0 ignores those rows
 - Class names must match the sidecar's `Raster Map` names exactly
 - These override the sidecar base values; they do NOT replace them
 
@@ -72,7 +75,10 @@ HEC-RAS does **NOT** have a 16-class limit. Verified with production models:
 | Lower Calcasieu (NLCD) | 16 | 16 | All NaN (no overrides, uses sidecar) |
 | Bayou Pierre (NLCD) | 18 | 16 | All NaN (no overrides, uses sidecar) |
 
-Models with `LCMann Table=0` show all-NaN calibration entries because no overrides are defined. This is normal -- HEC-RAS reads the sidecar `Variables` directly.
+Models with an actually empty `LCMann Table=0` show all-NaN calibration entries
+because no overrides are defined. This is normal -- HEC-RAS reads the sidecar
+`Variables` directly. A zero header followed by override rows is not equivalent:
+HEC-RAS 7.0 ignores the inconsistent rows.
 
 ## Special Characters in Class Names
 
@@ -87,32 +93,114 @@ from ras_commander.geom import ManningsFromLandCover
 table = ManningsFromLandCover.default_landcover_classification_table()
 ```
 
-## Required Flags for Spatial Manning's n
+## Per-cell Manning's n comes from the land-cover ASSOCIATION, not from the two flags
 
-Two flags in the plain-text `.g##` must be enabled for per-cell land cover Manning's n:
+> **Correction (2026-06-01):** a prior version of this rule claimed that
+> `spatially_varied_mann_on_faces` and `composite_classification` "must be enabled for per-cell
+> land cover Manning's n," and that with `spatially_varied_mann_on_faces=False` HEC-RAS uses a
+> uniform n regardless of land cover. **That is wrong.** Cell-center land-cover Manning's n is
+> driven by the **land-cover association** (sidecar `LandCover.hdf` + raster, referenced from the
+> `.rasmap` / geometry HDF), independent of those two flags.
+
+**Verified empirically** (`BaldEagleCrkMulti2D` g01): both flags are `False`, the `2mannings_n`
+default attribute is a single value (0.04), yet the preprocessed
+`Geometry/2D Flow Areas/<area>/Cells Center Manning's n` is spatially varied (**0.03–0.15 per cell**,
+89,879 cells) derived directly from the land-cover association. The uniform default attribute is
+only a fallback used where no association/class applies.
+
+What the two flags actually control:
+
+- `spatially_varied_mann_on_faces` — enables **depth-varying Manning's n on cell FACES**: a per-face
+  n that varies with flow depth, derived from the sub-grid land cover within each face (see the
+  CLB-757 depth-varying face-n API). This is a face-level refinement, **not** the on/off switch for
+  cell-center land-cover n.
+- `composite_classification` — composite (area-weighted) classification of face Manning's n.
 
 ```python
+# Optional refinement (depth-varying FACE n). NOT required for cell-center land-cover n,
+# which is applied whenever a land-cover association exists.
 from ras_commander.geom import GeomStorage
-
 GeomStorage.set_2d_flow_area_settings(
     geom_file, flow_area_name,
-    spatially_varied_mann_on_faces=True,   # use LCMann Table per cell
-    composite_classification=True,          # composite weighting per face
+    spatially_varied_mann_on_faces=True,
+    composite_classification=True,
 )
 ```
 
-When `spatially_varied_mann_on_faces=False`, HEC-RAS assigns uniform base Manning's n to every cell regardless of land cover.
+### Propagating an LCMann / sidecar change to per-cell n (matters for sensitivity/Monte Carlo)
+
+The preprocessed `Cells Center Manning's n` is **cached in the `.g##.hdf`**. Editing the plain-text
+`LCMann Table` (or the sidecar `Variables`) does **not** change per-cell n until the geometry
+preprocessor re-derives it.
+
+**Historical hazard:** earlier, `clear_geompre=True` only deleted `.c##` and **preserved** the
+`.g##.hdf` (and its cached per-cell n), so a plain-text `LCMann Table` edit was silently **ignored at
+compute time** — a Monte Carlo ensemble that perturbed the `LCMann Table` across 30 samples produced
+**byte-identical per-cell n and identical WSE** in every sample.
+
+**Current safe path:** use `RasMap.recompute_property_tables()` to ask the selected
+HEC-RAS/RASMapper version to refresh the solver-owned geometry tables. The method
+requires HEC-RAS to mark the geometry complete and, for every 2D area, verifies
+that the paired cell-volume and face-area tables are present and nonempty.
+`GeomPreprocessor.clear_geompre_files()` deletes `.c##` files only; it does not
+mutate `.g##.hdf` datasets.
+
+`GeomPreprocessor.invalidate_legacy_geometry_hdf_preprocessor_cache()` is a
+backup-first, explicitly acknowledged recovery utility for exact qualified
+HEC-RAS 5.x/6.x geometry-HDF schemas. It is not the routine preprocessing path.
+The deprecated `clear_geompre_hdf()` name cannot mutate silently.
+
+**Smart-skip caveat:** native recomputation only helps if `compute_plan()` gets far enough
+to request it. The smart skip is evaluated **before** the `clear_geompre` branch, and
+`are_plan_results_current()` compares only `.p##`/`.g##`/`.u##` mtimes against the results HDF. A
+sidecar/`LCMann` perturbation leaves all three untouched, so results still look "current",
+`compute_plan(clear_geompre=True)` returns success **without clearing and without running**, and the
+sample silently reuses the previous per-cell n. Pinned by
+`tests/test_rascmdr_compute_plan_control_flow.py::test_compute_plan_clear_geompre_is_skipped_when_results_are_current`.
+
+The skip only fires when the results genuinely look newer than `.p##`/`.g##`/`.u##`.
+Anything that refreshes one of those mtimes defeats it:
+
+| Ensemble shape | Skip fires? | What to use |
+|---|---|---|
+| `RasMonteCarlo.run_ensemble(clone_geom=True)` | No — cloning gives each `.g##` a fresh mtime | Native geometry/plan computation |
+| Fresh `dest_folder` per sample | No — copied results are not current | Native geometry/plan computation |
+| Perturb sidecar in place, reuse one geometry | **Yes** — `.g##` mtime never changes | `force_geompre=True` |
+
+```python
+# In-place sidecar perturbation: bypass the skip and request native full
+# geometry processing before the plan run.
+RasCmdr.compute_plan(plan_number, force_geompre=True, ras_object=ras)
+```
 
 ## Preprocessing: clear_geompre vs force_geompre
 
 When land cover associations exist in the geometry HDF:
 
-- **`clear_geompre=True`**: Deletes only `.c##` binary files. Preserves the `.g##.hdf` with its land cover filename attribute. **Use this.**
-- **`force_geompre=True`**: Deletes both `.g##.hdf` AND `.c##`. Destroys the land cover filename attribute that tells HEC-RAS where the sidecar is. **Avoid when land cover is configured.**
+- **`clear_geompre=True`**: Deletes `.c##` binary files only. Use it after a
+  native `RasMap.recompute_property_tables()` when a plan compute must rebuild
+  downstream preprocessor artifacts.
+- **`force_geompre=True`**: Bypasses the smart results skip, deletes `.c##`
+  files, and requests full native geometry processing via
+  `RasProcess.compute_geometry()` before the plan run. It preserves the geometry
+  HDF and its land-cover and terrain associations; it does not selectively
+  delete solver-owned HDF datasets.
 
 ```python
-RasCmdr.compute_plan(plan_number, clear_geompre=True)  # correct
+RasMap.recompute_property_tables(
+    ras_project_path,
+    geom_file,
+    hecras_version="7.0",
+)
+RasCmdr.compute_plan(plan_number, clear_geompre=True)
+
+# Sidecar-only edit: mtime does not expose the change to the smart skip.
+RasCmdr.compute_plan(plan_number, force_geompre=True)
 ```
+
+> `clear_geompre=True` alone does **not** defeat the smart skip. If a
+> perturbation leaves the `.g##` mtime untouched, use `force_geompre=True` (or
+> `force_rerun=True`) so the requested native processing is not skipped.
 
 ## Authoring Workflow
 
@@ -128,6 +216,7 @@ authored_hdf = RasMap.add_landcover_layer(
     ras_project_path, nlcd_raster,
     classification_table=classification_table,
     layer_name="NLCD Land Cover",
+    hecras_version="7.0",
 )
 
 # 2. Optionally write base overrides to plain-text geometry
@@ -143,7 +232,12 @@ GeomStorage.set_2d_flow_area_settings(
 # 4. Associate sidecar with geometry HDF
 RasMap.associate_geometry_layers(rasmap_path, geom_hdf_path)
 
-# 5. Run with clear_geompre (preserves HDF associations)
+# 5. Ask HEC-RAS to refresh property tables, then run
+RasMap.recompute_property_tables(
+    ras_project_path,
+    geom_file,
+    hecras_version="7.0",
+)
 RasCmdr.compute_plan(plan_number, clear_geompre=True)
 ```
 

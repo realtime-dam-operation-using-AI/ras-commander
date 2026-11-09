@@ -13,6 +13,7 @@ import h5py
 
 from ..Decorators import standardize_input, log_call
 from ..LoggingConfig import get_logger
+from ..fast_hdf import read_typed, reraise_required
 from .types import Severity, FlowType, CheckMessage, CheckResults
 from .thresholds import ValidationThresholds, get_default_thresholds
 from .messages import get_message_template, get_help_text, format_message
@@ -67,7 +68,9 @@ class CheckNt:
             geom_hdf = Path(geom_hdf)
             xs_gdf = HdfXsec.get_cross_sections(geom_hdf)
         except Exception as e:
-            logger.error(f"Failed to read geometry HDF: {e}")
+            reraise_required(e)
+            logger.error("Failed to read geometry HDF for Manning's n checks")
+            logger.debug("Geometry HDF read failure for %s: %s", geom_hdf, e)
             msg = CheckMessage(
                 message_id="SYS_002",
                 severity=Severity.ERROR,
@@ -386,7 +389,8 @@ class CheckNt:
                 results.messages = messages
                 return results
 
-            logger.info(f"Checking HTAB parameters for {len(xs_df)} cross sections")
+            logger.debug(f"Checking HTAB parameters for {len(xs_df)} cross sections")
+            skipped_xs = []
 
             for _, row in xs_df.iterrows():
                 river = row['River']
@@ -547,8 +551,17 @@ class CheckNt:
                     })
 
                 except Exception as e:
-                    logger.warning(f"Error checking HTAB for {river}/{reach}/RS {rs}: {e}")
+                    detail = f"{river}/{reach}/RS {rs}: {e}"
+                    skipped_xs.append(detail)
+                    logger.debug("Error checking HTAB for %s", detail)
                     continue
+
+            if skipped_xs:
+                logger.warning(
+                    "Skipped %d cross section(s) during HTAB parameter checks",
+                    len(skipped_xs),
+                )
+                logger.debug("Skipped HTAB cross sections: %s", skipped_xs)
 
             results.messages = messages
 
@@ -567,7 +580,8 @@ class CheckNt:
             )
 
         except Exception as e:
-            logger.error(f"Failed to check HTAB parameters: {e}")
+            logger.error("Failed to check HTAB parameters")
+            logger.debug("HTAB parameter check failure for %s: %s", geom_file, e)
             msg = CheckMessage(
                 message_id="SYS_002",
                 severity=Severity.ERROR,
@@ -657,9 +671,10 @@ class CheckNt:
                 results.messages = messages
                 return results
 
-            logger.info(
+            logger.debug(
                 f"Checking structure HTAB parameters for {len(structure_rows)} structures"
             )
+            skipped_structures = []
 
             for row in structure_rows:
                 river = row.get('River', '')
@@ -751,8 +766,17 @@ class CheckNt:
                         messages.append(msg)
 
                 except Exception as e:
-                    logger.warning(f"Error checking structure HTAB for {structure_name}: {e}")
+                    detail = f"{structure_name}: {e}"
+                    skipped_structures.append(detail)
+                    logger.debug("Error checking structure HTAB for %s", detail)
                     continue
+
+            if skipped_structures:
+                logger.warning(
+                    "Skipped %d structure(s) during HTAB parameter checks",
+                    len(skipped_structures),
+                )
+                logger.debug("Skipped structure HTAB entries: %s", skipped_structures)
 
             results.messages = messages
 
@@ -761,7 +785,8 @@ class CheckNt:
             )
 
         except Exception as e:
-            logger.error(f"Failed to check structure HTAB parameters: {e}")
+            logger.error("Failed to check structure HTAB parameters")
+            logger.debug("Structure HTAB check failure for %s: %s", geom_file, e)
             msg = CheckMessage(
                 message_id="SYS_002",
                 severity=Severity.ERROR,
@@ -810,7 +835,8 @@ class CheckNt:
 
         geom_file = Path(geom_file)
         if not geom_file.exists():
-            logger.warning(f"Geometry file not found for subgrid check: {geom_file}")
+            logger.warning("Geometry file not found for subgrid check: %s", geom_file.name)
+            logger.debug("Missing geometry file for subgrid check: %s", geom_file)
             return results
 
         try:
@@ -867,7 +893,8 @@ class CheckNt:
             )
 
         except Exception as e:
-            logger.error(f"Failed to check subgrid sampling options: {e}")
+            logger.error("Failed to check subgrid sampling options")
+            logger.debug("Subgrid sampling check failure for %s: %s", geom_file, e)
 
         return results
 
@@ -1007,7 +1034,7 @@ class CheckNt:
                 if 'Geometry/Structures/Attributes' not in hdf:
                     return messages
 
-                struct_attrs = hdf['Geometry/Structures/Attributes'][:]
+                struct_attrs = read_typed(hdf['Geometry/Structures/Attributes'], slice(None))
                 attr_names = struct_attrs.dtype.names
 
                 if 'US Type' not in attr_names or 'DS Type' not in attr_names:
@@ -1081,7 +1108,9 @@ class CheckNt:
                                 messages.append(msg)
 
         except Exception as e:
-            logger.warning(f"Could not check structure transition coefficients: {e}")
+            reraise_required(e)
+            logger.warning("Could not check structure transition coefficients")
+            logger.debug("Structure transition coefficient check failure: %s", e)
 
         return messages
 
@@ -1115,7 +1144,7 @@ class CheckNt:
                 if 'Geometry/Structures/Attributes' not in hdf:
                     return messages
 
-                attrs = hdf['Geometry/Structures/Attributes'][:]
+                attrs = read_typed(hdf['Geometry/Structures/Attributes'], slice(None))
 
                 # Find all bridges
                 bridge_indices = []
@@ -1129,10 +1158,13 @@ class CheckNt:
                         bridge_indices.append(i)
 
         except Exception as e:
-            logger.warning(f"Could not read structures for bridge n check: {e}")
+            reraise_required(e)
+            logger.warning("Could not read structures for bridge Manning's n check")
+            logger.debug("Bridge Manning's n structure read failure for %s: %s", geom_hdf, e)
             return messages
 
         # Check each bridge
+        skipped_bridges = []
         for bridge_idx in bridge_indices:
             try:
                 bridge_data = CheckNt._get_bridge_section_mannings_n(geom_hdf, bridge_idx)
@@ -1258,8 +1290,17 @@ class CheckNt:
                         messages.append(msg)
 
             except Exception as e:
-                logger.warning(f"Could not check bridge {bridge_idx}: {e}")
+                reraise_required(e)
+                skipped_bridges.append(f"{bridge_idx}: {e}")
+                logger.debug("Could not check bridge %s: %s", bridge_idx, e)
                 continue
+
+        if skipped_bridges:
+            logger.warning(
+                "Skipped %d bridge(s) during bridge Manning's n checks",
+                len(skipped_bridges),
+            )
+            logger.debug("Skipped bridge Manning's n entries: %s", skipped_bridges)
 
         return messages
 
@@ -1297,8 +1338,8 @@ class CheckNt:
         """
         with h5py.File(geom_hdf, 'r') as hdf:
             # Get structure attributes
-            attrs = hdf['Geometry/Structures/Attributes'][bridge_idx]
-            table_info = hdf['Geometry/Structures/Table Info'][bridge_idx]
+            attrs = read_typed(hdf['Geometry/Structures/Attributes'], bridge_idx)
+            table_info = read_typed(hdf['Geometry/Structures/Table Info'], bridge_idx)
 
             river = attrs['River'].decode('utf-8').strip() if isinstance(attrs['River'], bytes) else str(attrs['River'])
             reach = attrs['Reach'].decode('utf-8').strip() if isinstance(attrs['Reach'], bytes) else str(attrs['Reach'])
@@ -1307,9 +1348,9 @@ class CheckNt:
             ds_rs = attrs['DS RS'].decode('utf-8').strip() if isinstance(attrs['DS RS'], bytes) else str(attrs['DS RS'])
 
             # Get cross section Manning's n data
-            xs_attrs = hdf['Geometry/Cross Sections/Attributes'][:]
-            xs_mann_info = hdf['Geometry/Cross Sections/Manning\'s n Info'][:]
-            xs_mann_values = hdf['Geometry/Cross Sections/Manning\'s n Values'][:]
+            xs_attrs = read_typed(hdf['Geometry/Cross Sections/Attributes'], slice(None))
+            xs_mann_info = read_typed(hdf['Geometry/Cross Sections/Manning\'s n Info'], slice(None))
+            xs_mann_values = read_typed(hdf['Geometry/Cross Sections/Manning\'s n Values'], slice(None))
 
             # Find Section 1 (US RS) in cross sections
             section_1_n = []
@@ -1347,7 +1388,7 @@ class CheckNt:
 
             if section_2_custom and 'Geometry/Structures/Mannings Data' in hdf:
                 us_br_idx = int(table_info['US BR Mann (Index)'])
-                struct_mann = hdf['Geometry/Structures/Mannings Data'][:]
+                struct_mann = read_typed(hdf['Geometry/Structures/Mannings Data'], slice(None))
                 section_2_n = [(float(struct_mann[us_br_idx + j][0]),
                                float(struct_mann[us_br_idx + j][1]))
                               for j in range(us_br_cnt)]
@@ -1361,7 +1402,7 @@ class CheckNt:
 
             if section_3_custom and 'Geometry/Structures/Mannings Data' in hdf:
                 ds_br_idx = int(table_info['DS BR Mann (Index)'])
-                struct_mann = hdf['Geometry/Structures/Mannings Data'][:]
+                struct_mann = read_typed(hdf['Geometry/Structures/Mannings Data'], slice(None))
                 section_3_n = [(float(struct_mann[ds_br_idx + j][0]),
                                float(struct_mann[ds_br_idx + j][1]))
                               for j in range(ds_br_cnt)]

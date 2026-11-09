@@ -1,0 +1,228 @@
+.ras-example-library {
+  --ras-library-panel: #ffffff;
+  --ras-library-border: #d7dee8;
+  --ras-library-text: #172033;
+  --ras-library-muted: #66748a;
+  --ras-library-accent: #2563eb;
+  margin: 1rem 0 1.5rem;
+}
+
+.ras-library-map-shell {
+  min-height: 420px;
+  height: min(62vh, 680px);
+  border: 1px solid var(--ras-library-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #eef2f3;
+}
+
+.ras-library-map {
+  width: 100%;
+  height: 100%;
+}
+
+.ras-library-map-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.45rem;
+  color: var(--ras-library-muted);
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.ras-library-table-wrap {
+  margin: 1rem 0 0;
+  overflow-x: auto;
+  border: 1px solid var(--ras-library-border);
+  border-radius: 6px;
+}
+
+.ras-library-table {
+  width: 100%;
+  min-width: 700px;
+  margin: 0;
+  border: 0;
+  border-collapse: collapse;
+  color: var(--ras-library-text);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.ras-library-table th,
+.ras-library-table td {
+  padding: 0.6rem 0.7rem;
+  border: 0;
+  border-bottom: 1px solid var(--ras-library-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.ras-library-table th {
+  background: #f4f7fb;
+  color: var(--ras-library-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.ras-library-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.ras-library-table td:first-child {
+  width: 24%;
+  min-width: 12rem;
+  font-weight: 700;
+}
+
+.ras-library-table td:nth-child(3) {
+  width: 18%;
+  min-width: 9rem;
+}
+
+.ras-library-project-information {
+  color: #344258;
+}
+
+.ras-library-project-meta {
+  display: block;
+  margin-top: 0.22rem;
+  color: var(--ras-library-muted);
+  font-size: 0.66rem;
+  line-height: 1.3;
+  font-weight: 500;
+}
+
+.ras-library-project-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.65rem;
+  margin-top: 0.35rem;
+}
+
+.ras-library-project-link--disabled {
+  color: var(--ras-library-muted);
+  font-weight: 700;
+}
+
+.ras-library-project-version {
+  color: var(--ras-library-muted);
+}
+
+.ras-library-table a,
+.ras-library-popup a {
+  color: var(--ras-library-accent);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.ras-library-table a:hover,
+.ras-library-popup a:hover {
+  text-decoration: underline;
+}
+
+.ras-library-popup {
+  color: var(--ras-library-text);
+}
+
+.ras-library-popup h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.85rem;
+  line-height: 1.2;
+}
+
+.ras-library-popup > h2 {
+  margin: 0 0 0.45rem;
+  font-size: 0.78rem;
+  line-height: 1.2;
+}
+
+.ras-library-popup__project + .ras-library-popup__project {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--ras-library-border);
+}
+
+.ras-library-popup__type,
+.ras-library-popup__version {
+  color: #344258 !important;
+  font-weight: 700;
+}
+
+.ras-library-popup p {
+  margin: 0 0 0.55rem;
+  color: var(--ras-library-muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+@media (max-width: 760px) {
+  .ras-library-map-shell {
+    min-height: 360px;
+    height: 58vh;
+  }
+
+  .ras-library-map-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .ras-library-table-wrap {
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .ras-library-table,
+  .ras-library-table tbody,
+  .ras-library-table tr,
+  .ras-library-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .ras-library-table {
+    min-width: 0;
+  }
+
+  .ras-library-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .ras-library-table tbody tr {
+    margin-bottom: 0.65rem;
+    padding: 0.65rem 0.7rem;
+    border: 1px solid var(--ras-library-border);
+    border-radius: 6px;
+  }
+
+  .ras-library-table th,
+  .ras-library-table td,
+  .ras-library-table td:first-child,
+  .ras-library-table td:nth-child(3) {
+    width: 100%;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .ras-library-table td + td {
+    margin-top: 0.45rem;
+  }
+
+  .ras-library-table td:nth-child(3)::before {
+    content: "HEC-RAS version: ";
+    font-weight: 700;
+  }
+}

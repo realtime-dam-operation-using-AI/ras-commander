@@ -47,6 +47,7 @@ from typing import Union, Optional, List, Dict, Any
 import pandas as pd
 import numpy as np
 
+from .._ras_text import _write_ras_text
 from ..LoggingConfig import get_logger
 from ..Decorators import log_call
 from .GeomParser import GeomParser
@@ -1535,7 +1536,7 @@ class GeomBridge:
                     'Elevation': elevations,
                     'Source': 'bridge_block'
                 })
-                logger.info(
+                logger.debug(
                     f"Extracted {section} bridge opening XS ({len(df)} pts) "
                     f"for {river}/{reach}/RS {rs} from bridge block"
                 )
@@ -1551,7 +1552,7 @@ class GeomBridge:
                     'Elevation': elevations,
                     'Source': 'approach_xs'
                 })
-                logger.info(
+                logger.debug(
                     f"Extracted {section} bridge opening XS ({len(df)} pts) "
                     f"for {river}/{reach}/RS {rs} from adjacent approach XS"
                 )
@@ -1801,11 +1802,11 @@ class GeomBridge:
         Returns:
             dict with keys:
             - low_flow_method: one of ``energy``, ``momentum``, ``yarnell``,
-              ``wspro`` or None if no method code is present
+                ``wspro`` or None if no method code is present
             - high_flow_method: ``energy`` or ``pressure_weir`` when available
             - enabled_low_flow_methods: per-method compute flags from BR Coef
             - coefficients: Momentum, Yarnell, pressure-flow, deck/weir, and
-              audit values
+                audit values
             - deck: parsed values from the ``Deck Dist Width WeirC`` record
             - wspro: named WSPRO fields, or None if no WSPro record exists
             - raw: original method records and comma fields for audit
@@ -2206,10 +2207,9 @@ class GeomBridge:
 
             if create_backup:
                 backup_path = GeomParser.create_backup(geom_file)
-                logger.info(f"Created backup: {backup_path}")
+                logger.debug(f"Created backup: {backup_path}")
 
-            with open(geom_file, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(geom_file, "".join(lines), encoding="utf-8")
 
             after = GeomBridge.get_hydraulic_methods(
                 geom_file, river, reach, rs, opening_index=opening_index
@@ -2245,7 +2245,8 @@ class GeomBridge:
         except Exception as e:
             logger.error(f"Error writing bridge hydraulic methods: {str(e)}")
             if backup_path and backup_path.exists():
-                logger.info(f"Restoring from backup: {backup_path}")
+                logger.warning("Restoring bridge hydraulic methods from backup")
+                logger.debug(f"Backup path: {backup_path}")
                 import shutil
                 shutil.copy2(backup_path, geom_file)
             raise IOError(f"Failed to write bridge hydraulic methods: {str(e)}")
@@ -2275,9 +2276,11 @@ class GeomBridge:
             ValueError: If structure not found
 
         Example:
+            ```python
             >>> htab = GeomBridge.get_htab("model.g08", "River", "Reach", "25548")
             >>> hw_max = htab[htab['Parameter'] == 'HWMax']['Value'].values[0]
             >>> print(f"HW Max: {hw_max}")
+            ```
         """
         geom_file = Path(geom_file)
 
@@ -2409,7 +2412,7 @@ class GeomBridge:
             - Returns None for missing parameters (doesn't raise errors)
             - The 'invert' key contains the minimum LowChord value from deck geometry
             - This can be used to calculate optimal HWMax with safety factors:
-              optimal_hw_max = invert + (max_observed_depth * safety_factor)
+                optimal_hw_max = invert + (max_observed_depth * safety_factor)
         """
         geom_file = Path(geom_file)
 
@@ -3307,7 +3310,7 @@ class GeomBridge:
         try:
             # Create backup
             backup_path = GeomParser.create_backup(geom_file)
-            logger.info(f"Created backup: {backup_path}")
+            logger.debug(f"Created backup: {backup_path}")
 
             # Read file
             with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
@@ -3356,8 +3359,7 @@ class GeomBridge:
                 logger.debug(f"Inserted {lines_inserted} new HTAB lines at line {insert_idx}")
 
             # Write modified file
-            with open(geom_file, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(geom_file, "".join(lines), encoding="utf-8")
 
             logger.debug(f"Successfully wrote HTAB parameters for {river}/{reach}/RS {rs}")
 
@@ -3387,7 +3389,8 @@ class GeomBridge:
             logger.error(f"Error writing HTAB parameters: {str(e)}")
             # Attempt to restore from backup if write failed
             if backup_path and backup_path.exists():
-                logger.info(f"Restoring from backup: {backup_path}")
+                logger.warning("Restoring HTAB parameters from backup")
+                logger.debug(f"Backup path: {backup_path}")
                 import shutil
                 shutil.copy2(backup_path, geom_file)
             raise IOError(f"Failed to write HTAB parameters: {str(e)}")
@@ -3561,7 +3564,7 @@ class GeomBridge:
             - Structures without existing HTAB lines get new lines inserted
             - Structures with existing HTAB lines have values replaced
             - Uses single file read/write cycle for efficiency (faster than calling
-              set_htab() for each structure individually)
+                set_htab() for each structure individually)
 
         Example:
             >>> # Double existing HWMax/MaxFlow values and set optimal curve points
@@ -3605,7 +3608,7 @@ class GeomBridge:
             # Create backup if requested
             if create_backup:
                 backup_path = GeomParser.create_backup(geom_file)
-                logger.info(f"Created backup: {backup_path}")
+                logger.debug(f"Created backup: {backup_path}")
 
             # Read file once
             with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:
@@ -3717,8 +3720,7 @@ class GeomBridge:
                 )
 
             # Write modified file once
-            with open(geom_file, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(geom_file, "".join(lines), encoding="utf-8")
 
             total_modified = bridges_modified + inline_weirs_modified
             logger.debug(
@@ -3742,7 +3744,8 @@ class GeomBridge:
             logger.error(f"Error in set_all_structures_htab: {str(e)}")
             # Attempt to restore from backup if write failed
             if backup_path and backup_path.exists():
-                logger.info(f"Restoring from backup: {backup_path}")
+                logger.warning("Restoring structure HTAB parameters from backup")
+                logger.debug(f"Backup path: {backup_path}")
                 import shutil
                 shutil.copy2(backup_path, geom_file)
             raise IOError(f"Failed to modify structure HTAB parameters: {str(e)}")
@@ -3797,7 +3800,7 @@ class GeomBridge:
             submerged_curves: Number of submerged curves (default 60, optimal 60)
             points_per_curve: Points per submerged curve (default 50, optimal 50)
             validate: If True, validate parameters before writing (default: True)
-            ras_object: RasPrj object for multi-project workflows
+            ras_object (RasPrj, optional): RasPrj object for multi-project workflows
 
         Returns:
             dict: Parameters applied with keys:
@@ -4002,7 +4005,7 @@ class GeomBridge:
             points_per_curve: Points per submerged curve (optimal 50)
             create_backup: Whether to create a .bak backup before modification (default True).
                           Set to False when called from an orchestrator that manages its own backup.
-            ras_object: RasPrj object for multi-project workflows
+            ras_object (RasPrj, optional): RasPrj object for multi-project workflows
 
         Returns:
             dict: Summary with keys:
@@ -4050,7 +4053,7 @@ class GeomBridge:
         backup_path = None
         if create_backup:
             backup_path = GeomParser.create_backup(geom_file)
-            logger.info(f"Created backup: {backup_path}")
+            logger.debug(f"Created backup: {backup_path}")
 
         # Read file and find all structures
         with open(geom_file, 'r', encoding='utf-8', errors='replace') as f:

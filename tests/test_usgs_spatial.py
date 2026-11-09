@@ -36,6 +36,7 @@ def test_find_gauges_in_project_forwards_extent_element_flags(tmp_path, monkeypa
             pd.DataFrame(
                 {
                     "site_no": ["01500000"],
+                    "monitoring_location_id": ["USGS-01500000"],
                     "station_nm": ["Example Creek near Test"],
                     "site_type_code": ["ST"],
                     "site_status": ["Active"],
@@ -48,6 +49,10 @@ def test_find_gauges_in_project_forwards_extent_element_flags(tmp_path, monkeypa
 
     fake_waterdata = types.ModuleType("waterdata")
     fake_waterdata.get_monitoring_locations = fake_monitoring_locations
+    fake_waterdata.get_time_series_metadata = lambda **kw: (pd.DataFrame({
+        "monitoring_location_id": ["USGS-01500000"], "parameter_code": ["00060"],
+        "end": [(pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=1)).isoformat()],
+    }), {})
     fake_dataretrieval = types.ModuleType("dataretrieval")
     fake_dataretrieval.waterdata = fake_waterdata
 
@@ -73,6 +78,48 @@ def test_find_gauges_in_project_forwards_extent_element_flags(tmp_path, monkeypa
         "include_storage": False,
         "project_crs": "EPSG:2271",
     }
-    assert seen["query"] == {"bbox": [-78.0, 40.0, -77.0, 41.0]}
+    assert seen["query"] == {
+        "bbox": [-78.0, 40.0, -77.0, 41.0],
+        "site_type_code": "ST",
+        "agency_code": "USGS",
+    }
     assert gauges.crs == "EPSG:4326"
     assert gauges["site_no"].tolist() == ["01500000"]
+
+
+
+def test_modern_discovery_filters_requested_series_by_recency(monkeypatch):
+    from ras_commander.usgs import _waterdata_adapter as adapter
+    monkeypatch.setattr(adapter, "_wait", lambda: None)
+    now = pd.Timestamp.now(tz="UTC")
+    ids = ["USGS-01646500", "USGS-08158000", "USGS-01500000"]
+    calls = []
+    api = types.SimpleNamespace(
+        get_monitoring_locations=lambda **kw: (pd.DataFrame({"monitoring_location_id": ids}), {}),
+    )
+    def metadata(**kw):
+        calls.append(kw)
+        return pd.DataFrame({"monitoring_location_id": ids, "parameter_code": ["00060", "00065", "00060"],
+            "end": [(now-pd.Timedelta(days=d)).isoformat() for d in [1, 1, 184]]}), {}
+    api.get_time_series_metadata = metadata
+    found = UsgsGaugeSpatial._query_modern_sites(-80, 30, -70, 40, "ST", "00060", True, api)
+    assert found["monitoring_location_id"].tolist() == [ids[0]]
+    assert calls == [{"monitoring_location_id": ids, "parameter_code": ["00060"]}]
+    found = UsgsGaugeSpatial._query_modern_sites(-80, 30, -70, 40, "ST", "00060", False, api)
+    assert found["monitoring_location_id"].tolist() == [ids[0], ids[2]]
+
+
+def test_modern_discovery_batches_and_rate_limits(monkeypatch):
+    from ras_commander.usgs import _waterdata_adapter as adapter
+    waits, sizes = [], []
+    monkeypatch.setattr(adapter, "_wait", lambda: waits.append(1))
+    ids = [f"USGS-{i:08d}" for i in range(101)]
+    api = types.SimpleNamespace(get_monitoring_locations=lambda **kw: (pd.DataFrame({"monitoring_location_id": ids}), {}))
+    def metadata(**kw):
+        sizes.append(len(kw["monitoring_location_id"]))
+        return pd.DataFrame({"monitoring_location_id": kw["monitoring_location_id"], "parameter_code": "00060"}), {}
+    api.get_time_series_metadata = metadata
+    found = UsgsGaugeSpatial._query_modern_sites(-80, 30, -70, 40, "ST", "00060", False, api)
+    assert len(found) == 101
+    assert sizes == [50, 50, 1]
+    assert len(waits) == 4

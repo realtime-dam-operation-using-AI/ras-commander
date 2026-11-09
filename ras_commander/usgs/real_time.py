@@ -109,10 +109,11 @@ class RasUsgsRealTime:
             return RasUsgsRealTime._nwis
 
         try:
-            from dataretrieval import nwis
-            RasUsgsRealTime._nwis = nwis
+            from ._waterdata_adapter import _WaterDataAdapter as reader, _backend
+            _backend()
+            RasUsgsRealTime._nwis = reader
             RasUsgsRealTime._dataretrieval_loaded = True
-            logger.info("dataretrieval package loaded for real-time operations")
+            logger.debug("dataretrieval package loaded for real-time operations")
             return RasUsgsRealTime._nwis
         except ImportError:
             raise ImportError(
@@ -175,7 +176,7 @@ class RasUsgsRealTime:
         - Always check age_minutes to verify data freshness
         - Data may be provisional and subject to revision
         """
-        nwis = RasUsgsRealTime._ensure_dataretrieval()
+        reader = RasUsgsRealTime._ensure_dataretrieval()
 
         # Get parameter code
         if parameter.lower() == 'flow':
@@ -187,15 +188,15 @@ class RasUsgsRealTime:
         else:
             raise ValueError(f"Invalid parameter '{parameter}'. Must be 'flow' or 'stage'.")
 
-        logger.info(f"Retrieving latest {parameter} value for site {site_id}")
+        logger.debug(f"Retrieving latest {parameter} value for site {site_id}")
 
         try:
             # Get last 7 days of data to ensure we get recent values
             # (real-time endpoint sometimes doesn't respond well to very short periods)
-            end_date = datetime.now()
+            end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=7)
 
-            data_df, metadata = nwis.get_iv(
+            data_df, metadata = reader.get_iv(
                 sites=site_id,
                 parameterCd=param_code,
                 start=start_date.strftime("%Y-%m-%d"),
@@ -237,7 +238,7 @@ class RasUsgsRealTime:
                 'provisional': 'P' in qualifiers or 'p' in qualifiers,  # Provisional flag
             }
 
-            logger.info(
+            logger.debug(
                 f"Latest {parameter} for {site_id}: {latest_value:.2f} {units} "
                 f"at {latest_datetime} ({age_minutes:.1f} min old)"
             )
@@ -303,7 +304,7 @@ class RasUsgsRealTime:
         - Data is near-real-time, updated approximately hourly
         - Useful for operational decision-making
         """
-        nwis = RasUsgsRealTime._ensure_dataretrieval()
+        reader = RasUsgsRealTime._ensure_dataretrieval()
 
         # Get parameter code
         if parameter.lower() == 'flow':
@@ -315,16 +316,16 @@ class RasUsgsRealTime:
         else:
             raise ValueError(f"Invalid parameter '{parameter}'. Must be 'flow' or 'stage'.")
 
-        logger.info(f"Retrieving last {hours} hours of {parameter} data for site {site_id}")
+        logger.debug(f"Retrieving last {hours} hours of {parameter} data for site {site_id}")
 
         try:
             # Calculate time window
-            end_date = datetime.now()
+            end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(hours=hours)
 
             # Retrieve data
             # Note: Use ISO 8601 format (YYYY-MM-DDTHH:MM:SS) for USGS API compatibility
-            data_df, metadata = nwis.get_iv(
+            data_df, metadata = reader.get_iv(
                 sites=site_id,
                 parameterCd=param_code,
                 start=start_date.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -353,7 +354,7 @@ class RasUsgsRealTime:
             result_df.attrs['retrieved_at'] = datetime.now()
             result_df.attrs['metadata'] = metadata
 
-            logger.info(f"Retrieved {len(result_df)} recent {parameter} records for site {site_id}")
+            logger.debug(f"Retrieved {len(result_df)} recent {parameter} records for site {site_id}")
 
             return result_df
 
@@ -420,7 +421,7 @@ class RasUsgsRealTime:
         - Trims old data based on max_age_hours
         - Returns empty DataFrame if no cached data and API fails
         """
-        nwis = RasUsgsRealTime._ensure_dataretrieval()
+        reader = RasUsgsRealTime._ensure_dataretrieval()
 
         # Get parameter code
         if parameter.lower() == 'flow':
@@ -448,17 +449,17 @@ class RasUsgsRealTime:
                 # Ensure timezone-aware
                 if start_date.tz is None:
                     start_date = start_date.tz_localize('UTC')
-                logger.info(f"Refreshing {parameter} data since {last_cached}")
+                logger.debug(f"Refreshing {parameter} data since {last_cached}")
             else:
                 # No cache, get last max_age_hours
                 start_date = now_utc - pd.Timedelta(hours=max_age_hours)
-                logger.info(f"No cache, retrieving last {max_age_hours} hours")
+                logger.debug(f"No cache, retrieving last {max_age_hours} hours")
 
             end_date = now_utc
 
             # Retrieve new data
             # Note: Use ISO 8601 format (YYYY-MM-DDTHH:MM:SS) for USGS API compatibility
-            new_data_df, metadata = nwis.get_iv(
+            new_data_df, metadata = reader.get_iv(
                 sites=site_id,
                 parameterCd=param_code,
                 start=start_date.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -474,7 +475,7 @@ class RasUsgsRealTime:
                 })
             else:
                 new_df = pd.DataFrame(columns=['datetime', 'value'])
-                logger.info("No new data available")
+                logger.debug("No new data available")
 
             # Combine with cache if it exists
             if cached_df is not None and not cached_df.empty:
@@ -510,7 +511,7 @@ class RasUsgsRealTime:
                 combined_df.attrs['max_age_hours'] = max_age_hours
 
                 new_count = len(new_df) if not new_df.empty else 0
-                logger.info(
+                logger.debug(
                     f"Refresh complete: {new_count} new records, "
                     f"{len(combined_df)} total records in cache"
                 )

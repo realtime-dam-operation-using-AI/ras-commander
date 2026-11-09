@@ -1,0 +1,232 @@
+# Example Library Publishing Contract
+
+This file is the canonical agent-facing contract for building Example Project
+Library content and reusable WebGIS artifacts. It is implementation guidance
+and must not be copied onto the public Example Project Library page.
+
+## Publication Architecture
+
+- Do not commit raw HEC-RAS projects or large generated GIS artifacts to this
+  repository.
+- Acquire or extract source projects through RAS Commander, compute or inspect
+  them through the normal RAS Commander workflow, and export cloud-native
+  artifacts with `ras2cng`.
+- Post-process terrain, geometry, raw vector results, and RASMapper Stored Map
+  rasters into validated MapLibre-ready PMTiles and COGs.
+- Publish artifacts to the dedicated RAS Commander WebGIS service, then link the
+  docs viewer to its hosted catalog and manifest.
+- The public artifact namespace is `/data/rasexamples/hec-ras-7.0/`.
+- Produce portable candidate trees rooted at `hec-ras-7.0`. The private
+  `CLB-Engineering-Corporation/ras-commander-docs` repository owns immutable
+  release IDs, inventories, URL versioning, restricted publication, public
+  validation, activation, recovery, and host provisioning.
+- Generated project manifests must remain valid when the private release
+  pipeline rewrites their artifact URLs and numeric-service base URL to an
+  immutable release.
+- `rascommander.info` reverse-proxies `/data/*` to the isolated WebGIS artifact
+  service. Do not put local file paths in public manifests.
+
+## Infrastructure Boundary
+
+- Run HEC-RAS, `ras2cng`, terrain consolidation, COG generation, and other heavy
+  processing on the designated numbered processing hosts or workstations, not
+  on CLB-WebGIS.
+- Do not add host addresses, SSH keys, release promotion, public validation, or
+  WebGIS provisioning code to this public repository. Those mechanisms belong
+  in the private `ras-commander-docs/webgis/` directory.
+- Keep the RAS Commander artifact service isolated from the other
+  `gis.clbengineering.com` containers and services, even when they share the
+  CLB-WebGIS physical host.
+- Before changing deployment hosts, addresses, SSH routes, or storage paths,
+  reread the current migration records under
+  `H:/Backups/proxmox/CLB Router/`. Infrastructure references in older scripts
+  may be stale during migration.
+
+## Artifact Contract
+
+- Use GeoParquet as the analysis/archive format for geometry and raw
+  element-level result attributes.
+- Use vector PMTiles for browser delivery of commonly reviewed geometry and
+  queryable raw-result layers.
+- Use `join_index` metadata to relate result tables to geometry without
+  duplicating geometry in the archive layer.
+- Generate visual result maps through RASMapper/RasProcess Stored Maps. Publish
+  the numeric result as a COG and, where useful, a raster PMTiles display
+  derivative with HTTP byte-range support.
+- Do not present raw vector results as a continuous visual result surface. Raw
+  vectors expose source-element values; RASMapper Stored Maps provide the
+  interpolated raster visualization.
+- Publish terrain as a numeric COG and optional PMTiles derivative with HTTP
+  byte-range support.
+- Preserve nodata as transparent in terrain and result display derivatives.
+
+## Required Result Gate
+
+Every public project must have a successfully computed plan and every
+applicable result family populated:
+
+1. **Vector Results** from raw HDF values joined to applicable cross sections,
+   2D cells/faces, structures, pipes, and reference elements.
+2. **Raster Results** generated from RASMapper Stored Maps. Every applicable
+   plan must publish the complete standard set: Depth, WSE, Velocity, Froude
+   Number, Shear Stress, Depth x Velocity, Depth x Velocity Squared, Arrival
+   Time, Duration, Percent Time Inundated, and Inundation Boundary. This family
+   is required for every 2D plan and every terrain-backed 1D plan.
+
+A pure 1D source project that contains no RASMapper terrain must still publish
+its computed raw cross-section results, but continuous Stored Map rasters are
+not applicable. Record that capability explicitly in manifest v2; do not
+mislabel a derived surface as a RASMapper Stored Map. A related project's
+terrain may be linked only as a shared display resource when the projects have
+the same study area and CRS. Mark it `modelOwned: false`, identify the source
+project, and do not use it to make Stored Maps appear applicable to the 1D
+model.
+
+Treat either of these public viewer messages as a failed publication:
+
+```text
+No RASMapper Stored Map rasters are published.
+No raw HDF vector result layers are published.
+```
+
+Hold the project out of the public catalog until it runs successfully and both
+result branches pass validation. Preserve plan, geometry, profile/time, units,
+source HDF, map type, and interpolation authority in result metadata.
+
+### Discovery-only source candidates
+
+A maintainer may explicitly authorize a source-qualification candidate on the
+landing dashboard before the full result gate passes. This is a narrow
+discovery exception, not publication as a completed example project. A
+candidate entry must:
+
+- be labeled `Source qualification candidate` in both the catalog and public
+  explanation;
+- have a valid CRS and an API-derived WGS84 footprint;
+- link to a durable Record of Deficiencies that distinguishes source defects
+  from validation-copy mitigations;
+- have reached an explicitly recorded RAS Commander validation threshold, at
+  minimum unsteady-solver startup for an unsteady project;
+- omit its project-viewer link and hosted manifest until the complete terrain,
+  vector-result, raster-result, and browser-review gates pass; and
+- avoid any language suggesting that reconstructed terrain is source-equivalent
+  or that hydraulic results have been fully qualified.
+
+Keep discovery supplements separate from the generated fallback catalog and
+deduplicate them by project ID, with a future fully published catalog feature
+taking precedence. This permits the candidate to disappear cleanly into the
+normal publication path when all gates pass.
+
+## Terrain Gate
+
+- Discover every TIFF/VRT member associated with each named terrain.
+- Consolidate all source members of one named terrain into one authoritative
+  COG. Never merge distinct named terrain surfaces.
+- Never upsample terrain. The published cell size must be at least 5 ft.
+- If native cells are finer than 5 ft, use the smallest whole-number multiple of
+  the native cell size that is at least 5 ft.
+- If native terrain is already 5 ft or coarser, retain its native resolution,
+  including terrain coarser than 10 ft.
+- Mixed-native-resolution source sets require an explicit recorded target. Use
+  a whole-number multiple of the coarsest native source grid so mixed 2-foot
+  and 1-meter mosaics do not require an impractically coarse common multiple.
+  Record every source resolution and resampling factor, and do not silently
+  upsample any source during consolidation.
+- When relocated RASMapper paths cannot be resolved, call ras2cng's
+  `consolidate_terrain_files()` with the explicit priority-ordered TIFF list;
+  do not replace the provenance-bearing pipeline with an ad hoc GDAL command.
+- Preserve source priority, grid alignment, horizontal and vertical units and
+  datums, resampling method, cutline, and source-file inventory.
+- Build tiled, compressed COGs with statistics and overviews, and verify that
+  nodata remains transparent in the browser derivative.
+- Require an associated, queryable terrain COG for every 2D model.
+
+## Viewer Defaults
+
+- Enable hybrid satellite imagery and Model Extents on individual project maps.
+- Enable terrain on individual 2D project maps, but not on the library landing
+  map.
+- Enable only the first/default geometry initially.
+- For a 1D default geometry, enable rivers/reaches. For a 2D default geometry,
+  enable breaklines and refinement regions where available.
+- Keep large geometry, result, and optional derivative layers disabled unless
+  they are required for the initial review view.
+
+## Catalog Admission Checklist
+
+Add completed viewer projects one at a time only after all checks pass. The
+discovery-only exception above follows its own stricter labeling and no-viewer
+requirements:
+
+- source license permits publication;
+- project CRS is valid and catalog bounds are valid WGS84;
+- `HdfProject.get_project_extent(geometry_type="footprint")` produced the raw
+  WGS84 model-limit polygon used by the catalog;
+- at least one plan computed successfully;
+- raw HDF vector results are populated, and RASMapper Stored Map rasters are
+  populated for every 2D or terrain-backed plan;
+- each 2D model has a consolidated, validated terrain COG;
+- manifests use hosted URLs and contain no local paths;
+- PMTiles and COG endpoints support HTTP range requests;
+- successful immutable release artifacts use a one-year immutable cache policy,
+  mutable current/catalog paths revalidate, and every `4xx` or `5xx` response
+  uses `Cache-Control: no-store`;
+- large layers have sensible default visibility;
+- desktop and mobile viewers open from the public docs URL;
+- Identify distinguishes raw HDF values from RASMapper raster values;
+- paired RASMapper/web review covers geometry, terrain, vector results, and
+  raster results.
+
+### Authorized 1D BLE corpus discovery entries
+
+A maintainer may authorize a complete 1D steady BLE watershed corpus as one
+landing-page discovery entry before hydraulic result qualification. Such an
+entry must:
+
+- represent one HUC8 with one catalog feature and one table row, never one row
+  per reach project;
+- use the exact union of all API-derived individual model footprints for its
+  landing outline;
+- use one combined PMTiles archive with the `ras-1d-corpus-v1` profile and
+  exactly `ras_model_extent`, `ras_river_centerlines`, `ras_cross_sections`,
+  and `ras_bank_lines` layers at their contracted zoom ranges;
+- preserve portable per-feature `study_id`, publisher `model_id`, `model_key`,
+  `display_id`, `source_feature_id`, and `feature_key` identity metadata;
+- link a durable Record of Deficiencies and state exact model, plan, geometry,
+  and cross-section counts from the portable delivery inventory;
+- omit project-viewer and result-manifest links and explicitly state when no
+  computation or result qualification has occurred; and
+- treat the combined PMTiles as a display derivative only. The portable,
+  relative-path delivery inventory remains the canonical FIM Commander intake.
+
+Do not place a local PMTiles path or an unverified URL in public catalog data.
+Publish through the private release pipeline, require HTTP byte-range support,
+and validate the four-layer metadata before activating the hosted URL.
+
+## Viewer Template Contract
+
+- All project links use the single shared `example-project-viewer.md` page and
+  its shared MapLibre JavaScript. Do not create project-specific viewer pages.
+- Every generated or published manifest v2 must carry ras2cng's current
+  `viewerTemplate` revision. The manifest revision is the compatibility
+  contract between generated project data and the shared viewer.
+- Before migrating an existing release, run
+  `upgrade_viewer_release.py --release-root <path> --dry-run`. Review the report,
+  then rerun without `--dry-run` only after every selected project passes the
+  layer, asset-reference, compatibility-payload, and schema checks.
+- Template conformance does not waive any terrain, results, CRS, license,
+  performance, or catalog-admission gate. A project may be compatible with the
+  shared viewer while still being ineligible for public publication.
+- Validate the public manifest after restricted publication; do not infer
+  success from the staged or durable copy.
+
+## Current Expansion Priority
+
+1. Populate terrain and Stored Map results for larger 2D releases.
+2. Add eligible public model releases after CRS, license, result, terrain, and
+   viewer validation.
+
+Use the scripts in this directory for extraction, catalog content, terrain
+preparation, viewer packaging, and reusable candidate generation only. Hand a
+validated candidate tree to the private `ras-commander-docs/webgis/` pipeline
+for publication. Do not duplicate that pipeline here.

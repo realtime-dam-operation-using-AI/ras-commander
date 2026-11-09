@@ -36,6 +36,7 @@ Example Usage:
 
 from pathlib import Path
 from typing import Union, Optional, List, Tuple, TYPE_CHECKING
+
 import pandas as pd
 
 from ..hdf import HdfProject
@@ -66,6 +67,58 @@ class UsgsGaugeSpatial:
 
     All methods are static and designed to be used without instantiation.
     """
+
+    @staticmethod
+    def _empty_gauge_geodataframe() -> 'gpd.GeoDataFrame':
+        import geopandas as gpd
+
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    @staticmethod
+    def _query_modern_sites(west, south, east, north, site_type, param_codes, active_only, api):
+        """Intersect locations with requested, optionally recent time series."""
+        from ._waterdata_adapter import _wait
+
+        kwargs = {"bbox": [float(west), float(south), float(east), float(north)], "agency_code": "USGS"}
+        if site_type:
+            kwargs["site_type_code"] = site_type
+        _wait()
+        locations, _ = api.get_monitoring_locations(**kwargs)
+        if locations is None or locations.empty or (not active_only and not param_codes):
+            return locations
+        if "monitoring_location_id" not in locations:
+            raise ValueError("Monitoring locations lack monitoring_location_id")
+        ids = locations["monitoring_location_id"].drop_duplicates().tolist()
+        codes = param_codes.split(",") if param_codes else None
+        now = pd.Timestamp.now(tz="UTC")
+        threshold = now - pd.Timedelta(days=183)
+        selected = set()
+        # Batches bound URL length without querying every station separately.
+        for offset in range(0, len(ids), 50):
+            batch = ids[offset:offset + 50]
+            query = {"monitoring_location_id": batch}
+            if codes:
+                query["parameter_code"] = codes
+            _wait()
+            series, _ = api.get_time_series_metadata(**query)
+            if series is None or series.empty:
+                continue
+            if "monitoring_location_id" not in series or not series["monitoring_location_id"].isin(batch).all():
+                raise ValueError("Time-series metadata contains unexpected locations")
+            if codes:
+                if "parameter_code" not in series:
+                    raise ValueError("Time-series metadata lacks parameter_code")
+                series = series[series["parameter_code"].isin(codes)]
+            if active_only:
+                # v1 uses end; v0 used end_utc. This is observation recency,
+                # not the retired NWIS maintenance-status field.
+                field = "end" if "end" in series else "end_utc"
+                if field not in series:
+                    raise ValueError("Time-series metadata lacks its most recent observation time")
+                latest = pd.to_datetime(series[field], utc=True, errors="raise", format="mixed")
+                series = series[(latest >= threshold) & (latest <= now)]
+            selected.update(series["monitoring_location_id"])
+        return locations[locations["monitoring_location_id"].isin(selected)].copy()
 
     @staticmethod
     @log_call
@@ -109,8 +162,10 @@ class UsgsGaugeSpatial:
             - 'stage' or '00065' : Gage height
             - ['flow', 'stage'] : Multiple parameters
         active_only : bool, default True
-            If True, only return currently active gauges. If False,
-            include inactive/historical gauges.
+            Require a requested series with an observation in the last 183 days.
+            If no parameters are requested, any time series qualifies. This
+            measures observation recency, not legacy NWIS maintenance status.
+            If False, include historical series.
         project_crs : str, optional
             Override CRS for projects without embedded projection. Use EPSG codes
             like "EPSG:26918" (UTM Zone 18N) or "EPSG:2271" (PA State Plane North).
@@ -215,7 +270,7 @@ class UsgsGaugeSpatial:
 
         if west == 0.0 and south == 0.0 and east == 0.0 and north == 0.0:
             logger.warning("No valid project geometry found")
-            return gpd.GeoDataFrame()
+            return UsgsGaugeSpatial._empty_gauge_geodataframe()
 
         logger.info(f"Querying USGS gauges in bounds: "
                    f"W={west:.6f}, S={south:.6f}, E={east:.6f}, N={north:.6f}")
@@ -237,30 +292,18 @@ class UsgsGaugeSpatial:
 
         # Query USGS Water Services API
         try:
-            kwargs = {
-                'bbox': [west, south, east, north],  # List of floats, not string
-            }
-
-            # Add parameter code filter if specified
-            if param_codes is not None:
-                kwargs['parameterCd'] = param_codes
-
-            # Note: site_type and active_only filtering happens on returned data
-            # The API doesn't reliably filter by these parameters
-
-            logger.debug(f"USGS query parameters: {kwargs}")
-
-            # Query monitoring locations
-            df, md = waterdata.get_monitoring_locations(**kwargs)
+            df = UsgsGaugeSpatial._query_modern_sites(
+                west, south, east, north, site_type, param_codes, active_only, waterdata,
+            )
 
         except Exception as e:
             logger.error(f"USGS API query failed: {e}")
-            return gpd.GeoDataFrame()
+            return UsgsGaugeSpatial._empty_gauge_geodataframe()
 
         # Check if results are empty
         if df is None or df.empty:
             logger.info("No gauges found in project bounds")
-            return gpd.GeoDataFrame()
+            return UsgsGaugeSpatial._empty_gauge_geodataframe()
 
         logger.info(f"Found {len(df)} USGS gauges")
         logger.debug(f"API response columns: {list(df.columns)}")
@@ -295,7 +338,7 @@ class UsgsGaugeSpatial:
             
             if lon_col is None or lat_col is None:
                 logger.error(f"Could not find longitude/latitude columns. Available columns: {list(df.columns)}")
-                return gpd.GeoDataFrame()
+                return UsgsGaugeSpatial._empty_gauge_geodataframe()
             
             logger.debug(f"Using columns: lon={lon_col}, lat={lat_col}")
             
@@ -332,6 +375,7 @@ class UsgsGaugeSpatial:
                 'site_type': 'site_type_code',
                 'monitoringLocationType': 'site_type_code',
                 'siteType': 'site_type_code',
+                'site_tp_cd': 'site_type_code',
                 'type': 'site_type_code',
                 # Status
                 'activityStatus': 'site_status',
@@ -371,20 +415,12 @@ class UsgsGaugeSpatial:
                 if filtered_count > 0:
                     logger.info(f"Filtered out {filtered_count} non-{site_type} sites ({len(gdf)} {site_type} sites remaining)")
 
-            # Filter for active sites if requested
-            if active_only and 'site_status' in gdf.columns:
-                initial_count = len(gdf)
-                gdf = gdf[gdf['site_status'] == 'Active'].copy()
-                filtered_count = initial_count - len(gdf)
-                if filtered_count > 0:
-                    logger.info(f"Filtered out {filtered_count} inactive sites ({len(gdf)} active remaining)")
-
             return gdf
 
         except Exception as e:
             logger.error(f"Failed to create GeoDataFrame: {e}")
             logger.debug(f"DataFrame columns: {list(df.columns)}")
-            return gpd.GeoDataFrame()
+            return UsgsGaugeSpatial._empty_gauge_geodataframe()
 
     @staticmethod
     @log_call
@@ -484,7 +520,7 @@ class UsgsGaugeSpatial:
 
         if gauges.empty:
             logger.info("No gauges found in project bounds")
-            return gpd.GeoDataFrame()
+            return UsgsGaugeSpatial._empty_gauge_geodataframe()
 
         logger.info(f"Checking data availability for {len(gauges)} gauges")
 
@@ -496,11 +532,10 @@ class UsgsGaugeSpatial:
             site_no = row['site_no']
             try:
                 # Query data for this gauge
-                df, md = waterdata.get_continuous(
-                    sites=site_no,
-                    parameterCd=param_code,
-                    start=start_datetime,
-                    end=end_datetime
+                from ._waterdata_adapter import _WaterDataAdapter
+                df, md = _WaterDataAdapter.get_iv(
+                    sites=site_no, parameterCd=param_code,
+                    start=start_datetime, end=end_datetime,
                 )
 
                 # Check if data exists
@@ -518,7 +553,7 @@ class UsgsGaugeSpatial:
         # Create result GeoDataFrame
         if not gauges_with_data:
             logger.info("No gauges with data found for the specified period")
-            return gpd.GeoDataFrame()
+            return UsgsGaugeSpatial._empty_gauge_geodataframe()
 
         result = gpd.GeoDataFrame(gauges_with_data, crs=gauges.crs)
         result['data_count'] = data_counts

@@ -13,8 +13,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .RasWorker import RasWorker
+from .Utils import (
+    clear_worker_plan_hdf_artifacts,
+    copy_geometry_outputs_back,
+    copy_plan_hdf_back,
+    copy_plan_result_back,
+)
+from ..ExecutionArtifacts import (
+    get_plan_result_artifact_paths,
+    infer_execution_result_format,
+)
 from ..LoggingConfig import get_logger
+from ..RasCurrency import RasCurrency
 from ..RasUtils import RasUtils
+from ..fast_hdf import release_native_sessions
 
 logger = get_logger(__name__)
 
@@ -103,7 +115,7 @@ def init_local_worker(**kwargs) -> LocalWorker:
     Returns:
         LocalWorker: Configured worker ready for execution
     """
-    logger.info("Initializing local worker")
+    logger.debug("Initializing local worker")
 
     kwargs['worker_type'] = 'local'
     worker = LocalWorker(**kwargs)
@@ -112,15 +124,16 @@ def init_local_worker(**kwargs) -> LocalWorker:
     worker_folder_path = Path(worker.worker_folder)
     worker_folder_path.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Local worker configured:")
-    logger.info(f"  Worker folder: {worker.worker_folder}")
-    logger.info(f"  RAS Exe: {worker.ras_exe_path}")
-    logger.info(f"  Process Priority: {worker.process_priority}")
-    logger.info(f"  Queue Priority: {worker.queue_priority}")
     if worker.max_parallel_plans > 1:
-        logger.info(f"  Parallel Capacity: {worker.max_parallel_plans} plans simultaneously")
+        capacity = f"slots={worker.max_parallel_plans}"
     else:
-        logger.info(f"  Execution Mode: Sequential")
+        capacity = "mode=sequential"
+    logger.info(
+        "Local worker configured: "
+        f"priority={worker.process_priority}, queue={worker.queue_priority}, {capacity}"
+    )
+    logger.debug(f"Local worker folder: {worker.worker_folder}")
+    logger.debug(f"Local worker Ras.exe path: {worker.ras_exe_path}")
 
     return worker
 
@@ -134,7 +147,8 @@ def execute_local_plan(
     force_geompre: bool = False,
     force_rerun: bool = False,
     sub_worker_id: int = 1,
-    autoclean: bool = True
+    autoclean: bool = True,
+    copy_geometry_outputs: bool = True,
 ) -> bool:
     """
     Execute a plan on a local worker using RasCmdr.compute_plan().
@@ -152,15 +166,20 @@ def execute_local_plan(
         ras_obj: RAS project object
         num_cores: Number of cores
         clear_geompre: Clear geompre files (.c## only)
-        force_geompre: Force full geometry reprocessing (clears .g##.hdf AND .c##)
+        force_geompre: Clear cached geometry products in place and force execution
         force_rerun: Force execution even if results are current
         sub_worker_id: Sub-worker ID for parallel execution (default 1)
         autoclean: Delete temporary worker folder after execution (default True)
+        copy_geometry_outputs: Copy geometry HDF and preprocessor outputs back to
+            the source project (default True for backward compatibility).
+            Concurrent plans sharing a geometry can race during copyback; use
+            False for scenario ensembles that share preprocessed geometry.
 
     Returns:
         bool: True if successful
     """
-    logger.info(f"Starting local execution of plan {plan_number} (sub-worker #{sub_worker_id})")
+    plan_number = RasUtils.normalize_ras_number(plan_number)
+    logger.debug(f"Starting local execution of plan {plan_number} (sub-worker #{sub_worker_id})")
 
     project_folder = Path(ras_obj.project_folder)
     project_name = ras_obj.project_name
@@ -175,27 +194,60 @@ def execute_local_plan(
 
     try:
         # Step 2: Copy project to worker folder
-        logger.info(f"Copying project to {worker_temp_folder}")
+        logger.debug(f"Copying project for plan {plan_number} to local worker folder: {worker_temp_folder}")
         worker_project_path = worker_temp_folder / project_name
         shutil.copytree(project_folder, worker_project_path, dirs_exist_ok=True, ignore=RasUtils.ignore_windows_reserved)
+        staged_results_cleared = force_rerun or force_geompre
+        if staged_results_cleared:
+            clear_worker_plan_hdf_artifacts(worker_project_path, plan_number, ras_obj)
 
         # Step 3: Execute using RasCmdr.compute_plan()
         from ..RasCmdr import RasCmdr
-        from ..RasPrj import RasPrj, init_ras_project
+        from ..RasPrj import RasPrj, _matching_copied_prj_file, init_ras_project
 
         # Initialize project in worker folder
-        logger.info(f"Initializing project in worker folder")
+        logger.debug("Initializing project in local worker folder")
         temp_ras = RasPrj()
         prj_files = list(worker_project_path.glob("*.prj"))
         if not prj_files:
             logger.error(f"No .prj file found in {worker_project_path}")
             return False
 
-        # Get version from original ras object
-        ras_version = getattr(ras_obj, 'ras_version', '7.0')
-        init_ras_project(str(worker_project_path), ras_version, ras_object=temp_ras)
+        # The worker-selected executable is authoritative for the staged run.
+        # Fall back to source-project configuration only when no worker path
+        # was supplied.
+        execution_engine = getattr(worker, "ras_exe_path", None) or getattr(
+            ras_obj, "ras_exe_path", None
+        ) or getattr(ras_obj, "ras_version", None)
+        if not execution_engine:
+            raise ValueError(
+                "Local worker requires an explicit HEC-RAS version or executable"
+            )
+        worker_prj = _matching_copied_prj_file(
+            worker_project_path, getattr(ras_obj, "prj_file", None)
+        )
+        init_ras_project(
+            str(worker_prj or worker_project_path),
+            execution_engine,
+            ras_object=temp_ras,
+            hide_intro=True,
+        )
+        output_format = infer_execution_result_format(temp_ras)
 
-        logger.info(f"Executing plan {plan_number} with RasCmdr.compute_plan()")
+        if not staged_results_cleared:
+            is_current, _ = RasCurrency._are_plan_results_current_for_execution(
+                plan_number,
+                temp_ras,
+                output_format=output_format,
+            )
+            if not is_current:
+                clear_worker_plan_hdf_artifacts(
+                    worker_project_path,
+                    plan_number,
+                    ras_obj,
+                )
+
+        logger.debug(f"Executing plan {plan_number} with RasCmdr.compute_plan()")
         success = RasCmdr.compute_plan(
             plan_number=plan_number,
             ras_object=temp_ras,
@@ -206,21 +258,75 @@ def execute_local_plan(
         )
 
         if not success:
-            logger.error(f"RasCmdr.compute_plan() returned False for plan {plan_number}")
+            logger.error(
+                "RasCmdr.compute_plan() returned False for plan "
+                f"{plan_number} in local worker project: {worker_project_path}"
+            )
             return False
 
-        # Step 4: Copy results back (HDF file)
-        hdf_file = worker_project_path / f"{project_name}.p{plan_number}.hdf"
-
-        if not hdf_file.exists():
-            logger.error(f"HDF file not created: {hdf_file}")
+        worker_artifacts = get_plan_result_artifact_paths(
+            plan_number,
+            ras_object=ras_obj,
+            project_folder=worker_project_path,
+            project_name=project_name,
+        )
+        result_file = (
+            worker_artifacts.hdf
+            if output_format == "hdf"
+            else worker_artifacts.legacy_output
+        )
+        result_valid = (
+            RasCurrency.check_plan_hdf_complete(result_file)
+            if output_format == "hdf"
+            else RasCmdr._verify_legacy_result(
+                plan_number,
+                temp_ras,
+                check_errors=True,
+            )
+        )
+        if not result_valid:
+            logger.error(
+                "%s result was not created or is incomplete for plan %s",
+                output_format,
+                plan_number,
+            )
             return False
 
-        logger.info(f"HDF file created successfully: {hdf_file}")
+        logger.debug(
+            "%s result created successfully for plan %s",
+            output_format,
+            plan_number,
+        )
 
-        dest_hdf = project_folder / hdf_file.name
-        shutil.copy2(hdf_file, dest_hdf)
-        logger.info(f"Copied results to {dest_hdf}")
+        # Step 4: Copy the selected result family back.
+        copied_result = (
+            copy_plan_hdf_back(worker_project_path, plan_number, ras_obj)
+            if output_format == "hdf"
+            else copy_plan_result_back(
+                worker_project_path,
+                plan_number,
+                ras_obj,
+                output_format=output_format,
+            )
+        )
+        if copied_result is None:
+            return False
+
+        if copy_geometry_outputs:
+            try:
+                copy_geometry_outputs_back(
+                    worker_project_path=worker_project_path,
+                    project_folder=project_folder,
+                    project_name=project_name,
+                    plan_number=plan_number,
+                    ras_obj=ras_obj,
+                )
+            except FileNotFoundError as e:
+                logger.error(
+                    f"Geometry output copyback failed for plan {plan_number}: {e}. "
+                    f"worker_project={worker_project_path}; destination_project={project_folder}"
+                )
+                return False
 
         # Also copy any other result files (.computeMsgs.txt, etc.)
         for result_file in worker_project_path.glob(f"{project_name}.p{plan_number}.*"):
@@ -232,24 +338,37 @@ def execute_local_plan(
 
         # Step 5: Cleanup (if autoclean enabled)
         if autoclean:
+            release_native_sessions(worker_temp_folder)
             shutil.rmtree(worker_temp_folder, ignore_errors=True)
             logger.debug(f"Cleaned up worker folder: {worker_temp_folder}")
         else:
-            logger.info(f"Preserving worker folder for debugging: {worker_temp_folder}")
+            logger.info(
+                f"Preserving local worker folder for plan {plan_number} for debugging; "
+                "enable DEBUG logging for the path"
+            )
+            logger.debug(f"Preserved worker folder: {worker_temp_folder}")
 
         return True
 
     except Exception as e:
-        logger.error(f"Error in local execution: {e}")
+        logger.error(
+            f"Error in local execution for plan {plan_number}: {e}. "
+            f"worker_folder={worker_temp_folder}; source_project={project_folder}"
+        )
         import traceback
         logger.debug(traceback.format_exc())
 
         if autoclean:
             try:
                 if worker_temp_folder.exists():
+                    release_native_sessions(worker_temp_folder)
                     shutil.rmtree(worker_temp_folder, ignore_errors=True)
             except:
                 pass
         else:
-            logger.info(f"Preserving worker folder for debugging: {worker_temp_folder}")
+            logger.info(
+                f"Preserving local worker folder for plan {plan_number} for debugging; "
+                "enable DEBUG logging for the path"
+            )
+            logger.debug(f"Preserved worker folder: {worker_temp_folder}")
         return False

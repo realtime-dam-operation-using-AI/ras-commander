@@ -2,15 +2,15 @@
 RasUsgsCore - USGS Data Retrieval for ras-commander
 
 Summary:
-    Provides static methods for retrieving USGS gauge data via the dataretrieval
-    package. Supports flow and stage time series retrieval, gauge metadata extraction,
+    Provides static methods for retrieving USGS gauge data via the modern dataretrieval.waterdata
+    module. Supports flow and stage time series retrieval, gauge metadata extraction,
     and data availability checking.
 
 Functions:
     retrieve_flow_data(site_id, start_datetime, end_datetime, data_type='iv'):
-        Retrieve flow time series from USGS NWIS for a site.
+        Retrieve flow time series from USGS Water Data APIs for a site.
     retrieve_stage_data(site_id, start_datetime, end_datetime, data_type='iv'):
-        Retrieve stage (water level) time series from USGS NWIS for a site.
+        Retrieve stage (water level) time series from USGS Water Data APIs for a site.
     get_gauge_metadata(site_id):
         Get comprehensive metadata for a USGS gauge (location, drainage area, etc.).
     check_data_availability(site_id, start_datetime, end_datetime, parameter='flow'):
@@ -151,10 +151,11 @@ class RasUsgsCore:
             return RasUsgsCore._waterdata
 
         try:
-            from dataretrieval import nwis
-            RasUsgsCore._waterdata = nwis
+            from ._waterdata_adapter import _WaterDataAdapter as reader, _backend
+            _backend()
+            RasUsgsCore._waterdata = reader
             RasUsgsCore._dataretrieval_loaded = True
-            logger.info("dataretrieval package loaded successfully")
+            logger.debug("dataretrieval package loaded successfully")
             return RasUsgsCore._waterdata
         except ImportError:
             raise ImportError(
@@ -225,23 +226,20 @@ class RasUsgsCore:
         - Not all sites have instantaneous data; use check_data_availability() first
         - DateTime returned is in UTC; may need timezone conversion for local time
         """
-        nwis = RasUsgsCore._ensure_dataretrieval()
+        reader = RasUsgsCore._ensure_dataretrieval()
 
-        logger.info(f"Retrieving flow data for site {site_id}, {start_datetime} to {end_datetime}")
+        logger.debug(f"Retrieving flow data for site {site_id}, {start_datetime} to {end_datetime}")
 
         # Convert datetime objects to strings if needed
         if isinstance(start_datetime, datetime):
-            start_datetime = start_datetime.strftime("%Y-%m-%d")
+            start_datetime = start_datetime.isoformat()
         if isinstance(end_datetime, datetime):
-            end_datetime = end_datetime.strftime("%Y-%m-%d")
+            end_datetime = end_datetime.isoformat()
 
         try:
-            # Apply rate limiting before API request
-            _apply_rate_limit()
-
             if data_type.lower() == 'iv':
                 # Instantaneous values
-                data_df, metadata = nwis.get_iv(
+                data_df, metadata = reader.get_iv(
                     sites=site_id,
                     parameterCd=RasUsgsCore.PARAM_FLOW,
                     start=start_datetime,
@@ -249,7 +247,7 @@ class RasUsgsCore:
                 )
             elif data_type.lower() == 'dv':
                 # Daily values
-                data_df, metadata = nwis.get_dv(
+                data_df, metadata = reader.get_dv(
                     sites=site_id,
                     parameterCd=RasUsgsCore.PARAM_FLOW,
                     start=start_datetime,
@@ -282,7 +280,7 @@ class RasUsgsCore:
             result_df.attrs['data_type'] = data_type
             result_df.attrs['metadata'] = metadata
 
-            logger.info(f"Retrieved {len(result_df)} flow records for site {site_id}")
+            logger.debug(f"Retrieved {len(result_df)} flow records for site {site_id}")
 
             return result_df
 
@@ -345,23 +343,20 @@ class RasUsgsCore:
         - Not all flow gauges have stage data; check availability first
         - DateTime returned is in UTC; may need timezone conversion
         """
-        nwis = RasUsgsCore._ensure_dataretrieval()
+        reader = RasUsgsCore._ensure_dataretrieval()
 
-        logger.info(f"Retrieving stage data for site {site_id}, {start_datetime} to {end_datetime}")
+        logger.debug(f"Retrieving stage data for site {site_id}, {start_datetime} to {end_datetime}")
 
         # Convert datetime objects to strings if needed
         if isinstance(start_datetime, datetime):
-            start_datetime = start_datetime.strftime("%Y-%m-%d")
+            start_datetime = start_datetime.isoformat()
         if isinstance(end_datetime, datetime):
-            end_datetime = end_datetime.strftime("%Y-%m-%d")
+            end_datetime = end_datetime.isoformat()
 
         try:
-            # Apply rate limiting before API request
-            _apply_rate_limit()
-
             if data_type.lower() == 'iv':
                 # Instantaneous values
-                data_df, metadata = nwis.get_iv(
+                data_df, metadata = reader.get_iv(
                     sites=site_id,
                     parameterCd=RasUsgsCore.PARAM_STAGE,
                     start=start_datetime,
@@ -369,7 +364,7 @@ class RasUsgsCore:
                 )
             elif data_type.lower() == 'dv':
                 # Daily values
-                data_df, metadata = nwis.get_dv(
+                data_df, metadata = reader.get_dv(
                     sites=site_id,
                     parameterCd=RasUsgsCore.PARAM_STAGE,
                     start=start_datetime,
@@ -401,7 +396,7 @@ class RasUsgsCore:
             result_df.attrs['data_type'] = data_type
             result_df.attrs['metadata'] = metadata
 
-            logger.info(f"Retrieved {len(result_df)} stage records for site {site_id}")
+            logger.debug(f"Retrieved {len(result_df)} stage records for site {site_id}")
 
             return result_df
 
@@ -456,17 +451,14 @@ class RasUsgsCore:
         - Drainage area is useful for comparing gauge representativeness
         - Not all fields may be available for all gauges
         """
-        nwis = RasUsgsCore._ensure_dataretrieval()
+        reader = RasUsgsCore._ensure_dataretrieval()
 
-        logger.info(f"Retrieving metadata for site {site_id}")
+        logger.debug(f"Retrieving metadata for site {site_id}")
 
         try:
-            # Apply rate limiting before API request
-            _apply_rate_limit()
-
             # Get site information
             # Note: dataretrieval 1.1.0+ returns tuple (DataFrame, metadata_dict)
-            result = nwis.get_info(sites=site_id)
+            result = reader.get_info(sites=site_id)
             if isinstance(result, tuple):
                 site_info, _ = result  # Unpack tuple for newer versions
             else:
@@ -495,10 +487,9 @@ class RasUsgsCore:
             # Get available parameters by querying data availability
             try:
                 # Apply rate limiting before API request
-                _apply_rate_limit()
 
                 # Query what data is available (without downloading full dataset)
-                availability = nwis.what_sites(
+                availability = reader.what_sites(
                     sites=site_id,
                     service='iv'  # Check instantaneous value availability
                 )
@@ -509,7 +500,7 @@ class RasUsgsCore:
             except:
                 metadata['available_parameters'] = []
 
-            logger.info(f"Retrieved metadata for {metadata['station_name']} (drainage area: {metadata['drainage_area_sqmi']} sq mi)")
+            logger.debug(f"Retrieved metadata for {metadata['station_name']} (drainage area: {metadata['drainage_area_sqmi']} sq mi)")
 
             return metadata
 
@@ -578,7 +569,7 @@ class RasUsgsCore:
         - Use this before calling retrieve_flow_data() or retrieve_stage_data()
         - Does not guarantee data quality, only presence
         """
-        nwis = RasUsgsCore._ensure_dataretrieval()
+        reader = RasUsgsCore._ensure_dataretrieval()
 
         # Get parameter code
         if parameter.lower() == 'flow':
@@ -588,7 +579,7 @@ class RasUsgsCore:
         else:
             raise ValueError(f"Invalid parameter '{parameter}'. Must be 'flow' or 'stage'.")
 
-        logger.info(f"Checking {parameter} data availability for site {site_id}")
+        logger.debug(f"Checking {parameter} data availability for site {site_id}")
 
         # Convert datetime objects to strings if needed
         if isinstance(start_datetime, datetime):
@@ -597,12 +588,9 @@ class RasUsgsCore:
             end_datetime = end_datetime.strftime("%Y-%m-%d")
 
         try:
-            # Apply rate limiting before API request
-            _apply_rate_limit()
-
             # Try to get a small sample of data to verify availability
             # Get just first day to minimize data transfer
-            test_df, metadata = nwis.get_iv(
+            test_df, metadata = reader.get_iv(
                 sites=site_id,
                 parameterCd=param_code,
                 start=start_datetime,
@@ -621,7 +609,7 @@ class RasUsgsCore:
 
             if result['available']:
                 result['message'] = f"{parameter.capitalize()} data available for site {site_id}"
-                logger.info(result['message'])
+                logger.debug(result['message'])
             else:
                 result['message'] = f"No {parameter} data available for site {site_id} in specified period"
                 logger.warning(result['message'])

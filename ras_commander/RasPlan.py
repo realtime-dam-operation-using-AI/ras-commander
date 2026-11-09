@@ -46,7 +46,11 @@ List of Functions in RasPlan:
 - get_unsteady_path(): Get the full path for an unsteady number
 - get_geom_path(): Get the full path for a geometry number
 - update_run_flags(): Update various run flags in a plan file
-- update_plan_intervals(): Update computation and output intervals
+- update_plan_intervals(): Update computation/output/detailed/mapping intervals (validated)
+- get_plan_intervals(): Read the four plan intervals
+- validate_plan_intervals(): Check interval strings and HEC-RAS relationships
+- interval_to_seconds(): Convert an interval string to seconds
+- get_hdf_compression() / set_hdf_compression(): HDF5 compression level and chunk size
 - update_plan_description(): Update the description in a plan file
 - read_plan_description(): Read the description from a plan file
 - read_geom_description(): Read the description from a geometry file
@@ -75,12 +79,13 @@ List of Functions in RasPlan:
 import os
 import re
 import logging
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 from typing import Union, Optional, List, Dict, Any, Tuple
-from numbers import Number
+from numbers import Integral, Number
+from math import isfinite
 import pandas as pd
-from .RasPrj import RasPrj, ras
+from .RasPrj import RasPrj, _matching_copied_prj_file, ras
 from .RasUtils import RasUtils
 from pathlib import Path
 from datetime import datetime
@@ -88,9 +93,35 @@ from datetime import datetime
 import logging
 import re
 from .LoggingConfig import get_logger
+from .fast_hdf import release_native_sessions
 from .Decorators import log_call
+from ._ras_text import _write_ras_text
 
 logger = get_logger(__name__)
+
+def _iter_plan_key_lines(lines):
+    """
+    Yield ``(index, key, raw_value)`` for ``Key=Value`` lines of a plan file.
+
+    The key is the exact text before the first ``=`` (no stripping), so it only
+    matches at the start of a line, and lines inside a ``Begin DESCRIPTION`` ...
+    ``END DESCRIPTION`` block are skipped. Callers compare ``key`` for equality.
+    """
+    in_description = False
+    for i, line in enumerate(lines):
+        marker = line.strip().upper()
+        if in_description:
+            if marker.startswith("END DESCRIPTION"):
+                in_description = False
+            continue
+        if marker.startswith("BEGIN DESCRIPTION"):
+            in_description = "END DESCRIPTION" not in marker
+            continue
+        if "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        yield i, key, raw
+
 
 class RasPlan:
     """
@@ -227,11 +258,27 @@ class RasPlan:
         "time_step_residence_courant": {"plan_key": "Computation Time Step Residence Courant", "type": "bool", "min_version": 5.0},
     }
 
-    VALID_PLAN_INTERVALS = [
-        '1SEC', '2SEC', '3SEC', '4SEC', '5SEC', '6SEC', '10SEC', '15SEC', '20SEC', '30SEC',
-        '1MIN', '2MIN', '3MIN', '4MIN', '5MIN', '6MIN', '10MIN', '15MIN', '20MIN', '30MIN',
-        '1HOUR', '2HOUR', '3HOUR', '4HOUR', '6HOUR', '8HOUR', '12HOUR', '1DAY'
-    ]
+    # Baseline 2D results, observed in both 6.6 and 7.0.1 pilot runs. Requests
+    # for these names are accepted no-ops, not additional-output UI labels.
+    HDF_DEFAULT_OUTPUT_VARIABLES = frozenset({"Water Surface", "Face Velocity"})
+
+    # These labels first appear in HEC-RAS 7.0 and require secondary-flow physics.
+    HDF_OUTPUT_VARIABLE_MIN_VERSIONS = {
+        "Cell Dispersion Terms": 7.0,
+        "Cell Effective Flow Curvature": 7.0,
+        "Cell Effective Radius of Curvature": 7.0,
+        "Cell Equilibrium Spiral Intensity": 7.0,
+        "Cell Flow Curvature": 7.0,
+        "Cell Momentum Dispersive Stresses": 7.0,
+        "Cell Radius of Curvature": 7.0,
+        "Cell Spiral Intensity": 7.0,
+        "Cell Spiral Intensity Adaptation Length": 7.0,
+        "Face Momentum Dispersion": 7.0,
+        "Face Near-bed Velocity": 7.0,
+        "Face Spiral Intensity Diffusion Coefficient": 7.0,
+        "Face Spiral Velocity": 7.0,
+        "Face Surface Velocity": 7.0,
+    }
 
     HDF_ADDITIONAL_OUTPUT_VARIABLES = [
         "Cell Cumulative Excess Depth",
@@ -278,7 +325,49 @@ class RasPlan:
         "Face Wind Velocity",
         "Face Yield Stress",
         "Governing Equation Terms",
+        *HDF_OUTPUT_VARIABLE_MIN_VERSIONS,
     ]
+
+    # HEC-RAS silently drops these short tokens; write their full UI labels.
+    HDF_OUTPUT_VARIABLE_ALIASES = {
+        "Cell Flow Balance": "Cell Flow Balance (inflows - outflows)",
+        "Cell Invert Depth": "Cell Invert Depth (WSE - Cell Min Elev)",
+        "Face Tangential Velocity": "Face Tangential Velocity (Both sides of each face)",
+        "Cell Cumulative Precipitation": "Cell Cumulative Precipitation Depth",
+    }
+
+    # Observed label -> one/many dataset basenames in Base Output/Unsteady Time
+    # Series/2D Flow Areas/<area> (6.6 and 7.0.1 pilot). This is a partial map,
+    # not a guarantee of output: physics/version/plan settings control presence.
+    # Unlisted labels have no qualified mapping here. The empty node tuple
+    # records that the pilot produced no dataset; its working token is unresolved.
+    HDF_OUTPUT_VARIABLE_DATASETS = {
+        "Cell Courant": ("Cell Courant",),
+        "Cell Eddy Viscosity": ("Cell Eddy Viscosity - Eddy Viscosity X", "Cell Eddy Viscosity - Eddy Viscosity Y"),
+        "Cell Flow Balance (inflows - outflows)": ("Cell Flow Balance",),
+        "Cell Hydraulic Depth": ("Cell Hydraulic Depth",),
+        "Cell Invert Depth (WSE - Cell Min Elev)": ("Cell Invert Depth",),
+        "Cell Velocity": ("Cell Velocity - Velocity X", "Cell Velocity - Velocity Y"),
+        "Cell Volume": ("Cell Volume",),
+        "Cell Volume Error": ("Cell Volume Error",),
+        "Cell Water Surface Error": ("Cell Water Surface Error",),
+        "Face Area": ("Face Area",),
+        "Face Courant": ("Face Courant",),
+        "Face Cumulative Volume": ("Face Cumulative Volume",),
+        "Face Eddy Viscosity": ("Face Eddy Viscosity",),
+        "Face Flow": ("Face Flow",),
+        "Face Period-Average Flow": ("Face Flow Period Average",),
+        "Face Manning's n": ("Face Manning's n",),
+        # Also produces Summary Output/.../Maximum Face Shear Stress.
+        "Face Shear Stress": ("Face Shear Stress",),
+        "Face Tangential Velocity (Both sides of each face)": ("Face Tangential Velocity",),
+        "Face Water Surface": ("Face Water Surface",),
+        "Governing Equation Terms": (
+            "Cell Divergence Term", "Cell Storage Term", "Cell Water Source Term",
+            "Face Friction Term", "Face Pressure Gradient Term", "Face Wind Term",
+        ),
+        "Face Point (Node) Velocities*": (),
+    }
 
     RESTART_OUTPUT_PARAMETER_KEYS = {
         "enabled": "Write IC File",
@@ -296,6 +385,107 @@ class RasPlan:
         "plan file using Write IC File keys. Restart-file usage remains separate "
         "in the unsteady-flow file as Use Restart and Restart Filename."
     )
+
+    @staticmethod
+    def _replace_reference_in_lines(lines, key: str, value: str):
+        """Replace exactly one top-level ``key=value`` plan-file record."""
+        updated_lines = list(lines)
+        matches = []
+        in_description = False
+
+        for index, line in enumerate(updated_lines):
+            stripped = line.strip()
+            if re.match(r'^BEGIN DESCRIPTION:?$', stripped, re.IGNORECASE):
+                in_description = True
+                continue
+            if re.match(r'^END DESCRIPTION$', stripped, re.IGNORECASE):
+                in_description = False
+                continue
+            if not in_description and line.startswith(f"{key}="):
+                matches.append(index)
+
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one top-level {key}= record; found {len(matches)}"
+            )
+
+        index = matches[0]
+        original = updated_lines[index]
+        if original.endswith('\r\n'):
+            newline = '\r\n'
+        elif original.endswith('\n'):
+            newline = '\n'
+        elif original.endswith('\r'):
+            newline = '\r'
+        else:
+            newline = ''
+        updated_lines[index] = f"{key}={value}{newline}"
+        return updated_lines
+
+    @staticmethod
+    def _replace_top_level_plan_reference(
+        plan_file_path: Union[str, Path],
+        key: str,
+        value: str,
+    ) -> None:
+        """Rewrite and verify one plan reference without touching descriptions."""
+        plan_file_path = Path(plan_file_path)
+        with open(
+            plan_file_path,
+            'r',
+            encoding='utf-8',
+            errors='replace',
+            newline='',
+        ) as handle:
+            lines = handle.readlines()
+
+        updated_lines = RasPlan._replace_reference_in_lines(lines, key, value)
+        _write_ras_text(
+            plan_file_path, "".join(updated_lines), encoding="utf-8", errors="replace"
+        )
+
+        with open(
+            plan_file_path,
+            'r',
+            encoding='utf-8',
+            errors='replace',
+            newline='',
+        ) as handle:
+            verified_lines = handle.readlines()
+
+        RasPlan._replace_reference_in_lines(verified_lines, key, value)
+        actual = []
+        in_description = False
+        for line in verified_lines:
+            stripped = line.strip()
+            if re.match(r'^BEGIN DESCRIPTION:?$', stripped, re.IGNORECASE):
+                in_description = True
+                continue
+            if re.match(r'^END DESCRIPTION$', stripped, re.IGNORECASE):
+                in_description = False
+                continue
+            if not in_description and line.startswith(f"{key}="):
+                actual.append(line.rstrip('\r\n'))
+        if actual != [f"{key}={value}"]:
+            raise IOError(
+                f"Plan reference verification failed for {plan_file_path}: "
+                f"expected {key}={value}, found {actual}"
+            )
+        logger.debug(
+            "Updated %s in plan file %s to %s",
+            key,
+            plan_file_path.name,
+            value,
+        )
+
+    @staticmethod
+    def _refresh_classification(ras_obj, *, refresh_flows: bool = False) -> None:
+        """Refresh DataFrames in dependency order after a plan mutation."""
+        ras_obj.geom_df = ras_obj.get_geom_entries()
+        if refresh_flows:
+            ras_obj.flow_df = ras_obj.get_flow_entries()
+            ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
+        ras_obj.plan_df = ras_obj.get_plan_entries()
     
     @staticmethod
     @log_call
@@ -306,7 +496,7 @@ class RasPlan:
         Parameters:
             plan_number (Union[str, Number]): The plan number to update (accepts int, float, numpy types, etc.).
             new_geom (Union[str, Number]): The new geometry number to set (accepts int, float, numpy types, etc.).
-            ras_object: An optional RAS object instance.
+            ras_object (RasPrj, optional): An optional RAS object instance.
 
         Returns:
             pd.DataFrame: The updated geometry DataFrame.
@@ -325,8 +515,7 @@ class RasPlan:
         plan_number = RasUtils.normalize_ras_number(plan_number)
         new_geom = RasUtils.normalize_ras_number(new_geom)
 
-        # Update all dataframes
-        ras_obj.plan_df = ras_obj.get_plan_entries()
+        # Refresh geometry inventory before validating the new reference.
         ras_obj.geom_df = ras_obj.get_geom_entries()
         
         if new_geom not in ras_obj.geom_df['geom_number'].values:
@@ -339,31 +528,18 @@ class RasPlan:
             logger.error(f"Plan file not found: {plan_file_path}")
             raise ValueError(f"Plan file not found: {plan_file_path}")
         
-        # Read the plan file and update the Geom File line
         try:
-            with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
-                lines = file.readlines()
-            
-            for i, line in enumerate(lines):
-                if line.startswith("Geom File="):
-                    lines[i] = f"Geom File=g{new_geom}\n"
-                    logger.info(f"Updated Geom File in plan file to g{new_geom} for plan {plan_number}")
-                    break
-                
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            RasPlan._replace_top_level_plan_reference(
+                plan_file_path,
+                'Geom File',
+                f"g{new_geom}",
+            )
+            RasPlan._refresh_classification(ras_obj)
         except Exception as e:
             logger.error(f"Error updating plan file: {e}")
             raise
-        # Update the plan_df without reinitializing
-        mask = ras_obj.plan_df['plan_number'] == plan_number
-        ras_obj.plan_df.loc[mask, 'geom_number'] = new_geom
-        ras_obj.plan_df.loc[mask, 'geometry_number'] = new_geom  # Update geometry_number column
-        ras_obj.plan_df.loc[mask, 'Geom File'] = f"g{new_geom}"
-        geom_path = ras_obj.project_folder / f"{ras_obj.project_name}.g{new_geom}"
-        ras_obj.plan_df.loc[mask, 'Geom Path'] = str(geom_path)
 
-        logger.info(f"Geometry for plan {plan_number} set to {new_geom}")
+        logger.info("Set geometry for plan p%s to g%s", plan_number, new_geom)
         logger.debug("Updated plan DataFrame:")
         logger.debug(ras_obj.plan_df)
 
@@ -407,32 +583,28 @@ class RasPlan:
         
         plan_file_path = RasPlan.get_plan_path(plan_number, ras_obj)
         if not plan_file_path:
-            raise FileNotFoundError(f"Plan file not found: {plan_number}")
+            raise FileNotFoundError(
+                f"Plan file not found: {plan_number}. "
+                f"See: https://rascommander.info/ras/user-guide/plan-execution/"
+            )
         
         try:
-            RasUtils.update_file(plan_file_path, RasPlan._update_steady_in_file, new_steady_flow_number)
-            
-            # Update all dataframes
-            ras_obj.plan_df = ras_obj.get_plan_entries()
-            
-            # Update flow-related columns
-            mask = ras_obj.plan_df['plan_number'] == plan_number
-            flow_path = ras_obj.project_folder / f"{ras_obj.project_name}.f{new_steady_flow_number}"
-            ras_obj.plan_df.loc[mask, 'Flow File'] = f"f{new_steady_flow_number}"
-            ras_obj.plan_df.loc[mask, 'Flow Path'] = str(flow_path)
-            ras_obj.plan_df.loc[mask, 'unsteady_number'] = None
-            
-            # Update remaining dataframes
-            ras_obj.geom_df = ras_obj.get_geom_entries()
-            ras_obj.flow_df = ras_obj.get_flow_entries()
-            ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
-            
+            RasPlan._replace_top_level_plan_reference(
+                plan_file_path,
+                'Flow File',
+                f"f{new_steady_flow_number}",
+            )
+            RasPlan._refresh_classification(ras_obj, refresh_flows=True)
         except Exception as e:
             raise IOError(f"Failed to update steady flow file: {e}")
 
     @staticmethod
     def _update_steady_in_file(lines, new_steady_flow_number):
-        return [f"Flow File=f{new_steady_flow_number}\n" if line.startswith("Flow File=f") else line for line in lines]
+        return RasPlan._replace_reference_in_lines(
+            lines,
+            'Flow File',
+            f"f{new_steady_flow_number}",
+        )
 
     @staticmethod
     @log_call
@@ -472,48 +644,38 @@ class RasPlan:
         
         plan_file_path = RasPlan.get_plan_path(plan_number, ras_obj)
         if not plan_file_path:
-            raise FileNotFoundError(f"Plan file not found: {plan_number}")
+            raise FileNotFoundError(
+                f"Plan file not found: {plan_number}. "
+                f"See: https://rascommander.info/ras/user-guide/plan-execution/"
+            )
         
         try:
-            # Read the plan file
-            with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-
-            # Update the Flow File line
-            for i, line in enumerate(lines):
-                if line.startswith("Flow File="):
-                    lines[i] = f"Flow File=u{new_unsteady_flow_number}\n"
-                    break
-            
-            # Write back to the plan file
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as f:
-                f.writelines(lines)
-            
-            # Update all dataframes
-            ras_obj.plan_df = ras_obj.get_plan_entries()
-            
-            # Update flow-related columns
-            mask = ras_obj.plan_df['plan_number'] == plan_number
-            flow_path = ras_obj.project_folder / f"{ras_obj.project_name}.u{new_unsteady_flow_number}"
-            ras_obj.plan_df.loc[mask, 'Flow File'] = f"u{new_unsteady_flow_number}"
-            ras_obj.plan_df.loc[mask, 'Flow Path'] = str(flow_path)
-            ras_obj.plan_df.loc[mask, 'unsteady_number'] = new_unsteady_flow_number
-            
-            # Update remaining dataframes
-            ras_obj.geom_df = ras_obj.get_geom_entries()
-            ras_obj.flow_df = ras_obj.get_flow_entries()
-            ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
-            
+            RasPlan._replace_top_level_plan_reference(
+                plan_file_path,
+                'Flow File',
+                f"u{new_unsteady_flow_number}",
+            )
+            RasPlan._refresh_classification(ras_obj, refresh_flows=True)
         except Exception as e:
             raise IOError(f"Failed to update unsteady flow file: {e}")
 
     @staticmethod
     def _update_unsteady_in_file(lines, new_unsteady_flow_number):
-        return [f"Unsteady File=u{new_unsteady_flow_number}\n" if line.startswith("Unsteady File=u") else line for line in lines]
+        return RasPlan._replace_reference_in_lines(
+            lines,
+            'Flow File',
+            f"u{new_unsteady_flow_number}",
+        )
     
     @staticmethod
     @log_call
-    def set_num_cores(plan_number: Union[str, Number], num_cores: int, ras_object=None):
+    def set_num_cores(
+        plan_number: Union[str, Number],
+        num_cores: int,
+        ras_object=None,
+        *,
+        refresh_dataframes: bool = True,
+    ):
         """
         Update the maximum number of cores to use in the HEC-RAS plan file.
 
@@ -521,6 +683,8 @@ class RasPlan:
         plan_number (Union[str, Number]): Plan number (e.g., '02', 2, or 2.0) or full path to the plan file
         num_cores (int): Maximum number of cores to use
         ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
+        refresh_dataframes (bool, optional): Refresh project dataframes after updating the plan.
+            Defaults to True. Set to False when modifying an isolated plan copy.
         
         Returns:
         None
@@ -530,9 +694,12 @@ class RasPlan:
         UNET D2 Cores=
         PS Cores=
 
-        Where a value of "0" is used for "All Available" cores, and values of 1 or more are used to specify the number of cores to use.
+        A value of "0" uses "All Available" cores, and values of 1 or more
+        specify an explicit number of cores.
         For complex 1D/2D models with pipe systems, a more complex approach may be needed to optimize performance.  (Suggest writing a custom function based on this code).
-        This function simply sets the "num_cores" parameter for ALL instances of the above parameters in the plan file.
+        Sets all existing instances of these parameters and inserts missing
+        controls in the default plan scope. An omitted core key must not leave
+        an explicit request using the native runtime's default core count.
 
 
         Notes on setting num_cores in HEC-RAS:
@@ -547,25 +714,50 @@ class RasPlan:
         >>> RasPlan.set_num_cores('02', 4)
         >>> # Using full path to plan file
         >>> RasPlan.set_num_cores('/path/to/project.p02', 4)
+        >>> # Update an isolated copy without refreshing source project metadata
+        >>> RasPlan.set_num_cores('/staging/project.p02', 4, refresh_dataframes=False)
 
         Note:
-            This function updates the ras object's dataframes after modifying the project structure.
+            By default, this function updates the ras object's dataframes after modifying the plan.
         """
+        if isinstance(num_cores, bool) or not isinstance(num_cores, Integral) or num_cores < 0:
+            raise ValueError("num_cores must be a nonnegative integer")
+        num_cores = int(num_cores)
+
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
         
         plan_file_path = RasUtils.get_plan_path(plan_number, ras_obj)
         if not plan_file_path:
-            raise FileNotFoundError(f"Plan file not found: {plan_number}. Please provide a valid plan number or path.")
+            raise FileNotFoundError(
+                f"Plan file not found: {plan_number}. Please provide a valid plan number or path. "
+                f"See: https://rascommander.info/ras/user-guide/plan-execution/"
+            )
         
         def update_num_cores(lines):
-            updated_lines = []
-            for line in lines:
-                if any(param in line for param in ["UNET D1 Cores=", "UNET D2 Cores=", "PS Cores="]):
-                    param_name = line.split("=")[0]
-                    updated_lines.append(f"{param_name}= {num_cores}\n")
-                else:
-                    updated_lines.append(line)
+            core_keys = ("UNET D1 Cores", "UNET D2 Cores", "PS Cores")
+            updated_lines = list(lines)
+            seen = set()
+            default_seen = set()
+            default_end = len(lines)
+            for index, key, _ in _iter_plan_key_lines(lines):
+                if key == "UNET D2 Name" and default_end == len(lines):
+                    default_end = index
+                if key in core_keys:
+                    updated_lines[index] = f"{key}= {num_cores}\n"
+                    seen.add(key)
+                    if index < default_end:
+                        default_seen.add(key)
+            missing_lines = [
+                f"{key}= {num_cores}\n" for key in core_keys
+                if key not in seen or (key == "UNET D2 Cores" and key not in default_seen)
+            ]
+            if missing_lines:
+                # A missing D2 default belongs before any named mesh section,
+                # rather than accidentally overriding only the final mesh.
+                if default_end and not updated_lines[default_end - 1].endswith(("\n", "\r")):
+                    updated_lines[default_end - 1] += "\n"
+                updated_lines[default_end:default_end] = missing_lines
             return updated_lines
         
         try:
@@ -573,11 +765,11 @@ class RasPlan:
         except Exception as e:
             raise IOError(f"Failed to update number of cores in plan file: {e}")
         
-        # Update the ras object's dataframes
-        ras_obj.plan_df = ras_obj.get_plan_entries()
-        ras_obj.geom_df = ras_obj.get_geom_entries()
-        ras_obj.flow_df = ras_obj.get_flow_entries()
-        ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
+        if refresh_dataframes:
+            ras_obj.plan_df = ras_obj.get_plan_entries()
+            ras_obj.geom_df = ras_obj.get_geom_entries()
+            ras_obj.flow_df = ras_obj.get_flow_entries()
+            ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
 
     @staticmethod
     @log_call
@@ -611,7 +803,21 @@ class RasPlan:
         """
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
-        
+        RasPlan._update_geom_preprocessor_file(
+            file_path,
+            run_htab=run_htab,
+            use_ib_tables=use_ib_tables,
+        )
+
+        # Update the ras object's dataframes
+        ras_obj.plan_df = ras_obj.get_plan_entries()
+        ras_obj.geom_df = ras_obj.get_geom_entries()
+        ras_obj.flow_df = ras_obj.get_flow_entries()
+        ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
+
+    @staticmethod
+    def _update_geom_preprocessor_file(file_path, run_htab, use_ib_tables):
+        """Update preprocessor flags without requiring project initialization."""
         if run_htab not in [-1, 0]:
             raise ValueError("Invalid value for `Run HTab`. Expected `0` or `-1`.")
         if use_ib_tables not in [-1, 0]:
@@ -634,12 +840,6 @@ class RasPlan:
             raise FileNotFoundError(f"The file '{file_path}' does not exist.")
         except IOError as e:
             raise IOError(f"An error occurred while reading or writing the file: {e}")
-
-        # Update the ras object's dataframes
-        ras_obj.plan_df = ras_obj.get_plan_entries()
-        ras_obj.geom_df = ras_obj.get_geom_entries()
-        ras_obj.flow_df = ras_obj.get_flow_entries()
-        ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
 
     @staticmethod
     @log_call
@@ -843,7 +1043,7 @@ class RasPlan:
                 ras_object=ras_object,
             )
             if result is not None:
-                _logger.info(f"Found geometry path: {result}")
+                _logger.debug("Found geometry path: %s", result)
             else:
                 _logger.warning(f"No geometry file found with number: {geom_number}")
             return result
@@ -983,7 +1183,18 @@ class RasPlan:
         RasUtils.update_project_file(ras_obj.prj_file, 'Plan', new_plan_num, ras_object=ras_obj)
 
         # Re-initialize the ras global object
-        ras_obj.initialize(ras_obj.project_folder, ras_obj.ras_exe_path)
+        ras_obj.initialize(
+            ras_obj.project_folder,
+            ras_obj.ras_exe_path,
+            suppress_logging=getattr(ras_obj, "suppress_logging", True),
+            prj_file=_matching_copied_prj_file(
+                ras_obj.project_folder, ras_obj.prj_file
+            ),
+            load_results_summary=getattr(
+                ras_obj, "load_results_summary", True
+            ),
+            load_hdf_metadata=getattr(ras_obj, "load_hdf_metadata", True),
+        )
 
         ras_obj.plan_df = ras_obj.get_plan_entries()
         ras_obj.geom_df = ras_obj.get_geom_entries()
@@ -1013,8 +1224,12 @@ class RasPlan:
                 'output_interval': 'output_interval',
                 'mapping': 'mapping_interval',
                 'mapping_interval': 'mapping_interval',
-                'hydrograph': 'hydrograph_output_interval',
-                'hydrograph_output_interval': 'hydrograph_output_interval',
+                'hydrograph': 'output_interval',
+                'hydrograph_output_interval': 'output_interval',
+                'instantaneous': 'instantaneous_interval',
+                'instantaneous_interval': 'instantaneous_interval',
+                'detailed': 'instantaneous_interval',
+                'detailed_output_interval': 'instantaneous_interval',
             }
             for key, value in intervals.items():
                 mapped_key = key_mapping.get(key.lower().replace(' ', '_'))
@@ -1213,7 +1428,7 @@ class RasPlan:
         - 'UNET 1D Methodology' (str): 1D calculation methodology
         - 'UNET D2 Solver Type' (str): 2D solver type
         - 'UNET D2 Name' (str): Name of the 2D area
-        - 'Run RASMapper' (int): Flag to run RASMapper for floodplain mapping (-1 for off, 0 for on)
+        - 'Run RASMapper' (int): Flag to run RASMapper for floodplain mapping (-1 for on, 0 for off)
         
         Note: 
         Writing Multi line keys like 'Description' are not supported by this function.
@@ -1228,17 +1443,24 @@ class RasPlan:
         supported_plan_keys = {
             'Description', 'Computation Interval', 'DSS File', 'Flow File', 'Friction Slope Method',
             'Geom File', 'Mapping Interval', 'Plan File', 'Plan Title', 'Program Version',
-            'Run HTab', 'Run Post Process', 'Run Sediment', 'Run UNET', 'Run WQNET',
+            'Run HTab', 'Run Post Process', 'Run Sediment', 'Run UNet', 'Run UNET', 'Run WQNET',
             'Short Identifier', 'Simulation Date', 'UNET D1 Cores', 'UNET D2 Cores', 'PS Cores',
             'UNET Use Existing IB Tables', 'UNET 1D Methodology', 'UNET D2 Solver Type', 
             'UNET D2 Name', 'Run RASMapper', 'Run HTab', 'Run UNET',
             'Write IC File', 'Write IC File at Fixed DateTime', 'IC Time',
-            'Write IC File Reoccurance', 'Write IC File at Sim End'
+            'Write IC File Reoccurance', 'Write IC File at Sim End',
+            'Output Interval', 'Instantaneous Interval', 'Write Detailed',
+            'HDF Write Warmup', 'HDF Write Time Slices', 'HDF Flush', 'HDF Compression',
+            'HDF Chunk Size', 'HDF Spatial Parts', 'HDF Use Max Rows', 'HDF Fixed Rows'
         }
 
         if key not in supported_plan_keys:
             logger = logging.getLogger(__name__)
-            logger.warning(f"Unknown key: {key}. Valid keys are: {', '.join(supported_plan_keys)}\n Add more keys and explanations in get_plan_value() as needed.")
+            logger.warning("Unknown plan key requested: %s", key)
+            logger.debug(
+                "Supported plan keys for get_plan_value(): %s",
+                ", ".join(sorted(supported_plan_keys)),
+            )
 
         plan_file_path = Path(plan_number_or_path)
         if not plan_file_path.is_file():
@@ -1256,31 +1478,33 @@ class RasPlan:
 
         # Handle core settings specially to convert to integers
         core_keys = {'UNET D1 Cores', 'UNET D2 Cores', 'PS Cores'}
+        found_value = None
+        if key != 'Description':
+            for _, line_key, raw in _iter_plan_key_lines(content.splitlines()):
+                if line_key == key:
+                    found_value = raw.strip()
+                    break
         if key in core_keys:
-            pattern = f"{key}=(.*)"
-            match = re.search(pattern, content)
-            if match:
+            if found_value is not None:
                 try:
-                    return int(match.group(1).strip())
+                    return int(found_value)
                 except ValueError:
                     logger = logging.getLogger(__name__)
                     logger.error(f"Could not convert {key} value to integer")
                     return None
             else:
                 logger = logging.getLogger(__name__)
-                logger.error(f"Key '{key}' not found in the plan file.")
+                logger.debug(f"Key '{key}' not found in the plan file.")
                 return None
         elif key == 'Description':
             match = re.search(r'Begin DESCRIPTION(.*?)END DESCRIPTION', content, re.DOTALL)
             return match.group(1).strip() if match else None
         else:
-            pattern = f"{key}=(.*)"
-            match = re.search(pattern, content)
-            if match:
-                return match.group(1).strip()
+            if found_value is not None:
+                return found_value
             else:
                 logger = logging.getLogger(__name__)
-                logger.error(f"Key '{key}' not found in the plan file.")
+                logger.debug(f"Key '{key}' not found in the plan file.")
                 return None
 
 
@@ -1366,20 +1590,209 @@ class RasPlan:
                         lines.append(f"{flag}= {-1 if value else 0}\n")
                         updated_lines += 1
 
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as f:
-                f.writelines(lines)
+            _write_ras_text(
+                plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
 
             logger = get_logger(__name__)
             logger.info(
-                f"Successfully updated run flags in plan file: {plan_file_path} "
-                f"(flags modified: {updated_lines})"
+                "Updated run flags in plan file: %s (flags modified: %d)",
+                plan_file_path.name,
+                updated_lines,
             )
+            logger.debug("Updated run flags in plan file path: %s", plan_file_path)
 
         except IOError as e:
             logger = get_logger(__name__)
             logger.error(f"Error updating run flags in plan file {plan_file_path}: {e}")
             raise
 
+
+    # ------------------------------------------------------------------
+    # Output / mapping interval support
+    # ------------------------------------------------------------------
+
+    # Plan-file keys controlling the unsteady output cadence, keyed by the
+    # ras-commander argument name. HEC-RAS GUI names are in the comments.
+    PLAN_INTERVAL_KEYS = {
+        "computation": "Computation Interval",      # Computation Interval
+        "output": "Output Interval",                # Hydrograph Output Interval
+        "instantaneous": "Instantaneous Interval",  # Detailed Output Interval
+        "mapping": "Mapping Interval",              # Mapping Output Interval
+    }
+
+    # Interval strings offered by the HEC-RAS 5.0.7 - 7.0 unsteady-flow
+    # editor drop-downs (verified against the string tables in Ras.exe for
+    # 5.0.7, 6.3.1, 6.6 and 7.0).
+    VALID_PLAN_INTERVALS = (
+        '0.1SEC', '0.2SEC', '0.3SEC', '0.4SEC', '0.5SEC',
+        '1SEC', '2SEC', '3SEC', '4SEC', '5SEC', '6SEC', '10SEC', '12SEC',
+        '15SEC', '20SEC', '30SEC',
+        '1MIN', '2MIN', '3MIN', '4MIN', '5MIN', '6MIN', '10MIN', '12MIN',
+        '15MIN', '20MIN', '30MIN',
+        '1HOUR', '2HOUR', '3HOUR', '4HOUR', '6HOUR', '8HOUR', '12HOUR',
+        '1DAY', '1WEEK', '1MON', '1YEAR',
+    )
+
+    # MON and YEAR are calendar based; nominal 30/365 day lengths are used only
+    # for ordering, never for multiple checks.
+    _INTERVAL_UNIT_SECONDS = {
+        "SEC": 1.0, "MIN": 60.0, "HOUR": 3600.0, "DAY": 86400.0,
+        "WEEK": 604800.0, "MON": 2592000.0, "YEAR": 31536000.0,
+    }
+
+    @staticmethod
+    def interval_to_seconds(interval: str) -> float:
+        """
+        Convert a HEC-RAS interval string (e.g. ``'15MIN'``) to seconds.
+
+        Raises:
+            ValueError: If the string is not a valid HEC-RAS interval.
+        """
+        text = str(interval).strip().upper()
+        if text not in RasPlan.VALID_PLAN_INTERVALS:
+            raise ValueError(
+                f"Invalid HEC-RAS interval '{interval}'. "
+                f"Must be one of {list(RasPlan.VALID_PLAN_INTERVALS)}"
+            )
+        match = re.fullmatch(r"([\d.]+)(SEC|MIN|HOUR|DAY|WEEK|MON|YEAR)", text)
+        return float(match.group(1)) * RasPlan._INTERVAL_UNIT_SECONDS[match.group(2)]
+
+    @staticmethod
+    def _is_multiple(value_s: float, base_s: float, text: str = "") -> bool:
+        if str(text).upper().endswith(("MON", "YEAR")):
+            return True  # calendar based; not comparable to a fixed step
+        ratio = value_s / base_s
+        return abs(ratio - round(ratio)) < 1e-9
+
+    @staticmethod
+    def validate_plan_intervals(
+        computation_interval: Optional[str] = None,
+        output_interval: Optional[str] = None,
+        instantaneous_interval: Optional[str] = None,
+        mapping_interval: Optional[str] = None,
+        simulation_start_time: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Check interval strings and their relationships against HEC-RAS rules.
+
+        Rules (HEC-RAS 6.x unsteady-flow editor; messages taken from the Ras.exe
+        string table and the HEC-RAS User's Manual "Unsteady Flow Computation
+        Settings"):
+
+        - every value must be one of ``VALID_PLAN_INTERVALS``;
+        - the Hydrograph (``output``), Detailed (``instantaneous``) and Mapping
+          intervals must each be >= the computation interval and an even multiple
+          of it ("... needs to be an even interval of the computation time step");
+        - a Detailed interval smaller than the Hydrograph interval logs a warning
+          only ("The interval for detailed output is less than the hydrograph
+          output interval" exists in Ras.exe, but it was not confirmed to block a
+          compute, so it is not returned as a problem);
+        - when ``simulation_start_time`` (``'HH:MM'``) is given, it must fall on a
+          multiple of the Hydrograph output interval (HEC-RAS: "change the
+          simulation Starting Time to an even interval of the selected Hydrograph
+          Output Interval").
+
+        Pass only the values you know; relationships are checked only when both
+        sides are supplied.
+
+        Returns:
+            List[str]: Human-readable problems (empty when everything is valid);
+            advisory conditions are logged as warnings instead.
+        """
+        problems: List[str] = []
+        supplied = {
+            'Computation Interval': computation_interval,
+            'Output Interval': output_interval,
+            'Instantaneous Interval': instantaneous_interval,
+            'Mapping Interval': mapping_interval,
+        }
+        seconds: Dict[str, float] = {}
+        for key, value in supplied.items():
+            if value is None:
+                continue
+            try:
+                seconds[key] = RasPlan.interval_to_seconds(value)
+            except ValueError:
+                problems.append(
+                    f"Invalid {key}: {value!r}. Must be one of {list(RasPlan.VALID_PLAN_INTERVALS)}"
+                )
+
+        comp = seconds.get('Computation Interval')
+        if comp is not None:
+            for key in ('Output Interval', 'Instantaneous Interval', 'Mapping Interval'):
+                value_s = seconds.get(key)
+                if value_s is None:
+                    continue
+                if value_s < comp:
+                    problems.append(
+                        f"{key} ({supplied[key]}) is less than the Computation Interval ({computation_interval})"
+                    )
+                elif not RasPlan._is_multiple(value_s, comp, supplied[key]):
+                    problems.append(
+                        f"{key} ({supplied[key]}) must be an even multiple of the "
+                        f"Computation Interval ({computation_interval})"
+                    )
+
+        out_s, det_s = seconds.get('Output Interval'), seconds.get('Instantaneous Interval')
+        if out_s is not None and det_s is not None and det_s < out_s:
+            # Ras.exe contains this message, but no source (manual or compute)
+            # shows that HEC-RAS refuses to run, so it is advisory only.
+            logger.warning(
+                "Instantaneous (detailed) Interval (%s) is less than the Output "
+                "(hydrograph) Interval (%s); HEC-RAS reports this as a problem in the "
+                "unsteady flow editor but it was not confirmed to block a compute",
+                instantaneous_interval, output_interval,
+            )
+
+        if simulation_start_time and out_s is not None and out_s < 86400.0:
+            match = re.match(r"\s*(\d{1,2}):?(\d{2})", str(simulation_start_time))
+            if match:
+                start_s = int(match.group(1)) * 3600 + int(match.group(2)) * 60
+                if not RasPlan._is_multiple(start_s, out_s):
+                    problems.append(
+                        f"Simulation start time {simulation_start_time} is not an even multiple of "
+                        f"the Output Interval ({output_interval}); HEC-RAS will refuse to compute"
+                    )
+        return problems
+
+    @staticmethod
+    @log_call
+    def get_plan_intervals(
+        plan_number_or_path: Union[str, Number, Path],
+        ras_object=None
+    ) -> Dict[str, Optional[str]]:
+        """
+        Read the computation, output, detailed and mapping intervals from a plan file.
+
+        Args:
+            plan_number_or_path: Plan number or path to the plan file.
+            ras_object: Optional RAS project object. If None, uses global ``ras``.
+
+        Returns:
+            Dict[str, Optional[str]]: Keys ``computation``, ``output`` (Hydrograph
+            Output Interval), ``instantaneous`` (Detailed Output Interval) and
+            ``mapping``; values are the raw plan strings (e.g. ``'15MIN'``) or None
+            when the key is absent.
+
+        Raises:
+            ValueError: If the plan file cannot be found.
+        """
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        plan_file_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
+        if not plan_file_path or not Path(plan_file_path).exists():
+            raise ValueError(f"Plan file not found: {plan_number_or_path}")
+
+        key_to_name = {v: k for k, v in RasPlan.PLAN_INTERVAL_KEYS.items()}
+        values: Dict[str, Optional[str]] = {name: None for name in RasPlan.PLAN_INTERVAL_KEYS}
+        with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
+            lines = file.readlines()
+        for _, key, raw in _iter_plan_key_lines(lines):
+            name = key_to_name.get(key)
+            if name and values[name] is None:
+                values[name] = raw.strip()
+        return values
 
     @staticmethod
     @log_call
@@ -1389,31 +1802,40 @@ class RasPlan:
         output_interval: Optional[str] = None,
         instantaneous_interval: Optional[str] = None,
         mapping_interval: Optional[str] = None,
-        ras_object=None
+        ras_object=None,
+        *,
+        validate: bool = True
     ) -> None:
         """
-        Update the computation and output intervals in a HEC-RAS plan file.
+        Update the computation, output, detailed and mapping intervals in a plan file.
 
         Parameters:
         plan_number_or_path (Union[str, Path]): The plan number (1 to 99) or full path to the plan file
-        computation_interval (Optional[str]): The new computation interval. Valid entries include:
-            '1SEC', '2SEC', '3SEC', '4SEC', '5SEC', '6SEC', '10SEC', '15SEC', '20SEC', '30SEC',
-            '1MIN', '2MIN', '3MIN', '4MIN', '5MIN', '6MIN', '10MIN', '15MIN', '20MIN', '30MIN',
-            '1HOUR', '2HOUR', '3HOUR', '4HOUR', '6HOUR', '8HOUR', '12HOUR', '1DAY'
-        output_interval (Optional[str]): The new output interval. Valid entries are the same as computation_interval.
-        instantaneous_interval (Optional[str]): The new instantaneous interval. Valid entries are the same as computation_interval.
-        mapping_interval (Optional[str]): The new mapping interval. Valid entries are the same as computation_interval.
+        computation_interval (Optional[str]): New computation interval. Valid entries are
+            ``RasPlan.VALID_PLAN_INTERVALS`` ('0.1SEC' ... '1SEC' ... '1MIN' ... '1HOUR' ...
+            '1DAY', '1WEEK', '1MON', '1YEAR').
+        output_interval (Optional[str]): Hydrograph Output Interval (``Output Interval=``).
+        instantaneous_interval (Optional[str]): Detailed Output Interval (``Instantaneous Interval=``).
+        mapping_interval (Optional[str]): Mapping Output Interval (``Mapping Interval=``).
         ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
+        validate (bool): Keyword-only. Check the relationships described in
+            ``validate_plan_intervals`` against the *resulting* plan (new values merged
+            with those already in the file, including values you did not change, plus
+            the simulation start time). Default True.
 
         Raises:
-        ValueError: If the plan file is not found or if an invalid interval is provided
+        ValueError: If the plan file is not found or if an invalid/inconsistent interval is provided
         IOError: If there's an error reading or writing the plan file
 
-        Note: This function does not check if the intervals are equal divisors. Ensure you use valid values from HEC-RAS.
+        Notes:
+            Lines that are not intervals are written back untouched (line endings are
+            normalised to CRLF like every other ras-commander writer). A missing
+            interval key is inserted after the last existing interval key.
+            Short output/mapping intervals enlarge the plan HDF; see
+            ``set_hdf_compression``.
 
         Example:
-        >>> RasPlan.update_plan_intervals("01", computation_interval="5SEC", output_interval="1MIN", instantaneous_interval="1HOUR", mapping_interval="5MIN")
-        >>> RasPlan.update_plan_intervals("/path/to/plan.p01", computation_interval="10SEC", output_interval="30SEC")
+        >>> RasPlan.update_plan_intervals("01", computation_interval="30SEC", output_interval="15MIN", instantaneous_interval="1HOUR", mapping_interval="15MIN")
         """
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
@@ -1424,45 +1846,98 @@ class RasPlan:
             if plan_file_path is None or not Path(plan_file_path).exists():
                 raise ValueError(f"Plan file not found: {plan_file_path}")
 
-        valid_intervals = [
-            '1SEC', '2SEC', '3SEC', '4SEC', '5SEC', '6SEC', '10SEC', '15SEC', '20SEC', '30SEC',
-            '1MIN', '2MIN', '3MIN', '4MIN', '5MIN', '6MIN', '10MIN', '15MIN', '20MIN', '30MIN',
-            '1HOUR', '2HOUR', '3HOUR', '4HOUR', '6HOUR', '8HOUR', '12HOUR', '1DAY'
-        ]
-
-        interval_mapping = {
+        requested = {
             'Computation Interval': computation_interval,
             'Output Interval': output_interval,
             'Instantaneous Interval': instantaneous_interval,
-            'Mapping Interval': mapping_interval
+            'Mapping Interval': mapping_interval,
         }
+        requested = {
+            key: str(value).strip().upper() for key, value in requested.items() if value is not None
+        }
+        if not requested:
+            return
+
+        # Value validity is always enforced; relationships only when validate=True.
+        for key, value in requested.items():
+            if value not in RasPlan.VALID_PLAN_INTERVALS:
+                raise ValueError(
+                    f"Invalid {key}: {value}. Must be one of {list(RasPlan.VALID_PLAN_INTERVALS)}"
+                )
 
         try:
             with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
                 lines = file.readlines()
-
-            for i, line in enumerate(lines):
-                for key, value in interval_mapping.items():
-                    if value is not None:
-                        if value.upper() not in valid_intervals:
-                            raise ValueError(f"Invalid {key}: {value}. Must be one of {valid_intervals}")
-                        if line.strip().startswith(key):
-                            lines[i] = f"{key}={value.upper()}\n"
-
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
-
-            logger = logging.getLogger(__name__)
-            logger.info(f"Successfully updated intervals in plan file: {plan_file_path}")
-
         except IOError as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"Error updating intervals in plan file {plan_file_path}: {e}")
+            logger.error(f"Error reading plan file {plan_file_path}: {e}")
             raise
-     
-     
 
+        interval_keys = set(RasPlan.PLAN_INTERVAL_KEYS.values())
 
+        if validate:
+            effective: Dict[str, str] = {}
+            start_time = None
+            for _, key, raw in _iter_plan_key_lines(lines):
+                if key in interval_keys:
+                    effective.setdefault(key, raw.strip().upper())
+                elif key == "Simulation Date" and start_time is None:
+                    parts = [p.strip() for p in raw.split(",")]
+                    if len(parts) >= 2:
+                        start_time = parts[1]
+            effective.update(requested)
+            # Hand-edited values already in the file that are not valid strings are
+            # ignored rather than blamed on this call.
+            for key in list(effective):
+                if key not in requested and effective[key] not in RasPlan.VALID_PLAN_INTERVALS:
+                    del effective[key]
+            problems = RasPlan.validate_plan_intervals(
+                computation_interval=effective.get('Computation Interval'),
+                output_interval=effective.get('Output Interval'),
+                instantaneous_interval=effective.get('Instantaneous Interval'),
+                mapping_interval=effective.get('Mapping Interval'),
+                simulation_start_time=start_time,
+            )
+            if problems:
+                raise ValueError("Inconsistent plan intervals: " + "; ".join(problems))
+
+        present_keys = set()
+        last_interval_index = None
+        for i, key, _raw in _iter_plan_key_lines(lines):
+            if key in interval_keys:
+                last_interval_index = i
+                if key in requested:
+                    # HEC-RAS updates every occurrence when a hand-edited plan
+                    # contains duplicate interval records. Keep reads first-wins
+                    # and restore that single effective value on every write.
+                    lines[i] = f"{key}={requested[key]}\n"
+                    present_keys.add(key)
+
+        missing_keys = set(requested) - present_keys
+        if missing_keys:
+            if last_interval_index is None:
+                for i, key, _raw in _iter_plan_key_lines(lines):
+                    if key in {"Encroach Param", "Geom File", "Flow File"}:
+                        last_interval_index = i
+                if last_interval_index is None:
+                    # Append after a complete Description block rather than using
+                    # a raw-line index that could point inside one.
+                    last_interval_index = len(lines) - 1
+            new_lines = [
+                f"{key}={requested[key]}\n"
+                for key in RasPlan.PLAN_INTERVAL_KEYS.values() if key in missing_keys
+            ]
+            if lines and not lines[last_interval_index].endswith("\n"):
+                lines[last_interval_index] += "\n"
+            lines[last_interval_index + 1:last_interval_index + 1] = new_lines
+
+        _write_ras_text(
+            plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+        )
+        if hasattr(ras_obj, "get_plan_entries"):
+            ras_obj.plan_df = ras_obj.get_plan_entries()
+
+        logger.info("Updated intervals in plan file: %s", Path(plan_file_path).name)
+        logger.debug("Updated intervals in plan file path: %s", plan_file_path)
 
 
     @staticmethod
@@ -1522,11 +1997,12 @@ class RasPlan:
                 description_lines.append(line.strip())
 
         if not description_found:
-            logger.warning(f"No description found in plan file: {plan_file_path}")
+            logger.debug("No description found in plan file: %s", plan_file_path.name)
+            logger.debug("Plan file path without description: %s", plan_file_path)
             return ""
 
         description = '\n'.join(description_lines)
-        logger.info(f"Read description from plan file: {plan_file_path}")
+        logger.debug("Read description from plan file: %s", plan_file_path)
         return description
 
 
@@ -1563,6 +2039,7 @@ class RasPlan:
         ...     'Confidence Level: upper')
         True
         """
+        logger = get_logger(__name__)
         try:
             # Get the RAS object
             if ras_object is None:
@@ -1677,8 +2154,9 @@ class RasPlan:
                 new_lines = lines[:insertion_idx] + description_block + lines[insertion_idx:]
             
             # Write the modified content back to the file
-            with open(plan_path, 'w', encoding='utf-8', errors='replace') as f:
-                f.writelines(new_lines)
+            _write_ras_text(
+                plan_path, "".join(new_lines), encoding="utf-8", errors="replace"
+            )
             
             # Validate the result (optional debug check)
             if __debug__:  # Only in debug mode
@@ -1690,20 +2168,22 @@ class RasPlan:
                     desc_pos = content.find('Begin DESCRIPTION')
                     comp_pos = content.find('Computation Interval=')
                     if desc_pos > comp_pos:
-                        print(f"Warning: Description block may be in wrong position in plan {plan_number}")
+                        logger.warning(
+                            "Description block may be in wrong position in plan %s",
+                            plan_number,
+                        )
             
             return True
             
         except FileNotFoundError:
-            print(f"Error: Plan file not found for plan {plan_number}")
+            logger.error("Plan file not found for plan %s", plan_number)
             return False
         except IOError as e:
-            print(f"Error: IO error updating plan {plan_number}: {e}")
+            logger.error("IO error updating plan %s: %s", plan_number, e)
             return False
         except Exception as e:
-            print(f"Error: Unexpected error updating plan {plan_number}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error("Unexpected error updating plan %s: %s", plan_number, e)
+            logger.debug("Unexpected error updating plan description", exc_info=True)
             return False
 
     @staticmethod
@@ -1850,19 +2330,61 @@ class RasPlan:
             if plan_file_path is None or not Path(plan_file_path).exists():
                 raise ValueError(f"Plan file not found for plan number: {plan_number_or_path!r}")
 
-        # Format the dates
-        formatted_date = f"{start_date.strftime('%d%b%Y').upper()},{start_date.strftime('%H%M')},{end_date.strftime('%d%b%Y').upper()},{end_date.strftime('%H%M')}"
-
         try:
-            # Read the file
-            with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
-                lines = file.readlines()
+            # Keep unrelated native bytes intact; only newline serialization
+            # changes when the validated record is written with CRLF.
+            original = Path(plan_file_path).read_bytes()
+            lines = original.splitlines(keepends=True)
 
             # Update the Simulation Date line
             updated = False
             for i, line in enumerate(lines):
-                if line.startswith("Simulation Date="):
-                    lines[i] = f"Simulation Date={formatted_date}\n"
+                if line.startswith(b"Simulation Date="):
+                    if line.endswith(b"\r\n"):
+                        line_ending = b"\r\n"
+                    elif line.endswith(b"\n"):
+                        line_ending = b"\n"
+                    elif line.endswith(b"\r"):
+                        line_ending = b"\r"
+                    else:
+                        line_ending = b""
+                    body = line[: len(line) - len(line_ending)] if line_ending else line
+                    fields = body.removeprefix(b"Simulation Date=").split(b",")
+                    if len(fields) != 4:
+                        raise ValueError(
+                            "Malformed 'Simulation Date=' line in plan file: "
+                            f"{plan_file_path}. "
+                            "Expected four comma-separated fields."
+                        )
+
+                    start_time_token = fields[1]
+                    end_time_token = fields[3]
+                    time_formats = []
+                    for label, token in (
+                        ("start", start_time_token),
+                        ("end", end_time_token),
+                    ):
+                        if re.fullmatch(br"[0-9]{4}", token):
+                            time_formats.append("%H%M")
+                        elif re.fullmatch(br"[0-9]{2}:[0-9]{2}", token):
+                            time_formats.append("%H:%M")
+                        else:
+                            raise ValueError(
+                                f"Malformed {label} time {token.decode('ascii', errors='replace')!r} in "
+                                "'Simulation Date=' line in plan file: "
+                                f"{plan_file_path}. Expected HHMM or HH:MM."
+                            )
+
+                    formatted_date = (
+                        f"{start_date.strftime('%d%b%Y').upper()},"
+                        f"{start_date.strftime(time_formats[0])},"
+                        f"{end_date.strftime('%d%b%Y').upper()},"
+                        f"{end_date.strftime(time_formats[1])}"
+                    )
+                    lines[i] = (
+                        f"Simulation Date={formatted_date}".encode("ascii")
+                        + line_ending
+                    )
                     updated = True
                     break
 
@@ -1873,11 +2395,13 @@ class RasPlan:
                     "Cannot update simulation date."
                 )
 
-            # Write the updated content back to the file
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            # Write only after the complete target record has been validated.
+            _write_ras_text(
+                plan_file_path, b"".join(lines).decode("latin-1"), encoding="latin-1"
+            )
 
-            logger.info(f"Updated simulation date in plan file: {plan_file_path}")
+            logger.info("Updated simulation date in plan file: %s", plan_file_path.name)
+            logger.debug("Updated simulation date in plan file path: %s", plan_file_path)
 
         except OSError as e:
             logger.error(f"Error updating simulation date in plan file {plan_file_path}: {e}")
@@ -2024,8 +2548,9 @@ class RasPlan:
         insert = [f"Sediment Output Variables={v}\n" for v in final_vars]
         new_lines[level_idx + 1:level_idx + 1] = insert
 
-        with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-            file.writelines(new_lines)
+        _write_ras_text(
+            plan_file_path, "".join(new_lines), encoding="utf-8", errors="replace"
+        )
         logger.info(f"Set {len(final_vars)} sediment output variable(s) in {plan_file_path}")
 
         if ras_object:
@@ -2063,7 +2588,7 @@ class RasPlan:
             logger.warning(f"Short Identifier not found in plan: {plan_number_or_path}")
             return ""
         
-        logger.info(f"Retrieved Short Identifier: {shortid}")
+        logger.debug("Retrieved Short Identifier: %s", shortid)
         return shortid
 
     @staticmethod
@@ -2090,7 +2615,11 @@ class RasPlan:
 
         # Ensure new_shortid is not too long (HEC-RAS limits short identifiers to 24 characters)
         if len(new_shortid) > 24:
-            logger.warning(f"Short Identifier too long (24 char max). Truncating: {new_shortid}")
+            logger.warning(
+                "Short Identifier exceeds 24 characters (received %d); truncating",
+                len(new_shortid),
+            )
+            logger.debug("Original Short Identifier before truncation: %s", new_shortid)
             new_shortid = new_shortid[:24]
 
         # Get the plan file path
@@ -2127,10 +2656,12 @@ class RasPlan:
                     lines.insert(0, f"Short Identifier={new_shortid}\n")
 
             # Write the updated content back to the file
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            _write_ras_text(
+                plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
 
-            logger.info(f"Updated Short Identifier in plan file to: {new_shortid}")
+            logger.info("Updated Short Identifier in plan file to: %s", new_shortid)
+            logger.debug("Updated Short Identifier in plan file path: %s", plan_file_path)
 
         except IOError as e:
             logger.error(f"Error updating Short Identifier in plan file {plan_file_path}: {e}")
@@ -2172,7 +2703,7 @@ class RasPlan:
             logger.warning(f"Plan Title not found in plan: {plan_number_or_path}")
             return ""
         
-        logger.info(f"Retrieved Plan Title: {title}")
+        logger.debug("Retrieved Plan Title: %s", title)
         return title
 
     @staticmethod
@@ -2223,10 +2754,12 @@ class RasPlan:
                 lines.insert(0, f"Plan Title={new_title}\n")
 
             # Write the updated content back to the file
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            _write_ras_text(
+                plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
 
-            logger.info(f"Updated Plan Title in plan file to: {new_title}")
+            logger.debug("Updated Plan Title in plan file to: %s", new_title)
+            logger.debug("Updated Plan Title in plan file path: %s", plan_file_path)
 
         except IOError as e:
             logger.error(f"Error updating Plan Title in plan file {plan_file_path}: {e}")
@@ -2276,11 +2809,14 @@ class RasPlan:
         """
         Normalize a 2D equation-set value to the plan-file integer code.
         """
-        if isinstance(equation_set, bool):
+        if pd.api.types.is_bool(equation_set):
             raise ValueError("equation_set must be DWE, SWE-ELM, 0, or 1")
         if isinstance(equation_set, Number):
-            code = int(equation_set)
-            if code in RasPlan.TWO_D_EQUATION_CODE_TO_NAME:
+            try:
+                code = int(equation_set)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("equation_set must be DWE, SWE-ELM, 0, or 1") from exc
+            if equation_set == code and code in RasPlan.TWO_D_EQUATION_CODE_TO_NAME:
                 return code
         normalized = str(equation_set).strip().upper().replace("_", "-")
         normalized = re.sub(r"\s+", " ", normalized)
@@ -2312,6 +2848,18 @@ class RasPlan:
         raise ValueError(f"Cannot parse boolean value: {value}")
 
     @staticmethod
+    def _parse_2d_bool_option(api_key: str, value: Any) -> Optional[bool]:
+        """Accept boolean aliases and the native -1/0/1 numeric encodings."""
+        if isinstance(value, Number):
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{api_key} must be boolean or -1, 0, or 1") from exc
+            if not isfinite(numeric_value) or numeric_value not in {-1, 0, 1}:
+                raise ValueError(f"{api_key} must be boolean or -1, 0, or 1")
+        return RasPlan._parse_bool_like(value)
+
+    @staticmethod
     def _coerce_2d_option_value(api_key: str, raw_value: Any) -> Any:
         """
         Convert raw plan/HDF option values to Python types.
@@ -2335,11 +2883,17 @@ class RasPlan:
             code = RasPlan._normalize_2d_equation_set(raw_value)
             return RasPlan.TWO_D_EQUATION_CODE_TO_NAME[code]
         if value_type == "bool":
-            return RasPlan._parse_bool_like(raw_value)
+            return RasPlan._parse_2d_bool_option(api_key, raw_value)
         if value_type == "int":
-            return int(float(str(raw_value).strip()))
+            numeric_value = float(str(raw_value).strip())
+            if not isfinite(numeric_value) or not numeric_value.is_integer():
+                raise ValueError(f"{api_key} must be a finite integer")
+            return int(numeric_value)
         if value_type == "float":
-            return float(str(raw_value).strip())
+            numeric_value = float(str(raw_value).strip())
+            if not isfinite(numeric_value):
+                raise ValueError(f"{api_key} must be finite")
+            return numeric_value
         if value_type == "interval":
             interval = str(raw_value).strip().upper()
             if interval and interval not in RasPlan.VALID_PLAN_INTERVALS:
@@ -2369,14 +2923,23 @@ class RasPlan:
         if value_type == "equation":
             return str(RasPlan._normalize_2d_equation_set(value))
         if value_type == "bool":
-            return "-1" if RasPlan._parse_bool_like(value) else "0"
+            return "-1" if RasPlan._parse_2d_bool_option(api_key, value) else "0"
         if value_type == "int":
-            int_value = int(value)
+            if pd.api.types.is_bool(value):
+                raise ValueError(f"{api_key} must be a finite integer, not boolean")
+            try:
+                int_value = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{api_key} must be a finite integer") from exc
+            if not isinstance(value, (str, bytes)) and value != int_value:
+                raise ValueError(f"{api_key} must be a finite integer")
             if int_value < 0:
                 raise ValueError(f"{api_key} must be >= 0")
             return str(int_value)
         if value_type == "float":
             float_value = float(value)
+            if not isfinite(float_value):
+                raise ValueError(f"{api_key} must be finite")
             if api_key in {
                 "initial_conditions_time_hours",
                 "time_step_max_courant",
@@ -2631,7 +3194,7 @@ class RasPlan:
         Args:
             plan_number_or_path: Plan number or path to the plan file.
             mesh_name: Optional 2D flow area name to filter the returned areas.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             Dict[str, Any]: Parsed options with ``plan``, ``default``, and
@@ -2742,7 +3305,7 @@ class RasPlan:
             equation_set: ``"DWE"``/``0`` or ``"SWE-ELM"``/``1``.
             initial_conditions_time_hours: 2D initial conditions ramp-up time.
             include_default: Also update the default unnamed 2D settings block.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             bool: True when the plan file was written or already matched.
@@ -2780,7 +3343,7 @@ class RasPlan:
             time_step_residence_courant=time_step_residence_courant,
         )
         if not updates:
-            logger.info("No 2D flow options requested")
+            logger.debug("No 2D flow options requested")
             return True
 
         plan_file_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
@@ -2855,11 +3418,12 @@ class RasPlan:
                         section["last_index"] = max(section.get("last_index") or insert_index, insert_index)
 
         if lines == original_lines:
-            logger.info(f"2D flow options already current in plan file: {plan_file_path.name}")
+            logger.debug("2D flow options already current in plan file: %s", plan_file_path.name)
             return True
 
-        with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-            file.writelines(lines)
+        _write_ras_text(
+            plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         logger.info(f"Updated 2D flow options in plan file: {plan_file_path.name}")
         return True
@@ -2887,7 +3451,7 @@ class RasPlan:
                 with the equation-set change.
             initial_conditions_time_hours: Optional 2D initial conditions time.
             include_default: Also update the default unnamed 2D settings block.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             bool: True when the plan file was updated or already matched.
@@ -2908,11 +3472,173 @@ class RasPlan:
         """
         List additional 2D HDF output variables known to HEC-RAS plan files.
 
+        Baseline results ``Water Surface`` and ``Face Velocity`` are excluded
+        from this additional-output catalogue. Enabling them is an accepted
+        no-op: they are always written for computed 2D results, an INFO message
+        explains this, and existing plan text is preserved.
+
+        The catalogue includes 14 secondary-flow labels requiring HEC-RAS 7.0+
+        (``HDF_OUTPUT_VARIABLE_MIN_VERSIONS``). Writers check the plan's declared
+        Program Version; an unknown version warns. Required physics must also
+        be active. ``HDF_OUTPUT_VARIABLE_DATASETS`` documents observed one-to-many
+        dataset basenames, including the six Governing Equation Terms arrays;
+        presence and compatible time axes must be checked in the results.
+
+        ``Face Point (Node) Velocities*`` remains for compatibility, but writes
+        no dataset in the 6.6/7.0.1 pilot (recorded as ``Face Point  Velocities``).
+        Its working token is unresolved; enabling it warns instead of promising
+        node velocities. Unmapped labels have no qualified dataset mapping here.
+
         Returns:
             List[str]: Variable names accepted by
                 ``HDF Additional Output Variable=...`` plan-file entries.
         """
         return list(RasPlan.HDF_ADDITIONAL_OUTPUT_VARIABLES)
+
+    @staticmethod
+    def _normalize_hdf_output_variable(variable: str) -> str:
+        """Validate an additional-output label or recognized baseline result name."""
+        if not isinstance(variable, str):
+            raise ValueError("HDF output variable must be a full UI label string")
+        variable = variable.strip()
+        canonical = RasPlan.HDF_OUTPUT_VARIABLE_ALIASES.get(variable, variable)
+        if canonical != variable:
+            logger.warning("Normalizing HDF output variable %r to full label %r", variable, canonical)
+        if (canonical not in RasPlan.HDF_ADDITIONAL_OUTPUT_VARIABLES
+                and canonical not in RasPlan.HDF_DEFAULT_OUTPUT_VARIABLES):
+            raise ValueError(
+                f"Unknown HDF output variable {variable!r}; use a full label from "
+                "RasPlan.list_available_hdf_output_variables()"
+            )
+        if canonical == 'Face Point (Node) Velocities*':
+            logger.warning(
+                "HDF output label %r produced no node velocity datasets in the "
+                "HEC-RAS 6.6/7.0.1 pilot; the working token is unresolved", canonical
+            )
+        return canonical
+
+    # A versioned HEC-RAS install folder name, e.g. "6.6", "7.0.1", "6.7 Beta 5".
+    _RAS_VERSION_FOLDER_RE = re.compile(r"\d{1,2}\.\d+(?:\.\d+)?(?: Beta \d+)?", re.IGNORECASE)
+
+    @staticmethod
+    def _target_ras_version_to_float(
+        target_ras_version: Optional[Union[str, float, Path]],
+    ) -> Optional[float]:
+        """
+        Convert a target HEC-RAS version to a major.minor float for HDF label gates.
+
+        Accepts a version string (``"7.0"``, ``"7.0.1"``, ``"6.7 Beta 5"``), a
+        compact version (``"70"``, ``"701"``, ``"66"``), a number (``7.0``), or a
+        path to ``Ras.exe`` inside a versioned install folder
+        (``.../HEC-RAS/7.0/Ras.exe``; backslash paths are read as Windows
+        paths on any host). The whole value, or the exe's parent folder name,
+        must match one of those forms; anything else (``.../x86/Ras.exe``,
+        ``"1000"``, ``"latest"``) returns None.
+        """
+        if target_ras_version is None or isinstance(target_ras_version, bool):
+            return None
+        text = str(target_ras_version).strip()
+        if text.lower().endswith(".exe"):
+            exe_path = PureWindowsPath(text) if "\\" in text else Path(text)
+            folder = exe_path.parent.name.strip()
+            if not RasPlan._RAS_VERSION_FOLDER_RE.fullmatch(folder):
+                return None
+            return RasPlan._version_to_float(folder)
+        if re.fullmatch(r"\d{2,3}", text):
+            text = f"{text[0]}.{text[1]}"
+        elif not (
+            re.fullmatch(r"\d{1,2}", text)
+            or RasPlan._RAS_VERSION_FOLDER_RE.fullmatch(text)
+        ):
+            return None
+        return RasPlan._version_to_float(text)
+
+    @staticmethod
+    def _engine_hdf_target_version(plan_path: Union[str, Path], ras_exe_path: Any) -> Optional[str]:
+        """
+        Return the executing engine version to use as an HDF label gate, or None.
+
+        Used by ``RasCmdr.compute_plan`` where the HEC-RAS version that will
+        run is known. The engine version is returned only when it parses and is
+        NEWER than the plan's declared Program Version (HEC-RAS upgrades older
+        plans on open). Otherwise None keeps the declared-version gate, so this
+        never rejects a request the declared-version gate would accept.
+        """
+        engine = RasPlan._target_ras_version_to_float(ras_exe_path)
+        if engine is None:
+            return None
+        try:
+            lines = Path(plan_path).read_text(encoding='utf-8', errors='replace').splitlines(True)
+        except (IOError, OSError, TypeError):
+            return None
+        declared = RasPlan._version_to_float(RasPlan._declared_program_version(lines))
+        if declared is None or engine <= declared:
+            return None
+        return str(engine)
+
+    @staticmethod
+    def _declared_program_version(lines: List[str]) -> Optional[str]:
+        """Plan ``Program Version=`` value, ignoring Description text."""
+        program_version = next(
+            (value for _, key, value in _iter_plan_key_lines(lines) if key == 'Program Version'),
+            None,
+        )
+        return program_version.strip() if program_version is not None else None
+
+    @staticmethod
+    def _check_hdf_output_versions(
+        variables: List[str],
+        lines: List[str],
+        target_ras_version: Optional[Union[str, float, Path]] = None,
+    ) -> None:
+        """
+        Gate version-limited labels, ignoring Description text.
+
+        With ``target_ras_version=None`` the plan's declared Program Version is
+        the gate (unknown versions warn). An explicit target replaces the
+        declared version as the gate; a target older than a label's minimum
+        raises, and an unparseable target raises ValueError.
+        """
+        program_version = RasPlan._declared_program_version(lines)
+        version = RasPlan._version_to_float(program_version)
+        if target_ras_version is not None:
+            target = RasPlan._target_ras_version_to_float(target_ras_version)
+            if target is None:
+                raise ValueError(
+                    f"Could not determine a HEC-RAS version from target_ras_version={target_ras_version!r}"
+                )
+            for variable in variables:
+                minimum = RasPlan.HDF_OUTPUT_VARIABLE_MIN_VERSIONS.get(variable)
+                if minimum is None:
+                    continue
+                if target < minimum:
+                    raise ValueError(
+                        f"HDF output variable {variable!r} requires HEC-RAS {minimum:g}+; "
+                        f"target HEC-RAS version is {target_ras_version}"
+                    )
+                if version is None or version < minimum:
+                    logger.info(
+                        "Allowing HDF output variable %r for target HEC-RAS %s "
+                        "(plan Program Version is %s); it still requires active "
+                        "secondary flow", variable, target_ras_version, program_version
+                    )
+            return
+        for variable in variables:
+            minimum = RasPlan.HDF_OUTPUT_VARIABLE_MIN_VERSIONS.get(variable)
+            if minimum is None:
+                continue
+            if version is None:
+                logger.warning(
+                    "HDF output variable %r requires HEC-RAS %g+ and secondary flow; "
+                    "plan Program Version is unknown", variable, minimum
+                )
+            elif version < minimum:
+                raise ValueError(
+                    f"HDF output variable {variable!r} requires HEC-RAS {minimum:g}+; "
+                    f"plan Program Version is {program_version}. If HEC-RAS "
+                    f"{minimum:g}+ will run this plan, pass target_ras_version "
+                    f"(for example '7.0')"
+                )
 
     @staticmethod
     @log_call
@@ -2954,26 +3680,33 @@ class RasPlan:
         return str(value)
 
     @staticmethod
+    def _terminate_line_before(lines: List[str], index: int) -> None:
+        """Ensure the line before ``index`` ends with a newline before inserting."""
+        if 0 < index <= len(lines) and not lines[index - 1].endswith(("\n", "\r")):
+            lines[index - 1] += "\n"
+
+    @staticmethod
     def _find_hdf_insert_index(lines: List[str]) -> int:
         """
-        Find a stable insertion point for HDF write parameters.
+        Find a stable, Description-aware insertion point for HDF write parameters.
         """
-        for i, line in enumerate(lines):
-            if line.startswith("Calibration Method="):
+        key_lines = list(_iter_plan_key_lines(lines))
+        for i, key, _raw in key_lines:
+            if key == "Calibration Method":
                 return i
 
         insert_index = None
-        for i, line in enumerate(lines):
-            if line.startswith("HDF "):
+        for i, key, _raw in key_lines:
+            if key.startswith("HDF "):
                 insert_index = i + 1
 
         if insert_index is not None:
             return insert_index
 
-        for i, line in enumerate(lines):
-            if line.startswith("Write HDF5 File="):
+        for i, key, _raw in key_lines:
+            if key == "Write HDF5 File":
                 return i
-            if line.startswith("UNET "):
+            if key.startswith("UNET "):
                 insert_index = i + 1
 
         return insert_index if insert_index is not None else len(lines)
@@ -3121,7 +3854,7 @@ class RasPlan:
 
         Args:
             plan_number_or_path: Plan number or explicit plan-file path.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             Dict[str, Optional[Any]]: Parsed restart-output settings, including
@@ -3221,7 +3954,7 @@ class RasPlan:
                 or ``"DDMMMYYYY,hhmm"``.
             recurrence_interval_hours: Hours between subsequent restart writes.
             write_at_sim_end: Also write a restart file at the final time step.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             bool: True when the plan file was updated or already current.
@@ -3306,13 +4039,15 @@ class RasPlan:
             lines = retained_lines
 
             if lines == original_lines:
-                logger.info(
-                    f"Restart output settings already current in plan file: {plan_file_path.name}"
+                logger.debug(
+                    "Restart output settings already current in plan file: %s",
+                    plan_file_path.name,
                 )
                 return True
 
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            _write_ras_text(
+                plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
 
             if hasattr(ras_obj, "get_plan_entries"):
                 ras_obj.plan_df = ras_obj.get_plan_entries()
@@ -3334,7 +4069,7 @@ class RasPlan:
 
         Args:
             plan_number_or_path: Plan number or path to the plan file.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             Dict[str, Optional[Any]]: HDF write settings keyed by ras-commander
@@ -3345,8 +4080,7 @@ class RasPlan:
 
         plan_file_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
         if not plan_file_path or not plan_file_path.exists():
-            logger.error(f"Plan file not found: {plan_number_or_path}")
-            return {key: None for key in RasPlan.HDF_WRITE_PARAMETER_KEYS}
+            raise ValueError(f"Plan file not found: {plan_number_or_path}")
 
         values = {key: None for key in RasPlan.HDF_WRITE_PARAMETER_KEYS}
         plan_key_to_api_key = {
@@ -3356,12 +4090,11 @@ class RasPlan:
 
         try:
             with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
-                for line in file:
-                    if "=" not in line:
-                        continue
-                    key, raw_value = line.split("=", 1)
-                    api_key = plan_key_to_api_key.get(key.strip())
+                for _, key, raw_value in _iter_plan_key_lines(file.readlines()):
+                    api_key = plan_key_to_api_key.get(key)
                     if not api_key:
+                        continue
+                    if values[api_key] is not None:
                         continue
                     raw_value = raw_value.strip()
                     if api_key in {"write_warmup", "write_time_slices", "hdf_flush", "use_max_rows"}:
@@ -3414,12 +4147,12 @@ class RasPlan:
             write_warmup: Write warmup time steps to output file.
             write_time_slices: Write time-sliced steps in addition to basic time steps.
             hdf_flush: Commit writes every time step for crash diagnostics.
-            compression: Gzip/deflate compression level, 1 to 9.
+            compression: Gzip/deflate compression level, 0 (off, no chunking) to 9.
             chunk_size_mb: Maximum chunk size in MB.
             spatial_parts: Number of spatial column groups.
             use_max_rows: Use maximum possible time rows per chunk.
             fixed_rows: Fixed number of time rows when ``use_max_rows`` is False.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
 
         Returns:
             bool: True when the plan file was updated, False on error.
@@ -3427,8 +4160,8 @@ class RasPlan:
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
-        if compression is not None and not 1 <= compression <= 9:
-            raise ValueError("compression must be between 1 and 9")
+        if compression is not None and not 0 <= compression <= 9:
+            raise ValueError("compression must be between 0 (off) and 9")
         if chunk_size_mb is not None and chunk_size_mb < 1:
             raise ValueError("chunk_size_mb must be >= 1")
         if spatial_parts is not None and spatial_parts < 1:
@@ -3451,7 +4184,7 @@ class RasPlan:
             if value is not None
         }
         if not requested:
-            logger.info("No HDF write parameters requested")
+            logger.debug("No HDF write parameters requested")
             return True
 
         plan_file_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
@@ -3465,10 +4198,7 @@ class RasPlan:
             original_lines = list(lines)
 
             updated_keys = set()
-            for i, line in enumerate(lines):
-                if "=" not in line:
-                    continue
-                line_key = line.split("=", 1)[0].strip()
+            for i, line_key, _raw in _iter_plan_key_lines(lines):
                 for api_key, plan_key in RasPlan.HDF_WRITE_PARAMETER_KEYS.items():
                     if line_key == plan_key and api_key in requested:
                         value = RasPlan._format_hdf_parameter_value(requested[api_key])
@@ -3485,14 +4215,19 @@ class RasPlan:
                     plan_key = RasPlan.HDF_WRITE_PARAMETER_KEYS[api_key]
                     value = RasPlan._format_hdf_parameter_value(requested[api_key])
                     new_lines.append(f"{plan_key}= {value} \n")
+                RasPlan._terminate_line_before(lines, insert_index)
                 lines[insert_index:insert_index] = new_lines
 
             if lines == original_lines:
-                logger.info(f"HDF write parameters already current in plan file: {plan_file_path.name}")
+                logger.debug("HDF write parameters already current in plan file: %s", plan_file_path.name)
                 return True
 
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            _write_ras_text(
+                plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
+
+            if hasattr(ras_obj, "get_plan_entries"):
+                ras_obj.plan_df = ras_obj.get_plan_entries()
 
             logger.info(f"Updated HDF write parameters in plan file: {plan_file_path.name}")
             return True
@@ -3533,22 +4268,151 @@ class RasPlan:
             ras_object=ras_object
         )
 
+    # HEC-RAS defaults when an "HDF ..." key is absent from the plan file. Source:
+    # the HDF5 Write Parameters help text in Ras.exe 6.x ("A compression level of 1 is
+    # the default ..."; "... the default value of 1MB") and plans saved by 5.0.7-6.6.
+    HDF_COMPRESSION_DEFAULTS = {
+        "level": 1,
+        "chunk_size_mb": 1,
+        "spatial_parts": 1,
+        "use_max_rows": False,
+        "fixed_rows": 1,
+    }
+
+    # Oldest plan "Program Version" (as written in the plan, e.g. 5.07 = 5.0.7) for
+    # which the HDF-key set below is confirmed present in Ras.exe.
+    HDF_COMPRESSION_MIN_PROGRAM_VERSION = 5.07
+
+    @staticmethod
+    @log_call
+    def get_hdf_compression(
+        plan_number_or_path: Union[str, Number, Path],
+        ras_object=None
+    ) -> Dict[str, Any]:
+        """
+        Get the HDF5 compression/chunking settings of a plan file.
+
+        Returns a dict with the raw plan values (None when the key is absent) under
+        ``level`` (``HDF Compression``; 0 = off, 1-9 = gzip level), ``chunk_size_mb``
+        (``HDF Chunk Size``), ``spatial_parts`` (``HDF Spatial Parts``), ``use_max_rows``
+        (``HDF Use Max Rows``) and ``fixed_rows`` (``HDF Fixed Rows``), plus:
+
+        - ``effective``: the same five settings with HEC-RAS defaults filled in for
+          absent keys (``HDF_COMPRESSION_DEFAULTS``);
+        - ``enabled``: whether datasets will be gzip-compressed (effective level > 0).
+          Per the Ras.exe help text, compression off writes contiguous (unchunked)
+          datasets.
+        """
+        options = RasPlan.get_hdf_write_parameters(plan_number_or_path, ras_object=ras_object)
+        raw = {
+            "level": options.get("compression"),
+            "chunk_size_mb": options.get("chunk_size_mb"),
+            "spatial_parts": options.get("spatial_parts"),
+            "use_max_rows": options.get("use_max_rows"),
+            "fixed_rows": options.get("fixed_rows"),
+        }
+        effective = {
+            key: RasPlan.HDF_COMPRESSION_DEFAULTS[key] if value is None else value
+            for key, value in raw.items()
+        }
+        raw["effective"] = effective
+        raw["enabled"] = bool(effective["level"])
+        return raw
+
+    @staticmethod
+    @log_call
+    def set_hdf_compression(
+        plan_number_or_path: Union[str, Number, Path],
+        level: int,
+        chunk_size_mb: Optional[int] = None,
+        ras_object=None
+    ) -> bool:
+        """
+        Set the HDF5 gzip compression level (and optionally chunk size) in a plan file.
+
+        Args:
+            plan_number_or_path: Plan number or path to the plan file.
+            level: ``HDF Compression`` value. 0 turns compression (and chunking) off;
+                1-9 is the gzip/deflate level. HEC-RAS defaults to 1 because "higher
+                compression levels only minimally reduce the file size while slowing
+                the disk writes" (HDF5 Write Parameters help, Ras.exe 6.x).
+            chunk_size_mb: Optional ``HDF Chunk Size`` (maximum chunk size in MB;
+                HEC-RAS default 1).
+            ras_object: Optional RAS project object. If None, uses global ``ras``.
+
+        Returns:
+            bool: True when the plan file was updated (or already current).
+
+        Raises:
+            ValueError: If ``level`` is not an integer 0-9 or ``chunk_size_mb`` < 1.
+
+        Notes:
+            The keys exist in HEC-RAS 5.0.7 through 7.0 (checked in Ras.exe). A warning is
+            logged when the plan's ``Program Version`` is older than 5.07. ``plan_df``
+            is refreshed after the write. The effect of these keys on a computed HDF
+            (compression filter, chunk shape) was not confirmed in a HEC-RAS compute
+            when this helper was written; check with ``HdfPlan.get_hdf_output_settings``.
+        """
+        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 9:
+            raise ValueError("level must be an integer 0 (off) to 9")
+        if level > 1:
+            logger.warning(
+                "HDF compression level %s: HEC-RAS notes levels above 1 only minimally reduce "
+                "file size while slowing disk writes", level
+            )
+
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        plan_file_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
+        if plan_file_path and Path(plan_file_path).exists():
+            try:
+                with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    for line in file:
+                        if line.startswith("Program Version="):
+                            version = float(line.split("=", 1)[1].strip())
+                            if version < RasPlan.HDF_COMPRESSION_MIN_PROGRAM_VERSION:
+                                logger.warning(
+                                    "Plan Program Version %s predates HDF compression keys "
+                                    "verified for >= 5.0.7", version
+                                )
+                            break
+            except (ValueError, OSError):
+                pass
+
+        return RasPlan.set_hdf_write_parameters(
+            plan_number_or_path,
+            compression=level,
+            chunk_size_mb=chunk_size_mb,
+            ras_object=ras_object,
+        )
+
     @staticmethod
     @log_call
     def apply_hdf_output_profile(
         plan_number_or_path: Union[str, Number, Path],
         profile: str = "balanced",
         additional_variables: Optional[List[str]] = None,
-        ras_object=None
+        ras_object=None,
+        *,
+        target_ras_version: Optional[Union[str, float, Path]] = None,
     ) -> bool:
         """
         Apply a named HDF write-parameter profile and optional output variables.
+
+        All requested labels and version gates are checked before any writes;
+        see ``add_hdf_output_variable`` for normalization and physics limits.
 
         Args:
             plan_number_or_path: Plan number or path to the plan file.
             profile: One of ``balanced``, ``speed``, ``size``, or ``nas``.
             additional_variables: Optional additional HDF output variables to enable.
-            ras_object: Optional RAS project object. If None, uses global ``ras``.
+            ras_object (RasPrj, optional): Optional RAS project object. If None, uses global ``ras``.
+            target_ras_version (str, float, or Path, optional): HEC-RAS version
+                that will run the plan (``"7.0"``, ``"7.0.1"``, ``"70"``, or a
+                versioned ``Ras.exe`` path). When given, it replaces the plan's
+                declared Program Version for the version-limited labels in
+                ``HDF_OUTPUT_VARIABLE_MIN_VERSIONS``. None (default) keeps the
+                declared-version gate.
 
         Returns:
             bool: True when all requested updates succeeded.
@@ -3559,6 +4423,24 @@ class RasPlan:
             raise ValueError(f"Unknown HDF output profile '{profile}'. Valid profiles: {valid}")
 
         settings = RasPlan.HDF_OUTPUT_SETTING_PROFILES[profile_key]
+        # Validate the entire request before changing either options or labels.
+        additional_variables = [
+            RasPlan._normalize_hdf_output_variable(v) for v in additional_variables or []
+        ]
+        if additional_variables:
+            ras_obj = ras_object or ras
+            ras_obj.check_initialized()
+            plan_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
+            if not plan_path or not plan_path.exists():
+                return False
+            try:
+                lines = plan_path.read_text(encoding='utf-8', errors='replace').splitlines(True)
+            except IOError as exc:
+                logger.error("Error reading HDF output plan %s: %s", plan_path, exc)
+                return False
+            RasPlan._check_hdf_output_versions(
+                additional_variables, lines, target_ras_version=target_ras_version
+            )
         success = RasPlan.set_hdf_write_parameters(
             plan_number_or_path,
             ras_object=ras_object,
@@ -3571,7 +4453,8 @@ class RasPlan:
                     plan_number_or_path,
                     variable,
                     enabled=True,
-                    ras_object=ras_object
+                    ras_object=ras_object,
+                    target_ras_version=target_ras_version,
                 )
                 and success
             )
@@ -3584,19 +4467,23 @@ class RasPlan:
         plan_number_or_path: Union[str, Number, Path],
         profile: str = "balanced",
         additional_variables: Optional[List[str]] = None,
-        ras_object=None
+        ras_object=None,
+        *,
+        target_ras_version: Optional[Union[str, float, Path]] = None,
     ) -> bool:
         """
         Apply ras-commander's recommended HDF write settings to a plan file.
 
         This is an alias for ``apply_hdf_output_profile()`` using the balanced
-        profile by default.
+        profile by default. ``target_ras_version`` is passed through; see
+        ``apply_hdf_output_profile()``.
         """
         return RasPlan.apply_hdf_output_profile(
             plan_number_or_path,
             profile=profile,
             additional_variables=additional_variables,
-            ras_object=ras_object
+            ras_object=ras_object,
+            target_ras_version=target_ras_version,
         )
 
     @staticmethod
@@ -3605,16 +4492,23 @@ class RasPlan:
         plan_number_or_path: Union[str, Number, Path],
         variable: str,
         enabled: bool = True,
-        ras_object=None
+        ras_object=None,
+        *,
+        target_ras_version: Optional[Union[str, float, Path]] = None,
     ) -> bool:
         """
         Enable or disable one additional HDF output variable in a plan file.
+
+        Enabling follows ``add_hdf_output_variable`` label/version validation
+        (including ``target_ras_version``); disabling follows
+        ``remove_hdf_output_variable`` legacy-token cleanup and ignores it.
         """
         if enabled:
             return RasPlan.add_hdf_output_variable(
                 plan_number_or_path,
                 variable,
-                ras_object=ras_object
+                ras_object=ras_object,
+                target_ras_version=target_ras_version,
             )
         return RasPlan.remove_hdf_output_variable(
             plan_number_or_path,
@@ -3627,15 +4521,20 @@ class RasPlan:
     def enable_hdf_output_variable(
         plan_number_or_path: Union[str, Number, Path],
         variable_name: str,
-        ras_object=None
+        ras_object=None,
+        *,
+        target_ras_version: Optional[Union[str, float, Path]] = None,
     ) -> bool:
         """
         Enable one additional HDF output variable in a plan file.
+
+        ``target_ras_version`` is passed through to ``add_hdf_output_variable``.
         """
         return RasPlan.add_hdf_output_variable(
             plan_number_or_path,
             variable_name,
-            ras_object=ras_object
+            ras_object=ras_object,
+            target_ras_version=target_ras_version,
         )
 
     @staticmethod
@@ -3660,11 +4559,46 @@ class RasPlan:
         plan_number_or_path: Union[str, Number, Path],
         variables: List[str],
         enabled: bool = True,
-        ras_object=None
+        ras_object=None,
+        *,
+        target_ras_version: Optional[Union[str, float, Path]] = None,
     ) -> bool:
         """
         Enable or disable multiple additional HDF output variables in a plan file.
+
+        Enabling prevalidates all labels and version gates before any writes.
+        Known short tokens normalize with a warning; unknown labels raise
+        ValueError. Disabling also accepts literal legacy labels for cleanup.
+        Enabling baseline ``Water Surface`` or ``Face Velocity`` is a no-op
+        with an INFO message; it preserves any existing lines for those names.
+
+        Version gate: the 14 HEC-RAS 7.0 secondary-flow labels are gated on the
+        plan's declared ``Program Version`` by default. Shipped example plans
+        declare 5.x/6.x even when HEC-RAS 7.0+ will run them, so pass
+        ``target_ras_version`` (e.g. ``"7.0"``, ``"7.0.1"``, or a versioned
+        ``Ras.exe`` path) to gate on the version that will actually run.
+        Disabling ignores ``target_ras_version``.
+
+        Example:
+            >>> RasPlan.set_hdf_output_variables(
+            ...     "03", ["Cell Vorticity"], target_ras_version="7.0.1")
         """
+        if enabled:
+            variables = [RasPlan._normalize_hdf_output_variable(v) for v in variables]
+            if variables:
+                ras_obj = ras_object or ras
+                ras_obj.check_initialized()
+                plan_path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_obj)
+                if not plan_path or not plan_path.exists():
+                    return False
+                try:
+                    lines = plan_path.read_text(encoding='utf-8', errors='replace').splitlines(True)
+                except IOError as exc:
+                    logger.error("Error reading HDF output plan %s: %s", plan_path, exc)
+                    return False
+                RasPlan._check_hdf_output_versions(
+                    variables, lines, target_ras_version=target_ras_version
+                )
         success = True
         for variable in variables:
             success = (
@@ -3672,7 +4606,8 @@ class RasPlan:
                     plan_number_or_path,
                     variable,
                     enabled=enabled,
-                    ras_object=ras_object
+                    ras_object=ras_object,
+                    target_ras_version=target_ras_version if enabled else None,
                 )
                 and success
             )
@@ -3683,7 +4618,9 @@ class RasPlan:
     def add_hdf_output_variable(
         plan_number_or_path: Union[str, Number, Path],
         variable: str,
-        ras_object=None
+        ras_object=None,
+        *,
+        target_ras_version: Optional[Union[str, float, Path]] = None,
     ) -> bool:
         """
         Add an HDF output variable to a HEC-RAS plan file.
@@ -3695,16 +4632,39 @@ class RasPlan:
             plan_number_or_path (Union[str, Number, Path]): The plan number or path to the plan file.
             variable (str): The variable name to add (e.g., "Face Flow", "Face Shear Stress").
             ras_object (Optional[RasPrj]): The RAS project object. If None, uses the global 'ras' object.
+            target_ras_version (str, float, or Path, optional): HEC-RAS version
+                that will run the plan (``"7.0"``, ``"7.0.1"``, ``"70"``, or a
+                versioned ``Ras.exe`` path). When given, it replaces the plan's
+                declared Program Version for the version-limited labels in
+                ``HDF_OUTPUT_VARIABLE_MIN_VERSIONS``. None (default) keeps the
+                declared-version gate.
 
         Returns:
-            bool: True if variable was added or already exists, False on error.
+            bool: True if added, already present, or an always-written default;
+                False on error.
 
         Supported Variables:
             - "Face Flow" - Flow rate across each face (needed for discharge-weighted velocity)
             - "Face Shear Stress" - Shear stress at each face
             - "Face Cumulative Volume" - Cumulative volume through each face
-            - "Cell Cumulative Precipitation" - Cumulative precipitation per cell
+            - "Cell Cumulative Precipitation Depth" - Cumulative precipitation per cell
             - "Cell Courant" - Courant number per cell
+
+        Notes:
+            Catalogue labels and the baseline result names ``Water Surface``
+            and ``Face Velocity`` are accepted. Enabling either baseline name
+            logs at INFO that it is always written for computed 2D results and
+            leaves the plan unchanged, including any existing line for that
+            name. Known legacy short tokens are
+            normalized to full labels with a warning, including existing matching
+            short-token records. Unknown labels raise ValueError before writing.
+            The 14 spiral/curvature labels require a declared Program Version of
+            7.0+ (unknown versions warn) unless ``target_ras_version`` names the
+            version that will run, in which case that version is the gate.
+            Required physics still controls output.
+            See ``HDF_OUTPUT_VARIABLE_DATASETS`` for observed dataset basenames.
+            ``Face Point (Node) Velocities*`` is retained with a warning: the
+            6.6/7.0.1 pilot wrote no node data, and its working token is unresolved.
 
         Example:
             >>> # Enable Face Flow output before running a plan
@@ -3712,6 +4672,7 @@ class RasPlan:
             >>> RasCmdr.compute_plan('02')
         """
         logger = get_logger(__name__)
+        variable = RasPlan._normalize_hdf_output_variable(variable)
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
@@ -3720,48 +4681,48 @@ class RasPlan:
             logger.error(f"Plan file not found: {plan_number_or_path}")
             return False
 
+        if variable in RasPlan.HDF_DEFAULT_OUTPUT_VARIABLES:
+            logger.info(
+                "Default 2D HDF result %r is always written for computed 2D results; "
+                "leaving the plan unchanged", variable
+            )
+            return True
+
         try:
             # Read the file
             with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
                 lines = file.readlines()
 
-            # Check if this variable already exists
-            target_line = f"HDF Additional Output Variable={variable}"
-            for line in lines:
-                if line.strip() == target_line:
-                    logger.info(f"HDF output variable '{variable}' already exists in plan")
-                    return True
+            RasPlan._check_hdf_output_versions(
+                [variable], lines, target_ras_version=target_ras_version
+            )
 
-            # Find the best location to insert (near other HDF settings)
-            insert_index = None
-            for i, line in enumerate(lines):
-                if line.startswith("HDF Compression="):
-                    # Insert before HDF Compression
-                    insert_index = i
-                    break
-                elif line.startswith("HDF "):
-                    # Track last HDF line as fallback
-                    insert_index = i + 1
+            # Check only real plan keys; a Description block may contain an
+            # illustrative HDF Additional Output Variable line.
+            target_key = "HDF Additional Output Variable"
+            target_line = f"{target_key}={variable}"
+            matches = [
+                i for i, key, raw_value in _iter_plan_key_lines(lines)
+                if key == target_key
+                and RasPlan.HDF_OUTPUT_VARIABLE_ALIASES.get(raw_value.strip(), raw_value.strip()) == variable
+            ]
+            if len(matches) == 1 and lines[matches[0]].strip() == target_line:
+                logger.debug("HDF output variable %r already exists in plan", variable)
+                return True
 
-            # If no HDF settings found, find Write HDF5 File or end of UNET settings
-            if insert_index is None:
-                for i, line in enumerate(lines):
-                    if line.startswith("Write HDF5 File="):
-                        insert_index = i
-                        break
-                    elif line.startswith("UNET "):
-                        insert_index = i + 1
-
-            # Fallback to end of file
-            if insert_index is None:
-                insert_index = len(lines)
+            # Reuse the Description-aware placement used for HDF write keys.
+            insert_index = matches[0] if matches else RasPlan._find_hdf_insert_index(lines)
+            if matches:
+                lines = [line for i, line in enumerate(lines) if i not in matches]
 
             # Insert the new variable
+            RasPlan._terminate_line_before(lines, insert_index)
             lines.insert(insert_index, f"{target_line}\n")
 
             # Write the updated content back to the file
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            _write_ras_text(
+                plan_file_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
 
             logger.info(f"Added HDF output variable '{variable}' to plan file: {plan_file_path.name}")
             return True
@@ -3802,12 +4763,12 @@ class RasPlan:
         variables = []
         try:
             with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
-                for line in file:
-                    if line.startswith("HDF Additional Output Variable="):
-                        var_name = line.split("=", 1)[1].strip()
+                for _, key, raw_value in _iter_plan_key_lines(file.readlines()):
+                    if key == "HDF Additional Output Variable":
+                        var_name = raw_value.strip()
                         variables.append(var_name)
 
-            logger.info(f"Found {len(variables)} HDF output variables in plan")
+            logger.debug("Found %d HDF output variables in plan", len(variables))
             return variables
 
         except IOError as e:
@@ -3822,7 +4783,7 @@ class RasPlan:
 
         Args:
             plan_number: Plan number (e.g., "01", "08")
-            ras_object: Optional RAS object instance
+            ras_object (RasPrj, optional): Optional RAS object instance
 
         Returns:
             str: 'Steady', 'Unsteady', or 'Unknown'
@@ -3847,18 +4808,23 @@ class RasPlan:
             # Use flow_type column if available (preferred)
             if 'flow_type' in plan_row.columns:
                 flow_type = plan_row.iloc[0]['flow_type']
-                logger.debug(f"Plan {plan_num}: {flow_type} (from plan_df)")
-                return flow_type
+                if pd.notna(flow_type) and flow_type in {
+                    'Steady', 'Unsteady', 'Quasi-Unsteady', 'Unknown'
+                }:
+                    logger.debug(f"Plan {plan_num}: {flow_type} (from plan_df)")
+                    return flow_type
 
-            # Fallback: determine from unsteady_number
-            import pandas as pd
-            unsteady_num = plan_row.iloc[0]['unsteady_number']
-            flow_type = 'Unsteady' if pd.notna(unsteady_num) else 'Steady'
-            logger.debug(f"Plan {plan_num}: {flow_type} (from unsteady_number)")
+            if 'unsteady_number' not in plan_row.columns:
+                logger.debug(
+                    "plan_df missing unsteady_number column for plan %s",
+                    plan_num,
+                )
+            flow_type = RasPrj._classify_plan_flow(plan_row.iloc[0])
+            logger.debug(f"Plan {plan_num}: {flow_type} (from flow references)")
             return flow_type
 
-        except Exception as e:
-            logger.warning(f"Could not determine flow type for plan {plan_number}: {e}")
+        except Exception:
+            logger.debug("Could not determine flow type for plan %s", plan_number, exc_info=True)
             return 'Unknown'
 
     @staticmethod
@@ -3869,7 +4835,7 @@ class RasPlan:
 
         Args:
             plan_number: Plan number (e.g., "01", "08")
-            ras_object: Optional RAS object instance
+            ras_object (RasPrj, optional): Optional RAS object instance
 
         Returns:
             bool: True if steady state, False otherwise
@@ -3887,6 +4853,9 @@ class RasPlan:
         """
         Remove an HDF output variable from a HEC-RAS plan file.
 
+        Known short aliases and their full labels remove either stored form.
+        Unknown literal labels remain removable without catalogue/version checks.
+
         Args:
             plan_number_or_path (Union[str, Number, Path]): The plan number or path to the plan file.
             variable (str): The variable name to remove.
@@ -3899,6 +4868,8 @@ class RasPlan:
             >>> RasPlan.remove_hdf_output_variable('02', 'Face Flow')
         """
         logger = get_logger(__name__)
+        # Cleanup must remain possible for unknown/obsolete literal tokens.
+        variable = RasPlan.HDF_OUTPUT_VARIABLE_ALIASES.get(variable, variable)
         ras_obj = ras_object or ras
         ras_obj.check_initialized()
 
@@ -3912,25 +4883,30 @@ class RasPlan:
             with open(plan_file_path, 'r', encoding='utf-8', errors='replace') as file:
                 lines = file.readlines()
 
-            # Find and remove the variable line
-            target_line = f"HDF Additional Output Variable={variable}"
-            new_lines = []
-            removed = False
-            for line in lines:
-                if line.strip() == target_line:
-                    removed = True
-                else:
-                    new_lines.append(line)
+            # Do not alter matching text inside a Description block.
+            target_key = "HDF Additional Output Variable"
+            remove_indices = {
+                i for i, key, raw_value in _iter_plan_key_lines(lines)
+                if key == target_key
+                and RasPlan.HDF_OUTPUT_VARIABLE_ALIASES.get(raw_value.strip(), raw_value.strip()) == variable
+            }
+            removed = bool(remove_indices)
+            new_lines = [line for i, line in enumerate(lines) if i not in remove_indices]
 
             if not removed:
-                logger.info(f"HDF output variable '{variable}' not found in plan")
+                logger.debug("HDF output variable %r not found in plan", variable)
                 return False
 
             # Write the updated content back to the file
-            with open(plan_file_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(new_lines)
+            _write_ras_text(
+                plan_file_path, "".join(new_lines), encoding="utf-8", errors="replace"
+            )
 
-            logger.info(f"Removed HDF output variable '{variable}' from plan file")
+            logger.info(
+                "Removed HDF output variable %r from plan file: %s",
+                variable,
+                plan_file_path.name,
+            )
             return True
 
         except IOError as e:
@@ -3967,7 +4943,7 @@ class RasPlan:
             number_column: Column name for the number (e.g., 'flow_number')
             prj_entry_type: PRJ entry type for get_prj_entries() (e.g., 'Flow')
             file_prefix: File prefix letter (e.g., 'f', 'u', 'g')
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             Optional[Path]: Full path if found, None otherwise.
@@ -4018,7 +4994,7 @@ class RasPlan:
             new_title: Optional new title (max 32 chars). None keeps original.
             title_keyword: Keyword in file for title line (e.g., 'Flow Title')
             copy_hdf: Whether to copy the companion .hdf file.
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             str: The new component number.
@@ -4072,7 +5048,18 @@ class RasPlan:
         RasUtils.update_project_file(ras_obj.prj_file, component_type, new_num, ras_object=ras_obj)
 
         # Re-initialize and refresh DataFrames
-        ras_obj.initialize(ras_obj.project_folder, ras_obj.ras_exe_path)
+        ras_obj.initialize(
+            ras_obj.project_folder,
+            ras_obj.ras_exe_path,
+            suppress_logging=getattr(ras_obj, "suppress_logging", True),
+            prj_file=_matching_copied_prj_file(
+                ras_obj.project_folder, ras_obj.prj_file
+            ),
+            load_results_summary=getattr(
+                ras_obj, "load_results_summary", True
+            ),
+            load_hdf_metadata=getattr(ras_obj, "load_hdf_metadata", True),
+        )
         ras_obj.plan_df = ras_obj.get_plan_entries()
         ras_obj.geom_df = ras_obj.get_geom_entries()
         ras_obj.flow_df = ras_obj.get_flow_entries()
@@ -4114,7 +5101,7 @@ class RasPlan:
             force: If True, skip reference checks.
             permanent_delete: If True, permanently delete files. If False (default),
                 move files to {project_folder}/Backup/{timestamp}_{label}/.
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             Optional[Path]: Path to backup folder if files were backed up, None if
@@ -4211,7 +5198,7 @@ class RasPlan:
                 (e.g., 'Geom File', 'unsteady_number', 'Flow File')
             plan_ref_filter_fn: Optional callable(row) -> bool for additional filtering
                 of which plan rows should be updated. If None, all matching rows are updated.
-            ras_object: Optional RAS object instance.
+            ras_object (RasPrj, optional): Optional RAS object instance.
 
         Returns:
             str: The new component number.
@@ -4250,6 +5237,7 @@ class RasPlan:
 
         for old_path, new_path in rename_pairs:
             if old_path.exists():
+                release_native_sessions(old_path, new_path)
                 old_path.rename(new_path)
                 logger.debug(f"Renamed {old_path.name} -> {new_path.name}")
 
@@ -4322,9 +5310,16 @@ class RasPlan:
                     break
 
             if modified:
-                with open(plan_path, 'w', encoding='utf-8', errors='replace') as f:
-                    f.writelines(lines)
-                logger.info(f"Updated {key} from {old_value} to {new_value} in {plan_path.name}")
+                _write_ras_text(
+                    plan_path, "".join(lines), encoding="utf-8", errors="replace"
+                )
+                logger.debug(
+                    "Updated %s from %s to %s in %s",
+                    key,
+                    old_value,
+                    new_value,
+                    plan_path.name,
+                )
 
             return modified
         except Exception as e:
@@ -4406,9 +5401,10 @@ class RasPlan:
             lines = f.readlines()
         new_lines = [line for line in lines if line.strip() != f"Current Plan=p{plan_number}"]
         if len(new_lines) < len(lines):
-            with open(ras_obj.prj_file, 'w', encoding='utf-8', errors='replace') as f:
-                f.writelines(new_lines)
-            logger.info(f"Removed Current Plan=p{plan_number} line from .prj")
+            _write_ras_text(
+                ras_obj.prj_file, "".join(new_lines), encoding="utf-8", errors="replace"
+            )
+            logger.debug("Removed Current Plan=p%s line from .prj", plan_number)
 
         # Refresh all DataFrames
         RasPlan._refresh_all_dataframes(ras_obj)
@@ -4461,6 +5457,7 @@ class RasPlan:
 
         for old_path, new_path in rename_pairs:
             if old_path.exists():
+                release_native_sessions(old_path, new_path)
                 old_path.rename(new_path)
                 logger.debug(f"Renamed {old_path.name} -> {new_path.name}")
 
@@ -4473,9 +5470,10 @@ class RasPlan:
         for i, line in enumerate(lines):
             if line.strip() == f"Current Plan=p{old_number}":
                 lines[i] = f"Current Plan=p{new_number}\n"
-                with open(ras_obj.prj_file, 'w', encoding='utf-8', errors='replace') as f:
-                    f.writelines(lines)
-                logger.info(f"Updated Current Plan from p{old_number} to p{new_number}")
+                _write_ras_text(
+                    ras_obj.prj_file, "".join(lines), encoding="utf-8", errors="replace"
+                )
+                logger.debug("Updated Current Plan from p%s to p%s", old_number, new_number)
                 break
 
         # Refresh all DataFrames
@@ -4581,7 +5579,7 @@ class RasPlan:
         c_new = Path(f"{base}.c{new_num}")
         if c_old.exists():
             c_old.rename(c_new)
-            logger.info(f"Renamed {c_old.name} -> {c_new.name}")
+            logger.debug("Renamed %s -> %s", c_old.name, c_new.name)
         return result
 
     @staticmethod
@@ -4821,8 +5819,13 @@ class RasPlan:
             )
             # Truncate to 32 chars (HEC-RAS limit)
             if len(title) > 32:
+                original_title = title
                 title = title[:32]
-                logger.warning(f"Truncated plan title to 32 chars: '{title}'")
+                logger.warning(
+                    "Plan title exceeds 32 characters (received %d); truncating",
+                    len(original_title),
+                )
+                logger.debug("Original plan title before truncation: %s", original_title)
 
             # Build clone_plan kwargs from variant row
             clone_kwargs = {
@@ -4866,7 +5869,7 @@ class RasPlan:
                     'status': 'created',
                     'message': f"Created from plan {base_plan}"
                 })
-                logger.info(f"Created variant '{variant_name}' as plan p{new_plan_num}")
+                logger.debug("Created variant %r as plan p%s", variant_name, new_plan_num)
 
             except Exception as e:
                 report_rows.append({
@@ -4882,4 +5885,3 @@ class RasPlan:
         n_created = len(report[report['status'] == 'created'])
         logger.info(f"Created {n_created}/{len(variants)} plan variants from plan p{base_plan}")
         return report
-

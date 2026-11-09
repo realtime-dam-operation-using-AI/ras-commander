@@ -18,7 +18,9 @@ import pandas as pd
 
 from . import _land_classification_helper as _lch
 from . import _rasmap_layer_helper as _mlh
+from ._ras_text import _write_ras_xml
 from .LoggingConfig import get_logger
+from .fast_hdf import read_typed
 from .RasUtils import RasUtils
 
 logger = get_logger(__name__)
@@ -959,6 +961,35 @@ def open_rasmapper(
     return process
 
 
+def _resize_rasmapper_window(
+    hwnd: int,
+    width: Optional[int],
+    height: Optional[int],
+) -> None:
+    """Resize the outer RASMapper window before deterministic capture."""
+
+    try:
+        import win32con
+        import win32gui
+    except ImportError as exc:
+        raise RuntimeError("pywin32 is required to resize RASMapper") from exc
+
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    target_width = int(width) if width is not None else right - left
+    target_height = int(height) if height is not None else bottom - top
+    if target_width < 320 or target_height < 240:
+        raise ValueError("RASMapper viewport must be at least 320 by 240 pixels")
+    win32gui.SetWindowPos(
+        hwnd,
+        0,
+        left,
+        top,
+        target_width,
+        target_height,
+        win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER,
+    )
+
+
 def capture_rasmapper_snapshot(
     *,
     pid: Optional[int] = None,
@@ -966,6 +997,8 @@ def capture_rasmapper_snapshot(
     delay_seconds: float = 1.0,
     timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 0.5,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
 ) -> Optional[Path]:
     """Capture a visible RASMapper window using the existing Win32 screenshot helper.
 
@@ -982,6 +1015,9 @@ def capture_rasmapper_snapshot(
     if hwnd is None:
         logger.warning("No visible RASMapper window found for screenshot capture")
         return None
+
+    if viewport_width is not None or viewport_height is not None:
+        _resize_rasmapper_window(hwnd, viewport_width, viewport_height)
 
     # Sleep *after* the window appears so the delay is spent on map rendering,
     # not on waiting for the process to start.
@@ -1046,6 +1082,17 @@ def create_spatial_review_package(
     snapshot_timeout_seconds: float = 1800.0,
     snapshot_poll_interval_seconds: float = 0.5,
     close_after_capture: bool = True,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
+    dpi: Optional[int] = None,
+    expanded_tree_paths: Optional[Sequence[str]] = None,
+    ramp_id: Optional[str] = None,
+    range_mode: Optional[str] = None,
+    selected_layer: Optional[str] = None,
+    result_profile: Optional[str] = None,
+    render_mode: Optional[str] = None,
+    basemap: Optional[str] = None,
+    web_manifest_url: Optional[str] = None,
     rasmapper_exe_path: Optional[Union[str, Path]] = None,
     ras_version: Optional[str] = None,
     ras_object=None,
@@ -1071,6 +1118,12 @@ def create_spatial_review_package(
         use_feature_bounds=uses_feature_selector,
         padding_fraction=padding_fraction,
     )
+    if (viewport_width is None) != (viewport_height is None):
+        raise ValueError("viewport_width and viewport_height must be provided together")
+    if viewport_width is not None and (viewport_width < 320 or viewport_height < 240):
+        raise ValueError("RASMapper viewport must be at least 320 by 240 pixels")
+    if dpi is not None and dpi <= 0:
+        raise ValueError("dpi must be positive")
 
     artifacts: dict[str, Optional[str]] = {
         "rasmap_before": str(package_dir / "rasmap_before.xml"),
@@ -1123,6 +1176,21 @@ def create_spatial_review_package(
         "delay_seconds": delay_seconds,
         "snapshot_timeout_seconds": snapshot_timeout_seconds,
         "snapshot_poll_interval_seconds": snapshot_poll_interval_seconds,
+        "viewport": (
+            {"width": viewport_width, "height": viewport_height}
+            if viewport_width is not None
+            else None
+        ),
+        "dpi": dpi,
+        "expanded_tree_paths": sorted(set(expanded_tree_paths or [])),
+        "ramp_id": ramp_id,
+        "range_mode": range_mode,
+        "selected_layer": selected_layer,
+        "result_profile": result_profile,
+        "render_mode": render_mode,
+        "basemap": basemap,
+        "ras_version": ras_version,
+        "web_manifest_url": web_manifest_url,
     }
 
     geometry_layers_before = list_geometry_layers(project_paths.rasmap_path)
@@ -1277,6 +1345,8 @@ def create_spatial_review_package(
                 delay_seconds=delay_seconds,
                 timeout_seconds=snapshot_timeout_seconds,
                 poll_interval_seconds=snapshot_poll_interval_seconds,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
             )
             if captured is not None:
                 artifacts["snapshot"] = str(captured)
@@ -1840,7 +1910,7 @@ def _load_existing_rasmap_tree(rasmap_path: Path) -> tuple[ET.ElementTree, ET.El
 
 
 def _write_rasmap_tree(tree: ET.ElementTree, rasmap_path: Path) -> None:
-    tree.write(rasmap_path, encoding="utf-8", xml_declaration=False)
+    _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
 
 
 def _terrain_display_record(
@@ -2341,6 +2411,13 @@ def _all_coordinate_dataset_paths(hdf_file: h5py.File) -> list[str]:
     return paths
 
 
+def _dataset_array(obj: Any) -> np.ndarray:
+    """``np.asarray(obj)``; dataset values come through the fast_hdf router."""
+    if isinstance(obj, h5py.Dataset):
+        return np.asarray(read_typed(obj))
+    return np.asarray(obj)
+
+
 def _bounds_from_datasets(
     hdf_file: h5py.File,
     dataset_paths: Sequence[str],
@@ -2351,7 +2428,7 @@ def _bounds_from_datasets(
     for path in dataset_paths:
         if path not in hdf_file:
             continue
-        data = np.asarray(hdf_file[path])
+        data = _dataset_array(hdf_file[path])
         if data.ndim != 2 or data.shape[1] < 2 or data.size == 0:
             continue
         if not np.issubdtype(data.dtype, np.number):
@@ -2448,9 +2525,9 @@ def _structure_feature_records(
     if not all(path in hdf_file for path in (attr_path, info_path, points_path)):
         return []
 
-    attrs = hdf_file[attr_path][:]
-    info = np.asarray(hdf_file[info_path])
-    points = np.asarray(hdf_file[points_path])
+    attrs = read_typed(hdf_file[attr_path], slice(None))
+    info = np.asarray(read_typed(hdf_file[info_path]))
+    points = np.asarray(read_typed(hdf_file[points_path]))
     records: list[dict[str, Any]] = []
     for index, info_row in enumerate(info):
         row = attrs[index] if index < len(attrs) else None
@@ -2498,9 +2575,9 @@ def _polyline_feature_records(
     if not all(path in hdf_file for path in (info_path, points_path)):
         return []
 
-    attrs = hdf_file[attr_path][:] if attr_path in hdf_file else None
-    info = np.asarray(hdf_file[info_path])
-    points = np.asarray(hdf_file[points_path])
+    attrs = read_typed(hdf_file[attr_path], slice(None)) if attr_path in hdf_file else None
+    info = np.asarray(read_typed(hdf_file[info_path]))
+    points = np.asarray(read_typed(hdf_file[points_path]))
     records: list[dict[str, Any]] = []
     for index, info_row in enumerate(info):
         row = attrs[index] if attrs is not None and index < len(attrs) else None
@@ -2666,9 +2743,9 @@ def _lateral_structure_centerline_points(hdf_file: h5py.File) -> np.ndarray:
     if not all(path in hdf_file for path in required):
         return np.empty((0, 2), dtype=float)
 
-    attrs = hdf_file["Geometry/Structures/Attributes"][:]
-    info = np.asarray(hdf_file["Geometry/Structures/Centerline Info"])
-    points = np.asarray(hdf_file["Geometry/Structures/Centerline Points"])
+    attrs = read_typed(hdf_file["Geometry/Structures/Attributes"], slice(None))
+    info = np.asarray(read_typed(hdf_file["Geometry/Structures/Centerline Info"]))
+    points = np.asarray(read_typed(hdf_file["Geometry/Structures/Centerline Points"]))
     if "Type" not in attrs.dtype.names:
         return points[:, :2]
 

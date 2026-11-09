@@ -87,18 +87,20 @@ print(f"Folder: {ras.project_folder}")
 print(f"HEC-RAS: {ras.ras_exe_path}")
 
 print("\n=== Plans ===")
-print(ras.plan_df[['plan_number', 'plan_title', 'geom_number', 'hdf_path']])
+print(ras.plan_df[['plan_number', 'Plan Title', 'geometry_number', 'HDF_Results_Path']])
 
 print("\n=== Geometry Files ===")
-print(ras.geom_df[['geom_number', 'file_path']])
+print(ras.geom_df[['geom_number', 'full_path']])
 
 print("\n=== Boundary Conditions ===")
-print(ras.boundaries_df[['Name', 'Type', 'Interval']])
+print(ras.boundaries_df[['river_reach_name', 'bc_type', 'Interval']])
 ```
 
 ## DataFrame Reference
 
-Detailed information about each DataFrame available after project initialization.
+Detailed information about each DataFrame available after project initialization. For the
+complete, canonical column schema (including every derived column), see the
+[DataFrame Reference](../reference/dataframe-reference.md).
 
 ### plan_df Columns
 
@@ -109,7 +111,11 @@ Detailed information about each DataFrame available after project initialization
 | `Short Identifier` | str | User-defined short name |
 | `Plan Title` | str | User-defined full title |
 | `Geom File` | str | Geometry file reference (g##) |
-| `Flow File` | str | Flow file reference (f## or u##) |
+| `Flow File` | str | Flow file reference (f##, u##, or q##) |
+| `Sediment File` | str / None | Normalized sediment-file number such as `01`, when the plan contains a recognized `s##` reference |
+| `Sediment Path` | str / None | Expected absolute `.s##` path; file readiness is reported separately by the asset inventory |
+| `breach_definition_count` | nullable Int64 | Stored breach-definition count; zero means none and null means plan inspection failed |
+| `breach_active_count` | nullable Int64 | Definitions whose local stored `is_active` flag is true; not proof that a breach initiated |
 | `unsteady_number` | str | Unsteady flow number if used |
 | `geometry_number` | str | Geometry number used |
 | `Simulation Date` | str | Start/end dates string |

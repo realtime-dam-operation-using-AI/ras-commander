@@ -1,5 +1,6 @@
 """Focused tests for storage-area-backed 2D flow area writing in .g## files."""
 
+import logging
 import sys
 from pathlib import Path
 
@@ -10,9 +11,9 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 shapely = pytest.importorskip("shapely")
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon  # noqa: E402
 
-from ras_commander.geom import GeomParser, GeomStorage
+from ras_commander.geom import GeomParser, GeomStorage  # noqa: E402
 
 
 def _format_xy_rows(points, *, values_per_line):
@@ -185,6 +186,33 @@ def test_set_2d_flow_area_settings_updates_text_settings_without_resetting_mesh_
     assert row["laminar_depth"] == pytest.approx(0.65)
     assert row["min_face_length_ratio"] == pytest.approx(0.75)
     assert row["point_generation_data"] == ",,125,150"
+
+
+def test_set_2d_flow_area_settings_noop_logs_debug_not_info(tmp_path, caplog):
+    geom_file = _write_geom_file(
+        tmp_path,
+        [
+            "Geom Title=2D Writer Regression Test\n",
+            "Program Version=6.60\n",
+        ],
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="ras_commander.geom.GeomStorage"):
+        result = GeomStorage.set_2d_flow_area_settings(geom_file, "Configurable 2D")
+
+    assert result == geom_file
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelno == logging.INFO
+        and record.name == "ras_commander.geom.GeomStorage"
+    ]
+    assert any(
+        record.levelno == logging.DEBUG
+        and record.name == "ras_commander.geom.GeomStorage"
+        and "No 2D flow area settings changes requested" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_unchanged_perimeter_preserves_header_and_mesh_points(tmp_path):
@@ -393,3 +421,140 @@ def test_surface_line_fields_never_exceed_16_chars():
         for i in range(0, len(raw), 16):
             field = raw[i:i+16]
             assert len(field) <= 16, f"Field {field!r} exceeds 16 chars"
+
+
+def _breakline_replacement_fixture(tmp_path):
+    area_coords = [
+        (0.0, 0.0),
+        (100.0, 0.0),
+        (100.0, 100.0),
+        (0.0, 100.0),
+        (0.0, 0.0),
+    ]
+    return _write_geom_file(
+        tmp_path,
+        [
+            "Geom Title=Breakline Replacement\n",
+            "Program Version=6.60\n",
+            "Storage Area=Mesh,50.0000000,50.0000000\n",
+            "Storage Area Surface Line= 5\n",
+            *_format_xy_rows(area_coords, values_per_line=2),
+            "Storage Area Type= 0\n",
+            "Storage Area Area=\n",
+            "Storage Area Min Elev=\n",
+            "Storage Area Is2D=-1\n",
+            "Storage Area Point Generation Data=10,10,,\n",
+            "Storage Area 2D Points= 0\n",
+            "Storage Area 2D PointsPerimeterTime=01Jan2026 00:00:00\n",
+            "Storage Area Mannings=0.04\n",
+            *GeomStorage._format_breakline_block(
+                "Retain", [(10.0, 10.0), (90.0, 90.0)], 5.0, 10.0
+            ),
+            *GeomStorage._format_breakline_block(
+                "Remove", [(10.0, 90.0), (90.0, 10.0)], 5.0, 10.0
+            ),
+            "BC Line Name=Boundary\n",
+        ],
+    )
+
+
+def test_replace_breaklines_atomically_replaces_complete_collection(tmp_path):
+    geom_file = _breakline_replacement_fixture(tmp_path)
+
+    backup = GeomStorage.replace_breaklines(
+        geom_file,
+        "Mesh",
+        [
+            {
+                "name": "Retain",
+                "coords": [(10.0, 10.0), (50.0, 50.0)],
+                "cell_size_near": 4.0,
+                "cell_size_far": 8.0,
+                "near_repeats": 2,
+                "protection_radius": 1,
+            },
+            {
+                "name": "Clipped",
+                "coords": [(50.0, 50.0), (95.0, 50.0)],
+                "cell_size_near": 3.0,
+                "cell_size_far": 6.0,
+            },
+        ],
+        expected_existing_names=["Retain", "Remove"],
+    )
+
+    text = geom_file.read_text(encoding="utf-8")
+    assert backup == geom_file.with_suffix(".g01.bak")
+    assert backup.is_file()
+    assert text.count("BreakLine Name=") == 2
+    assert "BreakLine Name=Remove" not in text
+    assert text.index("BreakLine Name=Retain") < text.index("BreakLine Name=Clipped")
+    assert text.index("BreakLine Name=Clipped") < text.index("BC Line Name=Boundary")
+    assert "BreakLine CellSize Min=4.0" in text
+    assert "BreakLine Near Repeats=2" in text
+    assert "BreakLine Protection Radius=1" in text
+
+
+def test_replace_breaklines_guard_failure_preserves_original(tmp_path):
+    geom_file = _breakline_replacement_fixture(tmp_path)
+    original = geom_file.read_bytes()
+
+    with pytest.raises(ValueError, match="collection changed"):
+        GeomStorage.replace_breaklines(
+            geom_file,
+            "Mesh",
+            [],
+            expected_existing_names=["wrong"],
+        )
+
+    assert geom_file.read_bytes() == original
+    assert not geom_file.with_suffix(".g01.bak").exists()
+
+
+@pytest.mark.parametrize("flag", [-1, 0, 1])
+def test_replace_breaklines_preserves_native_boolean_text_encoding(tmp_path, flag):
+    from ras_commander.geom.GeomMesh import GeomMesh
+
+    geom_file = _breakline_replacement_fixture(tmp_path)
+    GeomStorage.replace_breaklines(
+        geom_file,
+        "Mesh",
+        [{"name": "Native", "coords": [(10, 10), (90, 90)], "protection_radius": flag}],
+    )
+    assert GeomMesh.get_breakline_spacing(geom_file)[0][-1] == flag
+    assert f"BreakLine Protection Radius={flag}" in geom_file.read_text()
+
+
+@pytest.mark.parametrize("flag", [-2, 2, 0.5])
+def test_replace_breaklines_rejects_non_boolean_protection_without_mutation(
+    tmp_path, flag
+):
+    geom_file = _breakline_replacement_fixture(tmp_path)
+    original = geom_file.read_bytes()
+    with pytest.raises(ValueError, match="protection_radius"):
+        GeomStorage.replace_breaklines(
+            geom_file,
+            "Mesh",
+            [
+                {"name": "Invalid", "coords": [(10, 10), (90, 90)], "protection_radius": flag}
+            ],
+        )
+    assert geom_file.read_bytes() == original
+    assert not geom_file.with_suffix(".g01.bak").exists()
+
+
+def test_replace_breaklines_rejects_duplicate_names_before_write(tmp_path):
+    geom_file = _breakline_replacement_fixture(tmp_path)
+    original = geom_file.read_bytes()
+
+    with pytest.raises(ValueError, match="Duplicate breakline name"):
+        GeomStorage.replace_breaklines(
+            geom_file,
+            "Mesh",
+            [
+                {"name": "same", "coords": [(0.0, 0.0), (1.0, 1.0)]},
+                {"name": "SAME", "coords": [(1.0, 0.0), (0.0, 1.0)]},
+            ],
+        )
+
+    assert geom_file.read_bytes() == original

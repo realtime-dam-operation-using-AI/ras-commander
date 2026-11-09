@@ -19,10 +19,14 @@ from ras_commander.dotnet.clr_bootstrap import is_hecras_available
 hdf_results_query_module = importlib.import_module("ras_commander.hdf.HdfResultsQuery")
 profile_interop_module = importlib.import_module("ras_commander.dotnet._profile_interop")
 
-pytestmark = pytest.mark.skipif(
-    not is_hecras_available(),
-    reason="HEC-RAS install + pythonnet required",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.real_ras,
+    pytest.mark.skipif(
+        not is_hecras_available(),
+        reason="HEC-RAS install + pythonnet required",
+    ),
+]
 
 EXPECTED_COLUMNS = [
     "station",
@@ -190,6 +194,8 @@ class _FakeRasObject:
 def _write_minimal_plan_hdf(path: Path) -> None:
     with h5py.File(path, "w") as hdf:
         hdf.attrs["Program Version"] = np.bytes_("7.0")
+        hdf.attrs["Units System"] = np.bytes_("US Customary")
+        hdf.require_group("Results")
 
 
 def _write_minimal_geom_hdf(path: Path) -> None:

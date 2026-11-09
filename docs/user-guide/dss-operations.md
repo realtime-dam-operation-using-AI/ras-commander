@@ -1,6 +1,127 @@
 # DSS Operations
 
-RAS Commander provides read access to HEC-DSS files for extracting boundary condition data.
+RAS Commander reads and writes HEC-DSS boundary and precipitation data.
+
+`RasDss.write_grid_timeseries()` already writes arrays directly to gridded DSS
+through HEC Monolith. Existing Monolith users do not need pydsstools for this
+capability. The native writer below is an optional backend alternative.
+
+For paired data, quality flags, location/vertical-datum metadata, and other
+native DSS record workflows, see [using pydsstools directly](../about/related-libraries.md#pydsstools-use-native-dss-features-directly).
+
+## Read backends
+
+`RasDss.backend` selects how catalogs, time series, paired data and the file
+version are read: `java` (default, HEC Monolith), `native` (optional
+dss-commander package, no Java) or `shadow` (native result with a logged Java
+cross-check). Native grid reads are gated until the native grid CRS is
+qualified. `RasDss.get_capabilities()` reports the support matrix. See
+[DSS Read Backends](dss-native-backend.md) for selection, installation and
+every difference from the Java path.
+
+## Direct precipitation arrays to DSS7
+
+`RasDss.write_precip_grid_arrays()` writes NumPy arrays through the native
+[pydsstools](https://github.com/gyanz/pydsstools) library by Gyan Basyal (gyanz),
+without Java, Vortex, or intermediate timestep raster files. NetCDF remains the
+default output of the gridded Atlas 14 generators; DSS is an explicit alternative.
+
+```bash
+uv pip install "ras-commander[dss-native]"
+```
+
+This extra uses pydsstools 3.x (at least 3.1). For the tested **3.1.0** release,
+Windows x64 wheels cover CPython 3.9–3.13; there is no CPython 3.14 Windows
+wheel. Python 3.11/3.12 requires NumPy >=1.26,<2; Python 3.13 requires NumPy
+>=2.1. Dependencies also include pandas, affine, pyproj, and pydantic >=2,<3.
+Install these together through the extra so the resolver honors their version
+constraints. The Windows roundtrip tests use Python 3.12.
+
+**Windows runtime requirement:** the inspected CPython 3.12 wheel imports
+`VCRUNTIME140.dll` and Windows Universal CRT components. It does not bundle
+these DLLs. The Python distribution may supply the Visual C runtime; otherwise
+install the applicable [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+On the validation workstation, uv's CPython supplied `VCRUNTIME140.dll` and
+Windows supplied `ucrtbase.dll`. Passing tests on that development machine
+does not establish installation on a clean Windows machine.
+
+A compatible **wheel needs the runtime, not a compiler**. Building pydsstools
+from source on Windows additionally requires Visual Studio Build Tools with
+the C++ workload; see the [upstream installation guide](https://pydsstools.readthedocs.io/en/latest/installation.html).
+Use a supported Python/wheel combination if a source build is not intended.
+
+```python
+from affine import Affine
+import numpy as np
+import pandas as pd
+from ras_commander import RasDss
+
+# Two interval depths (mm), north-most row first, west-most column first.
+depths = np.array([[[1., 2.], [3., np.nan]], [[4., 5.], [6., np.nan]]])
+paths = RasDss.write_precip_grid_arrays(
+    "rainfall.dss", "/UTM15/BASIN/PRECIP///DESIGN/", depths,
+    pd.date_range("2020-01-01", periods=3, freq="6min"),
+    transform=Affine(100, 0, 300000, 0, -100, 3300000),
+    crs="EPSG:26915", units="mm", grid_reference_origin=(0, 0),
+)
+```
+
+Pass **n+1 interval boundaries for n grids**, using the same timezone-naive
+clock as the receiving model. Each record is PER-CUM precipitation depth over
+its D/E start/end times. Supply incremental depths, not rainfall intensity or
+cumulative totals since storm start. `units="inches"` is also supported; the
+writer labels units explicitly and does not multiply or divide input values.
+
+The transform maps pixel corners in `(a,b,c,d,e,f)` Affine order. Grids must
+have square, unrotated cells in an explicit projected CRS. Geographic Atlas 14
+arrays must first be reprojected; this method does not interpret latitude and
+longitude as projected coordinates. NaN, masked cells, and an explicit `nodata=`
+sentinel become native DSS missing values. Negative depths and infinity fail.
+
+For consumers that address rainfall by fixed cell indexes, pass
+`grid_reference_origin=(x0, y0)` in CRS units. The lower-left raster corner must
+be a whole number of cells from that reference. For example, a legacy HMS HRAP
+file discretization can require `(0, 0)` rather than local raster indexes.
+Without this option, the native writer indexes from the raster's lower-left
+corner. Equal physical extents alone do not establish compatibility with an
+index-based discretization.
+
+An HMS 4.13 check using the official `tenk` example reproduced all four basins'
+precipitation and discharge exactly with both Monolith grids and native grids
+using the required reference origin. The locally indexed native variant
+completed computation but supplied zero rainfall. Check computed precipitation
+as well as completion status when changing a grid source.
+
+The HEC-RAS 6.6 Davis check also required `(0, 0)` for its aligned native SHG
+grid; local indexes otherwise placed the raster at the wrong location. With
+the reference restored, NetCDF, Monolith DSS and native DSS all computed and
+materialized the intended 110-cell, six-interval precipitation field. This
+qualifies those versioned configurations, not every projection or model setup.
+
+Before enabling global gridded rainfall, explicitly review and remove any
+superseded legacy `Precipitation Hydrograph` boundary in a staged project.
+HEC-RAS 6.6 rejected the tested combination before preprocessing. The gridded
+setters conservatively reject that combination across versions before mutation;
+they never delete a boundary automatically. Use `inspect_boundary_blocks()` and
+`delete_boundary()` to select and remove the intended block.
+
+After native preprocessing, `HdfPlan.get_plan_met_precip_values()` reads the
+solver's raw precipitation Values and Timestamp arrays with their attributes.
+It rejects an imported-raster sidecar without materialized solver datasets.
+The reader preserves encoded timestamps and numerical values; use method and
+unit metadata when comparing interval depths with cumulative import series.
+
+The writer creates DSS7 specified-time grids, closes and checks the temporary
+file, then publishes it. Existing files are protected by default;
+`overwrite=True` replaces the **entire file**, rather than appending records.
+New-file publication uses a same-directory hard link to prevent concurrent
+writers from overwriting each other; the destination filesystem must support
+hard links. Explicit overwrite uses atomic replacement.
+The tests verify native DSS readback of values, orientation, missing cells,
+CRS, units, and interval pathnames. They do not establish acceptance by every
+RAS/HMS version. Configure a receiving RAS project through
+`RasUnsteady.configure_gridded_dss_precipitation()` and validate the intended
+engine/version as part of the project workflow.
 
 ## Overview
 
@@ -11,7 +132,7 @@ The `RasDss` class reads HEC-DSS time series data using HEC's Monolith Java libr
 - Lazy loading - no overhead unless DSS methods are called
 - Tested with 84 DSS files totaling 6.64 GB
 
-## Requirements
+## Java bridge requirements
 
 ```bash
 # Install pyjnius (Java bridge)
@@ -69,6 +190,41 @@ results = RasDss.read_multiple_timeseries(dss_file, pathnames)
 for path, df in results.items():
     print(f"{path}: {len(df)} records")
 ```
+
+### Read Paired Data
+
+`read_paired_data()` reads one paired-data record (rating curves, damage
+curves, elevation-storage tables, Atlas 14 temporal patterns) with every curve:
+
+```python
+rating = RasDss.read_paired_data(dss_file, "/BASIN/LOC/STAGE-FLOW///RATING/")
+
+stage = rating.index.to_numpy()          # ordinates, stored order
+flows = rating.to_numpy()                # one column per curve
+print(rating.columns.tolist())           # curve labels, or curve_1..curve_n
+print(rating.attrs["x_units"], rating.attrs["y_units"])   # e.g. FEET, CFS
+print(rating.attrs["x_type"], rating.attrs["y_type"])     # e.g. UNT, LOG, PROB
+print(rating.attrs["labels"], rating.attrs["stored_dtype"])
+```
+
+- Values keep the stored precision by default: `float32` for PD records,
+  `float64` for PDD records. Pass `dtype="float64"` to widen (exact).
+- HEC missing markers are returned as stored, not NaN.
+- With `ignore_d_part=True` (default) a pathname whose D part does not match
+  falls back to the first paired-data record with the same A, B, C, E and F
+  parts, as `HecDss.get(pathname, True)` does. `attrs["record_pathname"]`
+  names the record read.
+- No record raises `DssPathnameNotFoundError` (a `ValueError`); a record of
+  another kind raises `DssRecordTypeError` (a `TypeError`). Both classes are
+  importable from `ras_commander.dss` and are the same on every backend.
+
+### DSS File Version
+
+```python
+RasDss.get_file_version(dss_file)   # 6 or 7; never creates or modifies the file
+```
+
+A file that is not DSS6/DSS7 raises `DssInvalidFileError` (a `ValueError`).
 
 ## Integration with HEC-RAS Projects
 
@@ -181,6 +337,11 @@ except RuntimeError as e:
 2. **Large files**: Successfully tested up to 1.3 GB DSS files
 3. **Memory**: Large time series may require chunked reading
 4. **Caching**: Catalog is cached per file during session
+5. **File release**: Java-bridge reads and writes (`get_catalog()`,
+   `read_timeseries()`, `read_grid()`, `write_timeseries()`,
+   `write_grid_timeseries()`) release the native file handle before they
+   return, so the file can be renamed, deleted, or opened by another program
+   while the JVM keeps running
 
 ## Writing Gridded DSS Precipitation
 
@@ -208,6 +369,7 @@ written = RasDss.write_grid_timeseries(
         "units": "mm",
         "data_type": "PER-CUM",
     },
+    dss_version=6,
 )
 ```
 
@@ -215,6 +377,23 @@ The pathname is a template. Parts A/B/C/F are preserved, while Parts D/E are
 rebuilt for each timestep using the start/end window. For period data such as
 precipitation, pass either `n_times + 1` boundary times or `n_times` interval
 end times.
+
+Monolith `write_grid_timeseries()` and `read_grid()` use HEC's south-first row
+order. For north-up raster arrays, pass `data[:, ::-1, :]` to the Monolith
+writer; the native `write_precip_grid_arrays()` accepts north-first arrays
+directly. Both run columns west to east. End-of-day E parts use the previous
+date with `2400`, matching the actual DSS catalog and returned exact paths.
+
+For specified-grid cross-library exchange, supply ASCII WKT1_GDAL projection
+text. The tested pydsstools 3.1 reader cannot decode Unicode characters in some
+WKT2 strings written through Monolith. This concerns projection serialization;
+changing WKT syntax does not reproject the rainfall.
+
+`dss_version` is keyword-only. Pass `6` or `7` when creating a new database,
+or omit it to retain the HEC bridge default. An explicit version must match an
+existing file. All writer timestamps must be timezone-naive: convert aware
+data to the intended HEC-RAS model clock and remove timezone metadata before
+calling the API.
 
 ### Grid Java API Mapping
 
@@ -246,8 +425,9 @@ the bundled HEC Monolith version.
 | DSS Version 7 | Supported |
 | Write time series | Supported |
 | Write gridded precipitation | Supported |
-| Paired data | Not yet supported |
-| General grid reading API | Not yet supported |
+| Read paired data (all curves) | Supported (`read_paired_data`) |
+| Read one grid record | Supported (`read_grid`; native route gated) |
+| Write paired data | Not yet supported |
 
 ## Technology Stack
 

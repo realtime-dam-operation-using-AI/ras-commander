@@ -35,12 +35,18 @@ Example Usage:
     >>> print(f"Downloaded to: {output}")
 """
 
-from pathlib import Path
-from typing import Tuple, Optional, Union, List
 from datetime import datetime
 import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
+from .._ras_text import _write_ras_text
 from ..LoggingConfig import get_logger
+from .._spatial_extent import _normalize_extent_bounds
+
+if TYPE_CHECKING:
+    import pandas as pd
+    from ..RasPrj import RasPrj
 
 logger = get_logger(__name__)
 
@@ -97,13 +103,14 @@ class PrecipAorc:
 
     @staticmethod
     def download(
-        bounds: Tuple[float, float, float, float],
+        bounds: Any,
         start_time: Union[str, datetime],
         end_time: Union[str, datetime],
         output_path: Union[str, Path],
         variable: str = "APCP_surface",
         target_crs: Optional[str] = "EPSG:5070",
-        resolution: Optional[float] = 2000.0
+        resolution: Optional[float] = 2000.0,
+        buffer_distance: float = 0.0,
     ) -> Path:
         """
         Download AORC precipitation data for specified bounds and time range.
@@ -113,9 +120,10 @@ class PrecipAorc:
 
         Parameters
         ----------
-        bounds : Tuple[float, float, float, float]
-            Bounding box in WGS84 as (west, south, east, north) in decimal degrees.
-            Use HdfProject.get_project_bounds_latlon() to get these from a HEC-RAS model.
+        bounds : extent-like
+            One valid Polygon, a single-effective-part MultiPolygon, or a legacy
+            bounds-shaped input in WGS84. Use
+            HdfProject.get_project_bounds_latlon() to get bounds from a HEC-RAS model.
         start_time : str or datetime
             Start of time window. String format: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"
         end_time : str or datetime
@@ -131,6 +139,8 @@ class PrecipAorc:
         resolution : float, optional, default 2000.0
             Grid cell resolution in target CRS units (meters for EPSG:5070).
             Standard HEC SHG resolution is 2000m. Only used if target_crs is set.
+        buffer_distance : float, default 0.0
+            Buffer applied before bounds are derived, in WGS84 degrees.
 
         Returns
         -------
@@ -177,6 +187,11 @@ class PrecipAorc:
         - Default output is reprojected to SHG (EPSG:5070) for HEC-RAS compatibility
         - SHG (Standard Hydrologic Grid) is required for HEC-RAS GDAL Raster import
         """
+        bounds = _normalize_extent_bounds(
+            bounds,
+            buffer_distance=buffer_distance,
+            parameter_name="bounds",
+        )
         _check_precip_dependencies()
 
         import xarray as xr
@@ -197,6 +212,15 @@ class PrecipAorc:
         else:
             end_dt = pd.Timestamp(end_time)
 
+        if start_dt.tzinfo is not None:
+            start_dt = start_dt.tz_convert("UTC").tz_localize(None)
+        if end_dt.tzinfo is not None:
+            end_dt = end_dt.tz_convert("UTC").tz_localize(None)
+        if end_dt < start_dt:
+            raise ValueError(
+                f"end_time must be on or after start_time. Got {start_dt} to {end_dt}"
+            )
+
         # Extract bounds
         west, south, east, north = bounds
 
@@ -209,13 +233,14 @@ class PrecipAorc:
         if west < conus_west or east > conus_east or south < conus_south or north > conus_north:
             logger.warning(f"Bounds {bounds} may extend outside CONUS coverage {PrecipAorc.CONUS_BOUNDS}")
 
-        logger.info(f"Downloading AORC data:")
-        logger.info(f"  Bounds: W={west:.4f}, S={south:.4f}, E={east:.4f}, N={north:.4f}")
-        logger.info(f"  Time range: {start_dt} to {end_dt}")
-        logger.info(f"  Variable: {variable}")
+        logger.info(
+            f"Downloading AORC {variable}: {start_dt} to {end_dt}, "
+            f"bounds W={west:.4f}, S={south:.4f}, E={east:.4f}, N={north:.4f}"
+        )
+        logger.debug(f"AORC output path: {output_path}")
 
         # Connect to S3 (anonymous access)
-        logger.info("Connecting to AWS S3...")
+        logger.debug("Connecting to AWS S3...")
         s3 = s3fs.S3FileSystem(anon=True)
 
         # Build Zarr store paths for each year in range
@@ -224,8 +249,9 @@ class PrecipAorc:
 
         for year in years:
             store_path = f"s3://{PrecipAorc.BUCKET}/{year}.zarr"
-            logger.info(f"  Loading year {year} from {store_path}")
+            logger.debug(f"Loading AORC year {year} from {store_path}")
 
+            ds = None
             try:
                 store = s3fs.S3Map(root=store_path, s3=s3)
                 ds = xr.open_zarr(store)
@@ -264,31 +290,35 @@ class PrecipAorc:
                         **{lon_dim: slice(west, east)}
                     )
 
-                # Subset temporally - use date-only strings for proper inclusive slicing
+                # AORC timestamps are hourly UTC interval-ending verification times.
+                # Preserve the caller's hour/minute bounds; date-only strings silently
+                # expand every request to whole calendar days.
                 year_start = max(start_dt, pd.Timestamp(f"{year}-01-01"))
                 year_end = min(end_dt, pd.Timestamp(f"{year}-12-31 23:59:59"))
-                # Use date format YYYY-MM-DD for proper inclusive time slicing
-                start_str = year_start.strftime('%Y-%m-%d')
-                end_str = year_end.strftime('%Y-%m-%d')
-                ds_subset = ds_subset.sel(time=slice(start_str, end_str))
+                ds_subset = ds_subset.sel(time=slice(year_start, year_end))
 
                 if ds_subset.size > 0:
                     # Load data from S3 now (force lazy evaluation)
                     ds_subset = ds_subset.load()
                     datasets.append(ds_subset)
-                    logger.info(f"    Loaded {ds_subset.sizes}")
+                    logger.debug(f"Loaded AORC year {year} subset: {ds_subset.sizes}")
                 else:
                     logger.warning(f"    No data found for year {year}")
 
             except Exception as e:
                 logger.error(f"Error loading year {year}: {e}")
                 raise
+            finally:
+                if ds is not None:
+                    close = getattr(ds, "close", None)
+                    if callable(close):
+                        close()
 
         if not datasets:
             raise ValueError("No data found for the specified bounds and time range")
 
         # Combine all years
-        logger.info("Combining datasets...")
+        logger.debug("Combining AORC datasets")
         if len(datasets) == 1:
             combined = datasets[0]
         else:
@@ -305,6 +335,11 @@ class PrecipAorc:
         combined.attrs['history'] = f'Downloaded by ras-commander on {datetime.now().isoformat()}'
         combined.attrs['units'] = 'kg/m^2'  # AORC precipitation units
         combined.attrs['long_name'] = 'Hourly Total Precipitation'
+        combined.attrs['value_type'] = 'amount'
+        combined.attrs['accumulation_interval_hours'] = 1.0
+        combined.attrs['time_semantics'] = (
+            'one-hour accumulation ending at the UTC timestamp'
+        )
 
         # Reproject to target CRS if specified (required for HEC-RAS GDAL import)
         if target_crs is not None:
@@ -316,7 +351,7 @@ class PrecipAorc:
                     "Install with: pip install rioxarray"
                 )
 
-            logger.info(f"Reprojecting to {target_crs} at {resolution}m resolution...")
+            logger.debug(f"Reprojecting AORC grid to {target_crs} at {resolution}m resolution")
 
             # Set source CRS and spatial dimensions
             combined = combined.rio.write_crs('EPSG:4326')
@@ -325,37 +360,47 @@ class PrecipAorc:
             # Reproject to target CRS
             combined = combined.rio.reproject(target_crs, resolution=resolution)
 
-            logger.info(f"Reprojected grid shape: {combined.shape}")
+            logger.debug(f"Reprojected AORC grid shape: {combined.shape}")
 
         # Create output directory if needed
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to NetCDF
-        logger.info(f"Writing to NetCDF: {output_path}")
+        logger.debug(f"Writing AORC NetCDF: {output_path}")
         combined.to_netcdf(output_path)
 
         file_size_mb = output_path.stat().st_size / (1024 * 1024)
-        logger.info(f"Download complete: {output_path} ({file_size_mb:.1f} MB)")
+        time_steps = getattr(combined, 'sizes', {}).get('time', 'unknown')
+        grid_shape = getattr(combined, 'shape', 'unknown')
+        logger.debug(f"AORC output grid shape: {grid_shape}")
+        logger.info(
+            f"AORC download complete: {output_path.name} "
+            f"({file_size_mb:.1f} MB, {time_steps} timesteps)"
+        )
 
         return output_path
 
     @staticmethod
     def check_availability(
-        bounds: Tuple[float, float, float, float],
+        bounds: Any,
         start_time: Union[str, datetime],
-        end_time: Union[str, datetime]
+        end_time: Union[str, datetime],
+        buffer_distance: float = 0.0,
     ) -> dict:
         """
         Check if AORC data is available for the specified region and time.
 
         Parameters
         ----------
-        bounds : Tuple[float, float, float, float]
-            Bounding box as (west, south, east, north)
+        bounds : extent-like
+            One valid Polygon, a single-effective-part MultiPolygon, or a legacy
+            bounds-shaped input in WGS84.
         start_time : str or datetime
             Start of time window
         end_time : str or datetime
             End of time window
+        buffer_distance : float, default 0.0
+            Buffer applied before bounds are derived, in WGS84 degrees.
 
         Returns
         -------
@@ -366,6 +411,12 @@ class PrecipAorc:
             - message: str with details
         """
         import pandas as pd
+
+        bounds = _normalize_extent_bounds(
+            bounds,
+            buffer_distance=buffer_distance,
+            parameter_name="bounds",
+        )
 
         if isinstance(start_time, str):
             start_dt = pd.to_datetime(start_time)
@@ -449,13 +500,14 @@ class PrecipAorc:
 
     @staticmethod
     def get_storm_catalog(
-        bounds: Tuple[float, float, float, float],
+        bounds: Any,
         year: int,
         inter_event_hours: float = 8.0,
         min_depth_inches: float = 0.5,
         min_wet_hours: int = 1,
         buffer_hours: int = 48,
-        percentile_threshold: Optional[float] = None
+        percentile_threshold: Optional[float] = None,
+        buffer_distance: float = 0.0,
     ) -> 'pd.DataFrame':
         """
         Analyze AORC precipitation data and generate a catalog of storm events.
@@ -466,9 +518,10 @@ class PrecipAorc:
 
         Parameters
         ----------
-        bounds : Tuple[float, float, float, float]
-            Bounding box in WGS84 as (west, south, east, north) in decimal degrees.
-            Use HdfProject.get_project_bounds_latlon() to get from HEC-RAS model.
+        bounds : extent-like
+            One valid Polygon, a single-effective-part MultiPolygon, or a legacy
+            bounds-shaped input in WGS84. Use
+            HdfProject.get_project_bounds_latlon() to get bounds from a HEC-RAS model.
         year : int
             Year to analyze (1979+).
         inter_event_hours : float, default 8.0
@@ -486,6 +539,8 @@ class PrecipAorc:
         percentile_threshold : float, optional
             If specified (0-100), only return storms above this percentile
             by total depth. E.g., 95 returns only top 5% storms. Default: None
+        buffer_distance : float, default 0.0
+            Buffer applied before bounds are derived, in WGS84 degrees.
 
         Returns
         -------
@@ -536,6 +591,11 @@ class PrecipAorc:
         - Inter-event period of 8 hours is USGS standard for storm separation
         - Buffer of 48 hours allows hydraulic model spin-up and recession
         """
+        bounds = _normalize_extent_bounds(
+            bounds,
+            buffer_distance=buffer_distance,
+            parameter_name="bounds",
+        )
         _check_precip_dependencies()
 
         import xarray as xr
@@ -543,20 +603,23 @@ class PrecipAorc:
         import pandas as pd
         import numpy as np
 
-        logger.info(f"Generating storm catalog for {year}")
-        logger.info(f"  Bounds: W={bounds[0]:.4f}, S={bounds[1]:.4f}, E={bounds[2]:.4f}, N={bounds[3]:.4f}")
-        logger.info(f"  Parameters: inter_event={inter_event_hours}h, min_depth={min_depth_inches}in, buffer={buffer_hours}h")
+        logger.info(
+            f"Generating AORC storm catalog for {year}: "
+            f"bounds W={bounds[0]:.4f}, S={bounds[1]:.4f}, E={bounds[2]:.4f}, N={bounds[3]:.4f}; "
+            f"inter_event={inter_event_hours}h, min_depth={min_depth_inches}in, buffer={buffer_hours}h"
+        )
 
         west, south, east, north = bounds
 
         # Connect to S3
-        logger.info("Connecting to AWS S3...")
+        logger.debug("Connecting to AWS S3...")
         s3 = s3fs.S3FileSystem(anon=True)
 
         # Load year's data
         store_path = f"s3://{PrecipAorc.BUCKET}/{year}.zarr"
-        logger.info(f"Loading {store_path}...")
+        logger.debug(f"Loading AORC store: {store_path}")
 
+        ds = None
         try:
             store = s3fs.S3Map(root=store_path, s3=s3)
             ds = xr.open_zarr(store)
@@ -583,16 +646,21 @@ class PrecipAorc:
                     **{lon_dim: slice(west, east)}
                 )
 
-            logger.info(f"Loading spatial subset...")
+            logger.debug("Loading AORC spatial subset")
             # Compute spatial mean for each timestep (lazy then load)
             precip_mean = ds_subset.mean(dim=[lat_dim, lon_dim])
             precip_mean = precip_mean.load()
 
-            logger.info(f"Loaded {len(precip_mean)} hourly timesteps")
+            logger.debug(f"Loaded {len(precip_mean)} hourly AORC timesteps")
 
         except Exception as e:
             logger.error(f"Error loading AORC data: {e}")
             raise
+        finally:
+            if ds is not None:
+                close = getattr(ds, "close", None)
+                if callable(close):
+                    close()
 
         # Convert to pandas Series for easier manipulation
         precip_series = precip_mean.to_series()
@@ -640,7 +708,7 @@ class PrecipAorc:
             if last_wet_idx is not None and last_wet_idx >= event_start:
                 events.append((event_start, last_wet_idx))
 
-        logger.info(f"Identified {len(events)} raw events")
+        logger.debug(f"Identified {len(events)} raw AORC storm events")
 
         # Analyze each event
         storm_records = []
@@ -693,7 +761,7 @@ class PrecipAorc:
         if percentile_threshold is not None:
             threshold_value = np.percentile(df['total_depth_in'], percentile_threshold)
             df = df[df['total_depth_in'] >= threshold_value]
-            logger.info(f"Filtered to {len(df)} storms above {percentile_threshold}th percentile ({threshold_value:.2f} in)")
+            logger.debug(f"Filtered to {len(df)} storms above {percentile_threshold}th percentile ({threshold_value:.2f} in)")
 
         # Rank by total depth (1 = largest)
         df['rank'] = df['total_depth_in'].rank(ascending=False, method='min').astype(int)
@@ -707,23 +775,33 @@ class PrecipAorc:
                  'total_depth_in', 'peak_intensity_in_hr', 'duration_hours',
                  'wet_hours', 'rank']]
 
-        logger.info(f"Storm catalog complete: {len(df)} storms")
         if len(df) > 0:
-            logger.info(f"  Total depth range: {df['total_depth_in'].min():.2f} - {df['total_depth_in'].max():.2f} inches")
-            logger.info(f"  Largest storm: {df[df['rank']==1]['start_time'].iloc[0]} ({df['total_depth_in'].max():.2f} in)")
+            largest_storm = df.loc[df['rank'].idxmin()]
+            largest_start = pd.Timestamp(largest_storm['start_time']).strftime('%Y-%m-%d %H:%M')
+            percentile_text = (
+                f"; percentile filter={percentile_threshold:g}"
+                if percentile_threshold is not None else ""
+            )
+            logger.info(
+                f"Storm catalog complete: {len(df)} storms; "
+                f"depth {df['total_depth_in'].min():.2f}-{df['total_depth_in'].max():.2f} in; "
+                f"largest {largest_start} ({df['total_depth_in'].max():.2f} in)"
+                f"{percentile_text}"
+            )
 
         return df
 
     @staticmethod
     def create_storm_plans(
         storm_catalog: 'pd.DataFrame',
-        bounds: Tuple[float, float, float, float],
+        bounds: Any,
         template_plan: str,
         precip_folder: Union[str, Path] = "Precipitation",
         ras_object: Optional['RasPrj'] = None,
         download_data: bool = True,
         max_storms: Optional[int] = None,
-        enable_timeseries: bool = True
+        enable_timeseries: bool = True,
+        buffer_distance: float = 0.0,
     ) -> 'pd.DataFrame':
         """
         Create HEC-RAS plan and unsteady files for each storm in a catalog.
@@ -740,9 +818,10 @@ class PrecipAorc:
         storm_catalog : pd.DataFrame
             Storm catalog from get_storm_catalog() with columns:
             storm_id, start_time, end_time, sim_start, sim_end, etc.
-        bounds : Tuple[float, float, float, float]
-            Bounding box in WGS84 as (west, south, east, north).
-            Same bounds used for get_storm_catalog().
+        bounds : extent-like
+            One valid Polygon, a single-effective-part MultiPolygon, or a legacy
+            bounds-shaped input in WGS84. Use the same extent passed to
+            get_storm_catalog().
         template_plan : str
             Plan number to use as template (e.g., "06").
             Must be an unsteady plan with precipitation enabled.
@@ -759,6 +838,8 @@ class PrecipAorc:
         enable_timeseries : bool, default True
             If True, enable HDF time series output (HDF Write Time Slices=-1).
             Required for extracting cell-level time series from results.
+        buffer_distance : float, default 0.0
+            Buffer applied before bounds are derived, in WGS84 degrees.
 
         Returns
         -------
@@ -796,8 +877,16 @@ class PrecipAorc:
         - Creates unique file names based on storm date: storm_YYYYMMDD.nc
         - Plan Short ID format: "Storm_MMDD" (e.g., "Storm_0430")
         - All files are created in the project folder
+        - AORC is historic analysis rainfall, so cloned plans are reset to a
+          precipitation ratio of 1.0.
         """
         import pandas as pd
+
+        bounds = _normalize_extent_bounds(
+            bounds,
+            buffer_distance=buffer_distance,
+            parameter_name="bounds",
+        )
 
         # Import RAS modules (avoid circular imports)
         from ..RasPlan import RasPlan
@@ -826,15 +915,16 @@ class PrecipAorc:
             raise ValueError(f"Template plan '{template_plan}' has no unsteady flow file")
         template_unsteady = unsteady_match.group(1)
 
-        logger.info(f"Creating storm plans from template plan {template_plan} (unsteady {template_unsteady})")
-        logger.info(f"  Precipitation folder: {precip_path}")
-
         # Limit storms if requested
         storms_to_process = storm_catalog
         if max_storms is not None:
             storms_to_process = storm_catalog.head(max_storms)
 
-        logger.info(f"  Processing {len(storms_to_process)} storms")
+        logger.info(
+            f"Creating storm plans from template plan {template_plan} "
+            f"(unsteady {template_unsteady}); processing {len(storms_to_process)} storms"
+        )
+        logger.debug(f"Precipitation folder: {precip_path}")
 
         # Results tracking
         results = []
@@ -862,24 +952,41 @@ class PrecipAorc:
             }
 
             try:
-                logger.info(f"Storm {storm_id}: {start_date.strftime('%Y-%m-%d')} ({storm['total_depth_in']:.2f} in)")
+                logger.debug(f"Processing storm {storm_id}: {start_date.strftime('%Y-%m-%d')} ({storm['total_depth_in']:.2f} in)")
 
                 # 1. Download AORC data
                 if download_data:
                     full_precip_path = ras_obj.project_folder / precip_file
                     if not full_precip_path.exists():
-                        logger.info(f"  Downloading AORC data...")
+                        logger.debug(f"Downloading AORC data for storm {storm_id} to {full_precip_path}")
+                        # APCP timestamps mark the end of the preceding one-hour
+                        # accumulation.  A plan beginning at sim_start therefore
+                        # needs its first forcing frame at sim_start + 1 hour; the
+                        # HDF authoring path prepends the zero baseline at sim_start.
+                        first_valid_time = pd.Timestamp(sim_start) + pd.Timedelta(hours=1)
                         PrecipAorc.download(
                             bounds=bounds,
-                            start_time=sim_start,
+                            start_time=first_valid_time,
                             end_time=sim_end,
                             output_path=full_precip_path
                         )
                     else:
-                        logger.info(f"  Precipitation file exists, skipping download")
+                        logger.debug(f"Precipitation file exists, skipping download: {full_precip_path}")
+                else:
+                    logger.debug(f"Download disabled for storm {storm_id}; using {precip_file}")
+
+                # Validate before cloning. set_gridded_precipitation also raises for
+                # a missing NetCDF, but by then an orphaned unsteady clone would have
+                # been left in the project.
+                full_precip_path = ras_obj.project_folder / precip_file
+                if not full_precip_path.exists():
+                    raise FileNotFoundError(
+                        f"Precipitation file not found for storm {storm_id}: "
+                        f"{full_precip_path}"
+                    )
 
                 # 2. Clone unsteady file
-                logger.info(f"  Cloning unsteady file...")
+                logger.debug(f"Cloning unsteady file for storm {storm_id}")
                 new_unsteady = RasPlan.clone_unsteady(
                     template_unsteady,
                     new_title=unsteady_title,
@@ -888,15 +995,20 @@ class PrecipAorc:
                 result['unsteady_number'] = new_unsteady
 
                 # 3. Configure gridded precipitation
-                logger.info(f"  Configuring gridded precipitation...")
+                logger.debug(f"Configuring gridded precipitation for storm {storm_id}: {precip_file}")
                 RasUnsteady.set_gridded_precipitation(
                     unsteady_file=new_unsteady,
                     netcdf_path=precip_file,
-                    ras_object=ras_obj
+                    ras_object=ras_obj,
+                    dataset_name="APCP_surface",
+                    units="mm",
+                    value_type="amount",
+                    first_timestep_hours=1.0,
+                    historic=True,
                 )
 
                 # 4. Clone plan file
-                logger.info(f"  Cloning plan file...")
+                logger.debug(f"Cloning plan file for storm {storm_id}")
                 new_plan = RasPlan.clone_plan(
                     template_plan,
                     new_plan_shortid=short_id,
@@ -927,12 +1039,18 @@ class PrecipAorc:
                         'HDF Write Time Slices=-1',
                         plan_content
                     )
-                    with open(plan_path, 'w', encoding='utf-8', errors='replace') as f:
-                        f.write(plan_content)
-                    logger.info(f"  Enabled HDF time series output")
+                    _write_ras_text(
+                        plan_path, plan_content, encoding="utf-8", errors="replace"
+                    )
+                    logger.debug(f"Enabled HDF time series output for plan {new_plan}")
 
                 result['status'] = 'success'
-                logger.info(f"  Created plan {new_plan} with unsteady {new_unsteady}")
+                timeseries_text = "with HDF time series" if enable_timeseries else "without HDF time series"
+                logger.info(
+                    f"Created storm {storm_id}: {start_date.strftime('%Y-%m-%d')} "
+                    f"({storm['total_depth_in']:.2f} in) -> plan {new_plan}, "
+                    f"unsteady {new_unsteady}, {timeseries_text}"
+                )
 
             except Exception as e:
                 result['status'] = f'error: {str(e)}'

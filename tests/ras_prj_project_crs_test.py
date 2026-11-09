@@ -113,10 +113,24 @@ def _init_project(project_dir: Path) -> RasPrj:
     return project
 
 
-def test_project_crs_prefers_geometry_hdf_over_plan_hdf(tmp_path):
+@pytest.mark.synthetic_hdf_layout
+def test_project_crs_conflict_between_geometry_and_plan_hdf_is_none(tmp_path):
     project_name = _write_project_files(tmp_path, include_geom_entry=True)
     _write_hdf(tmp_path / f"{project_name}.g01.hdf", epsg=2278)
     _write_hdf(tmp_path / f"{project_name}.p01.hdf", epsg=26915)
+
+    project = _init_project(tmp_path)
+
+    assert project.project_crs is None
+    assert project.project_crs_source is None
+    assert project.project_crs_status == "conflict"
+
+
+@pytest.mark.synthetic_hdf_layout
+def test_project_crs_prefers_geometry_hdf_when_plan_hdf_agrees(tmp_path):
+    project_name = _write_project_files(tmp_path, include_geom_entry=True)
+    _write_hdf(tmp_path / f"{project_name}.g01.hdf", epsg=2278)
+    _write_hdf(tmp_path / f"{project_name}.p01.hdf", epsg=2278)
 
     project = _init_project(tmp_path)
 
@@ -124,6 +138,7 @@ def test_project_crs_prefers_geometry_hdf_over_plan_hdf(tmp_path):
     assert project.project_crs_source == "geom_hdf"
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_project_crs_falls_back_to_plan_hdf(tmp_path):
     project_name = _write_project_files(tmp_path)
     _write_hdf(tmp_path / f"{project_name}.p01.hdf", epsg=26915)
@@ -150,6 +165,7 @@ def test_project_crs_falls_back_to_rasmap_projection_path(tmp_path):
     assert project.project_crs_source == "rasmap_projection_path"
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_project_crs_falls_back_to_terrain_hdf(tmp_path):
     project_name = _write_project_files(tmp_path)
     terrain_hdf_path = tmp_path / "Terrain" / "terrain.hdf"
@@ -181,6 +197,7 @@ def test_project_crs_falls_back_to_terrain_raster(tmp_path):
     assert project.project_crs_source == "terrain_raster"
 
 
+@pytest.mark.synthetic_hdf_layout
 def test_reinitialize_resets_project_crs_state(tmp_path):
     first_project_dir = tmp_path / "first"
     first_project_name = _write_project_files(

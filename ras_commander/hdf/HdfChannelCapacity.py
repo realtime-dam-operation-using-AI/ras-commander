@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from ..LoggingConfig import log_call, get_logger
+from ..fast_hdf import read_typed, reraise_required
 
 logger = get_logger(__name__)
 
@@ -181,7 +182,7 @@ class HdfChannelCapacity:
                 return Path(hdf_path)
             return Path(project_folder) / f"unknown.p{plan_number}.hdf"
         except Exception as e:
-            logger.warning(f"Could not resolve {label} '{input_str}': {e}")
+            logger.debug(f"Could not resolve {label} '{input_str}': {e}")
             if hasattr(ras_object, 'folder') and ras_object.folder:
                 return Path(ras_object.folder) / f"unknown.p{plan_number}.hdf"
             raise ValueError(f"Failed to resolve {label} '{input_str}': {e}")
@@ -241,7 +242,7 @@ class HdfChannelCapacity:
             if attr_path not in hdf:
                 continue
 
-            attrs = hdf[attr_path][:]
+            attrs = read_typed(hdf[attr_path], slice(None))
             if len(attrs) == 0 or attrs.dtype.names is None:
                 continue
 
@@ -324,17 +325,17 @@ class HdfChannelCapacity:
 
         with h5py.File(hdf_path, "r") as hdf:
             if summary_path in hdf:
-                wse = HdfChannelCapacity._as_1d_wse(hdf[summary_path][:], reducer="first")
+                wse = HdfChannelCapacity._as_1d_wse(read_typed(hdf[summary_path], slice(None)), reducer="first")
                 attrs = HdfChannelCapacity._read_cross_section_attributes(hdf, len(wse))
                 return wse, attrs, "unsteady_summary"
 
             if unsteady_path in hdf:
-                wse = HdfChannelCapacity._as_1d_wse(hdf[unsteady_path][:], reducer="max")
+                wse = HdfChannelCapacity._as_1d_wse(read_typed(hdf[unsteady_path], slice(None)), reducer="max")
                 attrs = HdfChannelCapacity._read_cross_section_attributes(hdf, len(wse))
                 return wse, attrs, "unsteady_timeseries"
 
             if steady_wse_path in hdf:
-                wse_data = np.asarray(hdf[steady_wse_path][:], dtype=float)
+                wse_data = np.asarray(read_typed(hdf[steady_wse_path], slice(None)), dtype=float)
                 if wse_data.ndim == 1:
                     wse = wse_data
                     profile_source = "steady_single_profile"
@@ -415,14 +416,21 @@ class HdfChannelCapacity:
                     geom_path = geom_file.with_suffix(geom_file.suffix + '.hdf')
 
         if not geom_path.exists():
-            raise FileNotFoundError(f"Geometry HDF not found: {geom_path}")
+            raise FileNotFoundError(
+                f"Geometry HDF not found: {geom_path}. "
+                f"Run the geometry preprocessor or verify the geometry HDF path."
+            )
 
         logger.info(f"Extracting bank elevations from: {geom_path.name}")
 
         xs_gdf = HdfXsec.get_cross_sections(str(geom_path), ras_object=_ras)
 
         if xs_gdf is None or len(xs_gdf) == 0:
-            raise ValueError("No cross sections found in geometry HDF.")
+            raise ValueError(
+                f"No 1D cross sections found in geometry HDF: {geom_path}. "
+                f"Verify this is a 1D geometry HDF and run the geometry preprocessor "
+                f"if the geometry HDF has not been generated."
+            )
 
         rows = []
         for _, row in xs_gdf.iterrows():
@@ -506,7 +514,10 @@ class HdfChannelCapacity:
         )
 
         if not hdf_path.exists():
-            raise FileNotFoundError(f"HDF file not found: {hdf_path}")
+            raise FileNotFoundError(
+                f"Plan HDF not found: {hdf_path}. "
+                f"Compute the plan first so steady profile results are written to HDF."
+            )
 
         logger.info(f"Extracting steady-state profiles from: {hdf_path.name}")
 
@@ -518,10 +529,11 @@ class HdfChannelCapacity:
             if ws_path not in hdf:
                 raise ValueError(
                     f"No steady-state Water Surface data found in {hdf_path.name}. "
-                    f"This method requires a steady-state plan HDF."
+                    f"This method requires a computed steady-state plan HDF with "
+                    f"Steady Profiles/Cross Sections/Water Surface results."
                 )
 
-            ws_data = np.asarray(hdf[ws_path][:], dtype=float)
+            ws_data = np.asarray(read_typed(hdf[ws_path], slice(None)), dtype=float)
             if ws_data.ndim == 1:
                 ws_data = ws_data.reshape(1, -1)
             n_profiles, n_xs = ws_data.shape
@@ -662,10 +674,13 @@ class HdfChannelCapacity:
             )
 
             if not hdf_path.exists():
-                logger.warning(f"HDF not found for {pname}: {hdf_path}")
+                logger.warning(
+                    f"HDF not found for {pname}: {hdf_path}. "
+                    f"Compute the plan before extracting maximum WSE."
+                )
                 continue
 
-            logger.info(f"Extracting Max WSE from {hdf_path.name} as '{pname}'")
+            logger.debug(f"Extracting Max WSE from {hdf_path.name} as '{pname}'")
 
             try:
                 max_wse_values, attrs, source = HdfChannelCapacity._extract_single_plan_wse(
@@ -677,7 +692,12 @@ class HdfChannelCapacity:
                     f"  Format: {source} ({len(max_wse_values)} XS)"
                 )
             except Exception as exc:
-                logger.warning(f"Could not extract WSE from {hdf_path.name}: {exc}")
+                reraise_required(exc)
+                logger.warning(
+                    f"Could not extract WSE from {hdf_path.name}: {exc}. "
+                    f"Compute the plan and verify the HDF contains steady profiles "
+                    f"or unsteady cross-section water-surface output."
+                )
                 continue
 
             plan_df = pd.DataFrame({
@@ -695,7 +715,11 @@ class HdfChannelCapacity:
                 )
 
         if result_df is None:
-            raise ValueError("No WSE data extracted from any plan input.")
+            raise ValueError(
+                "No WSE data extracted from any plan input. Compute the plans and "
+                "verify each HDF contains steady profiles or unsteady cross-section "
+                "water-surface output."
+            )
 
         logger.info(
             f"Extracted Max WSE: {len(result_df)} XS, "
@@ -746,6 +770,15 @@ class HdfChannelCapacity:
                         'left_bank_elev', 'right_bank_elev', 'controlling_bank_elev',
                         'Len Channel'}
             storm_order = [c for c in merged.columns if c not in key_cols]
+        else:
+            missing_storms = [storm for storm in storm_order if storm not in merged.columns]
+            if missing_storms:
+                message = (
+                    f"Storm columns not found in WSE data: {missing_storms}. "
+                    f"Available WSE columns: "
+                    f"{[c for c in max_wse.columns if c not in ('River', 'Reach', 'RS')]}"
+                )
+                raise ValueError(message)
 
         n_xs = len(merged)
         n_storms = len(storm_order)
@@ -989,13 +1022,18 @@ class HdfChannelCapacity:
 
         summary = summary.sort_values('capacity_level').reset_index(drop=True)
 
-        logger.info("System Capacity Summary:")
-        for _, row in summary.iterrows():
-            if row['channel_length_ft'] > 0:
-                logger.info(
-                    f"  Level {row['capacity_level']} ({row['capacity_category']}): "
-                    f"{row['channel_length_ft']:.0f} ft ({row['percent_of_total']:.1f}%)"
-                )
+        nonzero = summary[summary['channel_length_ft'] > 0]
+        logger.info(
+            "System capacity summary: levels=%d total_length_ft=%.0f xs=%d",
+            len(nonzero),
+            summary['channel_length_ft'].sum(),
+            summary['xs_count'].sum(),
+        )
+        for _, row in nonzero.iterrows():
+            logger.debug(
+                f"  Level {row['capacity_level']} ({row['capacity_category']}): "
+                f"{row['channel_length_ft']:.0f} ft ({row['percent_of_total']:.1f}%)"
+            )
 
         return summary[['capacity_level', 'capacity_category', 'channel_length_ft',
                         'percent_of_total', 'xs_count']]

@@ -11,6 +11,7 @@ Classes:
     GeomLandCover - 2D Manning's n land cover operations
     GeomCrossSection - 1D cross section operations
     GeomStorage - Storage area operations
+    GeomProjection - Model geometry reprojection operations
     GeomLateral - Lateral structures and SA/2D connections
     GeomInlineWeir - Inline weir operations
     GeomBridge - Bridge operations
@@ -54,19 +55,32 @@ from .GeomCrossSection import (
     GeomCrossSection,
 )
 from .ManningsFromLandCover import ManningsFromLandCover
-from .GeomCrossSection import GeomCrossSection
 from .GeomStorage import GeomStorage
+from .GeomProjection import GeomProjection
 from .GeomLateral import GeomLateral
 from .GeomInlineWeir import GeomInlineWeir
 from .GeomBridge import GeomBridge
 from .GeomCulvert import GeomCulvert
+from .GeomCulvertGIS import GeomCulvertGIS
 from .GeomHtabUtils import GeomHtabUtils
 from .GeomHtab import GeomHtab
 from .GeomMetadata import GeomMetadata
 from .GeomReferenceFeatures import GeomReferenceFeatures
 from .GeomBcLines import GeomBcLines
 from .GeomMesh import GeomMesh
-from .GeomMeshDataclasses import MeshResult, BCConflict, BCFixResult
+from .GeomMeshRepair import GeomMeshRepair
+from ._seed_repair import ComputationPointRepairPlan
+from .GeomPipeNetwork import GeomPipeNetwork
+from .GeomMeshDataclasses import (
+    BCConflict,
+    BCFixResult,
+    DomainContainmentResult,
+    DomainContainmentViolation,
+    GridAnchor,
+    MeshResult,
+    MeshCellSubsetPlan,
+    MeshSeedRepairResult,
+)
 
 __all__ = [
     'GeomParser',
@@ -80,17 +94,27 @@ __all__ = [
     'CrossSectionManningsN',
     'CrossSectionReachLengths',
     'GeomStorage',
+    'GeomProjection',
     'GeomLateral',
     'GeomInlineWeir',
     'GeomBridge',
     'GeomCulvert',
+    'GeomCulvertGIS',
     'GeomHtabUtils',
     'GeomHtab',
     'GeomMetadata',
     'GeomReferenceFeatures',
     'GeomBcLines',
     'GeomMesh',
+    'GeomMeshRepair',
+    'GeomPipeNetwork',
     'MeshResult',
+    'MeshCellSubsetPlan',
+    'MeshSeedRepairResult',
+    'ComputationPointRepairPlan',
     'BCConflict',
     'BCFixResult',
+    'DomainContainmentResult',
+    'DomainContainmentViolation',
+    'GridAnchor',
 ]

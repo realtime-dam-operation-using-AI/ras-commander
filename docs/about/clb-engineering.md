@@ -17,7 +17,7 @@ Within two years, CLB Engineering built the **most robust and feature-complete H
 - **[ras-commander](https://github.com/gpt-cmdr/ras-commander)**: 50+ modules covering plan execution, HDF results extraction, geometry parsing, USGS integration, precipitation analysis, remote distributed execution, quality assurance, and more
 - **[hms-commander](https://github.com/gpt-cmdr/hms-commander)**: Companion library for HEC-HMS automation
 - **Comprehensive agentic infrastructure**: AI agents, skills, rules, and cognitive memory systems that enable engineers to work alongside AI assistants on complex modeling tasks
-- **50+ example notebooks**: Production-quality demonstrations covering every major HEC-RAS workflow
+- **100+ example notebooks**: Production-quality demonstrations covering every major HEC-RAS workflow
 
 This demonstrates the extraordinary value that licensed professional engineers can create when working alongside Large Language Models with clear principles and accountability.
 
@@ -75,8 +75,14 @@ Owner & Vice President, CLB Engineering Corporation
 
 ## Citing RAS Commander
 
-If you use ras-commander in your work, please cite the library and provide a link to the GitHub repository:
+If you use RAS Commander, please consider citing the library in published work
+or mentioning it when sharing results. The canonical
+[citation and sharing guide](../cite.md) provides copy-ready language, structured
+citation metadata, contributor acknowledgments, and contribution guidance.
 
-> This analysis was performed using ras-commander ([https://github.com/gpt-cmdr/ras-commander](https://github.com/gpt-cmdr/ras-commander)), an open-source Python library for HEC-RAS automation by CLB Engineering Corporation.
+> This work used RAS Commander vX.Y.Z, the open-source Python library for
+> automating and analyzing HEC-RAS projects
+> ([https://github.com/gpt-cmdr/ras-commander](https://github.com/gpt-cmdr/ras-commander)).
 
-If you are building products or services on top of ras-commander, acknowledgment of CLB Engineering Corporation is appreciated.
+For products and services, a short "Built with RAS Commander" acknowledgment is
+appreciated and voluntary.

@@ -1,74 +1,98 @@
 """Integration tests for HEC-DSS grid writing through RasDss."""
 
-from datetime import datetime
+from __future__ import annotations
 
-import numpy as np
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pandas as pd
 import pytest
 
+from ras_commander import RasDss
 
 pytestmark = pytest.mark.integration
 
+_BRIDGE_WORKER = Path(__file__).with_name("_rasdss_grid_bridge_worker.py")
 
-def _configure_dss_or_skip():
-    from ras_commander import RasDss
 
-    try:
-        RasDss._configure_jvm()
-    except (ImportError, RuntimeError) as exc:
-        pytest.skip(f"HEC Monolith/pyjnius unavailable: {exc}")
-    return RasDss
+def _run_bridge_scenario(scenario: str, output_dir: Path) -> None:
+    # Java bridge checks cover the Java path whatever backend the caller selected.
+    completed = subprocess.run(
+        [sys.executable, str(_BRIDGE_WORKER), scenario, str(output_dir)],
+        check=False,
+        env={k: v for k, v in os.environ.items() if k != "RAS_COMMANDER_DSS_BACKEND"},
+        capture_output=True,
+        text=True,
+    )
+    combined_output = completed.stdout + completed.stderr
+
+    if completed.returncode == 77 and "C03C_BRIDGE_UNAVAILABLE:" in completed.stdout:
+        pytest.skip(completed.stdout.strip())
+
+    assert "Windows fatal exception: access violation" not in combined_output
+    assert completed.returncode == 0, combined_output
+    assert f"C03C_SCENARIO_OK:{scenario}" in completed.stdout
 
 
 def test_write_grid_timeseries_round_trips_synthetic_shg_grid(tmp_path):
-    RasDss = _configure_dss_or_skip()
+    _run_bridge_scenario("shg_round_trip", tmp_path)
 
-    dss_file = tmp_path / "synthetic_grid.dss"
-    data = np.arange(5 * 10 * 10, dtype=np.float32).reshape(5, 10, 10)
-    times = [datetime(2020, 1, 1, hour) for hour in range(1, 6)]
 
-    written = RasDss.write_grid_timeseries(
-        dss_file=dss_file,
-        pathname="/SHG/TEST/PRECIP/01JAN2020:0000/01JAN2020:0100/RC_TEST/",
-        data=data,
-        times=times,
-        grid_info={
-            "cellsize": 2000,
-            "origin": (1096000, 1516000),
-            "crs": "SHG",
-            "units": "mm",
-            "data_type": "PER-CUM",
-        },
+def test_read_grid_round_trips_specified_grid_and_missing_values(tmp_path):
+    _run_bridge_scenario("specified_grid_round_trip", tmp_path)
+
+
+def test_midnight_writer_returns_exact_stored_path(tmp_path):
+    _run_bridge_scenario("midnight_exact_path", tmp_path)
+
+
+def test_read_grid_reports_exact_path_errors(tmp_path):
+    missing_file = tmp_path / "missing.dss"
+    pathname = "/BASIN/LOCATION/PRECIP/01JAN2020:0000/01JAN2020:0100/TEST/"
+    with pytest.raises(FileNotFoundError, match="DSS file not found"):
+        RasDss.read_grid(missing_file, pathname)
+
+    with pytest.raises(ValueError, match="without wildcard"):
+        RasDss.read_grid(Path(missing_file), pathname.replace("PRECIP", "P*"))
+    with pytest.raises(ValueError, match="must have 6 parts"):
+        RasDss.read_grid(missing_file, "/TOO/FEW/PARTS/")
+
+    _run_bridge_scenario("exact_path_error", tmp_path)
+
+
+def test_parse_grid_dss_datetime_normalizes_2400():
+    assert RasDss._parse_grid_dss_datetime("31DEC2022:2400") == pd.Timestamp(
+        "2023-01-01 00:00"
     )
 
-    assert written == [
-        "/SHG/TEST/PRECIP/01JAN2020:0000/01JAN2020:0100/RC_TEST/",
-        "/SHG/TEST/PRECIP/01JAN2020:0100/01JAN2020:0200/RC_TEST/",
-        "/SHG/TEST/PRECIP/01JAN2020:0200/01JAN2020:0300/RC_TEST/",
-        "/SHG/TEST/PRECIP/01JAN2020:0300/01JAN2020:0400/RC_TEST/",
-        "/SHG/TEST/PRECIP/01JAN2020:0400/01JAN2020:0500/RC_TEST/",
-    ]
 
-    catalog = RasDss.get_catalog(dss_file)
-    assert sorted(catalog["pathname"].tolist()) == sorted(written)
+def test_write_grid_rejects_timezone_aware_times_before_jvm_or_output(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        RasDss,
+        "_configure_jvm",
+        staticmethod(
+            lambda: pytest.fail("timezone rejection must precede JVM setup")
+        ),
+    )
+    output = tmp_path / "missing-parent" / "aware-grid.dss"
 
-    from jnius import autoclass, cast
+    with pytest.raises(ValueError, match="timezone-naive"):
+        RasDss.write_grid_timeseries(
+            output,
+            "/SHG/TEST/PRECIP/01JAN2020:0000/01JAN2020:0100/TZ/",
+            data=[[[1.0]]],
+            times=pd.date_range(
+                "2020-01-01 01:00",
+                periods=1,
+                freq="h",
+                tz="UTC",
+            ),
+            grid_info={"cellsize": 2000, "crs": "SHG"},
+        )
 
-    HecDss = autoclass("hec.heclib.dss.HecDss")
-    dss = HecDss.open(str(dss_file))
-    try:
-        container = cast("hec.io.GridContainer", dss.get(written[2]))
-        grid_data = container.getGridData()
-        grid_info = cast("hec.heclib.grid.AlbersInfo", grid_data.getGridInfo())
-        values = np.asarray(grid_data.getData(), dtype=np.float32)
-    finally:
-        dss.done()
-
-    assert grid_info.getNumberOfCellsX() == 10
-    assert grid_info.getNumberOfCellsY() == 10
-    assert grid_info.getLowerLeftCellX() == 548
-    assert grid_info.getLowerLeftCellY() == 758
-    assert grid_info.getCellSize() == 2000
-    assert grid_info.getDataUnits() == "mm"
-    assert grid_info.getDataTypeName() == "PER-CUM"
-    assert grid_info.getGridType() == 420
-    assert np.allclose(values, data[2].ravel())
+    assert not output.parent.exists()

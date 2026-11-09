@@ -20,10 +20,9 @@ Example Usage:
     >>> print(f"Max HW: {max_vals['max_hw']}, Max Flow: {max_vals['max_flow']}")
     >>>
 Technical Notes:
-    - 1D structure results are stored in cross section output at structure locations
-    - BR U (bridge upstream) and BR D (bridge downstream) sections store HW/TW
-    - Structure flow is typically stored in the structure's upstream cross section
-    - For bridges: BR U = upstream face (headwater), BR D = downstream face (tailwater)
+    - Unsteady Base Output stores per-family structure groups and labelled columns.
+    - Exact geometry identities link inline structures, bridges, culverts and pumps.
+    - Legacy cross-section and generic Structures layouts remain fallbacks.
 """
 
 from pathlib import Path
@@ -36,6 +35,7 @@ from .HdfBase import HdfBase
 from .HdfUtils import HdfUtils
 from ..Decorators import standardize_input, log_call
 from ..LoggingConfig import get_logger
+from ..fast_hdf import read_attr, read_typed, reraise_required
 
 logger = get_logger(__name__)
 
@@ -52,10 +52,9 @@ class HdfStruc1D:
 
     Notes
     -----
-    - 1D structure results are accessed via cross section output at structure locations
-    - The structure's upstream (BR U) section provides headwater values
-    - The structure's downstream (BR D) section provides tailwater values
-    - Flow is typically recorded at the upstream face
+    - Direct unsteady family results take precedence over cross-section estimates.
+    - Structure Variables, Bridge Variables and Culvert Variables use Variable_Unit.
+    - Legacy BR U/BR D and steady flanking cross-section behavior is retained.
     """
 
     @staticmethod
@@ -73,9 +72,10 @@ class HdfStruc1D:
         Extract maximum headwater, tailwater, and flow values for a 1D structure.
 
         This method searches for structure results in the HDF file and extracts
-        the maximum values needed for HTAB optimization. It looks for both the
-        upstream (BR U) and downstream (BR D) cross sections associated with
-        a bridge, culvert, or inline structure.
+        the maximum values needed for HTAB optimization. Direct unsteady inline,
+        bridge, culvert and pump results take precedence over legacy cross-section
+        output. Stage HW, Stage TW and Total Flow (inline) or Flow (other families)
+        are selected by their stored Variable_Unit labels, in native units.
 
         Parameters
         ----------
@@ -87,6 +87,7 @@ class HdfStruc1D:
             Reach name (case-sensitive)
         rs : str
             River station of the structure (as string, e.g., "5600")
+            For a pumping station, use its exact Name with river=reach="".
         ras_object : RasPrj, optional
             RAS object for multi-project workflows
 
@@ -120,7 +121,11 @@ class HdfStruc1D:
         Notes
         -----
         - For bridges: BR U = headwater (upstream face), BR D = tailwater (downstream)
-        - If exact structure location not found, searches for nearby BR U/BR D markers
+        - Direct family identities require an exact, unique geometry match; no
+          nearest-station matching or estimated TW is used for these results.
+        - Missing/all-NaN direct quantities remain None, with no source assigned.
+        - Malformed family identity, time/column layout or labels raises ValueError.
+        - Legacy cross-section fallback can search nearby BR U/BR D markers
         - For unsteady results, uses time series max values
         - For steady results, uses max across all profiles
         """
@@ -134,31 +139,34 @@ class HdfStruc1D:
             'found': False
         }
 
-        try:
-            with h5py.File(hdf_path, 'r') as hdf_file:
-                # Determine if unsteady or steady results
-                is_unsteady = "Results/Unsteady" in hdf_file
-                is_steady = "Results/Steady" in hdf_file
+        with h5py.File(hdf_path, 'r') as hdf_file:
+            # Determine if unsteady or steady results
+            is_unsteady = "Results/Unsteady" in hdf_file
+            is_steady = "Results/Steady" in hdf_file
 
-                if is_unsteady:
-                    result = HdfStruc1D._extract_unsteady_structure_max(
-                        hdf_file, river, reach, rs, result
-                    )
-                elif is_steady:
-                    result = HdfStruc1D._extract_steady_structure_max(
-                        hdf_file, river, reach, rs, result
-                    )
-                else:
-                    logger.warning(f"No steady or unsteady results found in {hdf_path}")
-                    return result
+            if is_unsteady:
+                result = HdfStruc1D._extract_unsteady_structure_max(
+                    hdf_file, river, reach, rs, result
+                )
+            elif is_steady:
+                result = HdfStruc1D._extract_steady_structure_max(
+                    hdf_file, river, reach, rs, result
+                )
+            else:
+                raise ValueError(
+                    f"No steady or unsteady results were found in {Path(hdf_path).name}. "
+                    "Compute a steady or unsteady plan and pass the plan HDF with results."
+                )
 
-                return result
+        if not result.get('found'):
+            raise ValueError(
+                f"No 1D structure results were found for {river}/{reach}/RS {rs} "
+                f"in {Path(hdf_path).name}. Checked cross-section output and direct "
+                "structure output; confirm the plan has been computed and this "
+                "structure is included in the results."
+            )
 
-        except FileNotFoundError:
-            raise
-        except Exception as e:
-            logger.error(f"Error extracting structure max values: {str(e)}")
-            return result
+        return result
 
     @staticmethod
     def _extract_unsteady_structure_max(
@@ -169,19 +177,61 @@ class HdfStruc1D:
         result: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Extract max values from unsteady results for a structure."""
+        matches = [(record, dataset) for record, dataset in
+                   HdfStruc1D._unsteady_family_structures(hdf_file)
+                   if (record['River'], record['Reach'], record['RS']) == (river, reach, rs)]
+        if len(matches) > 1:
+            raise ValueError(f'Ambiguous direct structure identity: {river}/{reach}/{rs}')
+        for record, dataset in matches:
+            flow_label = 'Total Flow' if record['Type'] == 'Inline' else 'Flow'
+            quantities = {'Stage HW': 'hw', 'Stage TW': 'tw', flow_label: 'flow'}
+            labels = read_attr(dataset, 'Variable_Unit')
+            values_2d = None
+            selected = set()
+            for i, label in enumerate(labels):
+                name = HdfStruc1D._identity_text(label[0])
+                if name not in quantities:
+                    continue
+                quantity = quantities[name]
+                if quantity in selected:
+                    raise ValueError(f"{dataset.name}: ambiguous {name} columns")
+                selected.add(quantity)
+                if values_2d is None:
+                    values_2d = read_typed(dataset)
+                values = values_2d[:, i]
+                if values.size and not np.isnan(values).all():
+                    result[f'max_{quantity}'] = float(np.nanmax(values))
+                    result[f'{quantity}_source'] = f"{dataset.name} [{name}]"
+                    result['found'] = True
+            return result
+
+        # Preserve the existing legacy generic layout, without requiring XS output.
+        struct_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Structures"
+        if struct_path in hdf_file:
+            struct_result = HdfStruc1D._extract_from_structure_group(
+                hdf_file, struct_path, river, reach, rs
+            )
+            if struct_result['found']:
+                return struct_result
+
         base_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Cross Sections"
 
         if base_path not in hdf_file:
-            logger.warning("No cross section results found in unsteady output")
-            return result
+            raise ValueError(
+                "Unsteady 1D structure extraction requires cross-section results at "
+                f"'{base_path}'. Confirm the plan has been computed with 1D structure "
+                "results available."
+            )
 
         # Get cross section attributes to find structure location
         attrs_path = f"{base_path}/Cross Section Attributes"
         if attrs_path not in hdf_file:
-            logger.warning("No cross section attributes found")
-            return result
+            raise ValueError(
+                "Unsteady 1D structure extraction requires cross-section attributes at "
+                f"'{attrs_path}'. Confirm the plan HDF includes 1D cross-section output."
+            )
 
-        attrs_data = hdf_file[attrs_path][()]
+        attrs_data = read_typed(hdf_file[attrs_path])
 
         # Build location lookup
         xs_locations = []
@@ -236,23 +286,12 @@ class HdfStruc1D:
                         logger.debug(f"Using exact RS match for HW at index {hw_idx}")
                         break
 
-        # Strategy 3: Search for structure in Structures output path (if exists)
-        struct_path = f"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Structures"
-        if struct_path in hdf_file:
-            logger.debug("Found Structures output group - checking for direct structure data")
-            # Try to extract from dedicated structure output if available
-            struct_result = HdfStruc1D._extract_from_structure_group(
-                hdf_file, struct_path, river, reach, rs
-            )
-            if struct_result['found']:
-                return struct_result
-
         # Extract max values from cross section time series
         if hw_idx is not None:
             # Water Surface for headwater
             ws_path = f"{base_path}/Water Surface"
             if ws_path in hdf_file:
-                ws_data = hdf_file[ws_path][:]
+                ws_data = read_typed(hdf_file[ws_path], slice(None))
                 if hw_idx < ws_data.shape[1]:
                     result['max_hw'] = float(np.nanmax(ws_data[:, hw_idx]))
                     result['found'] = True
@@ -261,7 +300,7 @@ class HdfStruc1D:
             # Flow for headwater location
             flow_path = f"{base_path}/Flow"
             if flow_path in hdf_file:
-                flow_data = hdf_file[flow_path][:]
+                flow_data = read_typed(hdf_file[flow_path], slice(None))
                 if hw_idx < flow_data.shape[1]:
                     result['max_flow'] = float(np.nanmax(flow_data[:, hw_idx]))
                     result['flow_source'] = result['hw_source']
@@ -271,7 +310,7 @@ class HdfStruc1D:
             # Water Surface for tailwater
             ws_path = f"{base_path}/Water Surface"
             if ws_path in hdf_file:
-                ws_data = hdf_file[ws_path][:]
+                ws_data = read_typed(hdf_file[ws_path], slice(None))
                 if tw_idx < ws_data.shape[1]:
                     result['max_tw'] = float(np.nanmax(ws_data[:, tw_idx]))
                     result['found'] = True
@@ -285,6 +324,110 @@ class HdfStruc1D:
             logger.debug("TW not found separately - using HW value as conservative estimate")
 
         return result
+
+    @staticmethod
+    def _identity_text(value) -> str:
+        """Decode stored identity/label text without coercing non-text values."""
+        if isinstance(value, bytes):
+            value = value.decode('utf-8')
+        if not isinstance(value, str):
+            raise ValueError("Structure identity and Variable_Unit fields must be text")
+        return value.strip().strip('\x00').strip()
+
+    @staticmethod
+    def _unsteady_family_structures(hdf_file: h5py.File):
+        """Yield exact geometry-linked primary series in qualified Base families.
+
+        Like the native structures_1d reader, join trimmed River/Reach/RS plus
+        Type, or pump Name, to group names. Never split group names or infer a
+        location from numeric station proximity. Nested gate/pump components are
+        not substitutes for a family's primary flow/stage dataset.
+        """
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        text = HdfStruc1D._identity_text
+        families = (
+            ('Inline Structures', 'Inline', 'Structure Variables'),
+            ('Bridges', 'Bridge', 'Bridge Variables'),
+            ('Culverts', 'Culvert', 'Culvert Variables'),
+            ('Pumping Stations', 'Pump', 'Structure Variables'),
+        )
+        for family, struct_type, variable in families:
+            path = f'{base}/{family}'
+            if path not in hdf_file:
+                continue
+            group = hdf_file[path]
+            if not isinstance(group, h5py.Group):
+                raise ValueError(f'{path}: expected a structure family group')
+            table_path = ('Geometry/Pump Stations/Attributes' if struct_type == 'Pump'
+                          else 'Geometry/Structures/Attributes')
+            if table_path not in hdf_file:
+                raise ValueError(f'{path}: missing geometry identity table {table_path}')
+            table = hdf_file[table_path]
+            fields = ('Name',) if struct_type == 'Pump' else ('Type', 'River', 'Reach', 'RS')
+            if (not isinstance(table, h5py.Dataset) or table.ndim != 1
+                    or not set(fields).issubset(table.dtype.names or ())):
+                raise ValueError(f'{table_path}: invalid structure identity columns')
+            identities = {}
+            for row in read_typed(table):
+                if struct_type == 'Pump':
+                    name = text(row['Name'])
+                    # Pumps have a Name identity, not a river station. Keep the
+                    # five-column inventory and use Name as their lookup token.
+                    identity = ('', '', name)
+                else:
+                    if text(row['Type']) != struct_type:
+                        continue
+                    identity = tuple(text(row[key]) for key in ('River', 'Reach', 'RS'))
+                    name = ' '.join(identity)
+                if name in identities:
+                    raise ValueError(f'{table_path}: non-unique structure identity {name!r}')
+                identities[name] = identity
+
+            time_rows = []
+            for time_name in ('Time', 'Time Date Stamp', 'Time Date Stamp (ms)'):
+                time_path = f'{base}/{time_name}'
+                if time_path in hdf_file:
+                    axis = hdf_file[time_path]
+                    if not isinstance(axis, h5py.Dataset) or axis.ndim != 1:
+                        raise ValueError(f'{time_path}: expected a one-dimensional time axis')
+                    time_rows.append(len(axis))
+            if not time_rows or not time_rows[0] or len(set(time_rows)) != 1:
+                raise ValueError(f'{path}: missing or inconsistent Base Output time axes')
+
+            seen_names = set()
+            pointers = set()
+            for name, structure in group.items():
+                key = text(name)
+                if key in seen_names:
+                    raise ValueError(f'{path}: duplicate trimmed structure name {key!r}')
+                seen_names.add(key)
+                if key not in identities:
+                    raise ValueError(f'{path}/{name}: no unique geometry identity')
+                if not isinstance(structure, h5py.Group):
+                    raise ValueError(f'{path}/{name}: expected a structure group')
+                if 'Node Pointer' in structure.attrs:
+                    pointer = np.asarray(read_attr(structure, 'Node Pointer'))
+                    if pointer.size != 1 or pointer.dtype.kind not in 'iu':
+                        raise ValueError(f'{structure.name}: invalid Node Pointer')
+                    pointer = int(pointer.item())
+                    if pointer in pointers:
+                        raise ValueError(f'{path}: duplicate Node Pointer {pointer}')
+                    pointers.add(pointer)
+                if variable not in structure:
+                    raise ValueError(f'{structure.name}: missing primary dataset {variable}')
+                dataset = structure[variable]
+                if (not isinstance(dataset, h5py.Dataset) or dataset.ndim != 2
+                        or dataset.dtype.kind not in 'fi'
+                        or dataset.shape[0] != time_rows[0]):
+                    raise ValueError(f'{structure.name}/{variable}: invalid numeric time/column layout')
+                labels = np.asarray(read_attr(dataset, 'Variable_Unit', []))
+                if labels.shape != (dataset.shape[1], 2):
+                    raise ValueError(f'{dataset.name}: invalid or missing Variable_Unit labels')
+                for label in labels.flat:
+                    text(label)
+                river, reach, rs = identities[key]
+                yield ({'River': river, 'Reach': reach, 'RS': rs,
+                        'Name': name, 'Type': struct_type}, dataset)
 
     @staticmethod
     def _extract_steady_structure_max(
@@ -307,18 +450,26 @@ class HdfStruc1D:
         base_path = "Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Cross Sections"
 
         if base_path not in hdf_file:
-            logger.warning("No cross section results found in steady output")
-            return result
+            raise ValueError(
+                "Steady 1D structure extraction requires cross-section results at "
+                f"'{base_path}'. Confirm the plan has been computed with steady "
+                "profile results available."
+            )
 
         # Get cross section attributes
         attrs_path = f"{base_path}/Attributes"
         if attrs_path not in hdf_file:
             attrs_path = "Results/Steady/Output/Geometry Info/Cross Section Attributes"
             if attrs_path not in hdf_file:
-                logger.warning("No cross section attributes found")
-                return result
+                raise ValueError(
+                    "Steady 1D structure extraction requires cross-section attributes at "
+                    "'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/"
+                    "Cross Sections/Attributes' or 'Results/Steady/Output/Geometry Info/"
+                    "Cross Section Attributes'. Confirm the plan HDF includes steady "
+                    "geometry output."
+                )
 
-        attrs_data = hdf_file[attrs_path][()]
+        attrs_data = read_typed(hdf_file[attrs_path])
 
         xs_locations = []
         for i, attr in enumerate(attrs_data):
@@ -400,7 +551,7 @@ class HdfStruc1D:
                             result['tw_source'] = result['hw_source']
 
                         if hw_idx is not None:
-                            logger.info(
+                            logger.debug(
                                 f"Steady structure {rs}: using flanking XS "
                                 f"US={upstream['station'] if upstream else 'N/A'}, "
                                 f"DS={downstream['station'] if downstream else 'N/A'}"
@@ -409,7 +560,7 @@ class HdfStruc1D:
         if hw_idx is not None:
             ws_path = f"{base_path}/Water Surface"
             if ws_path in hdf_file:
-                ws_data = hdf_file[ws_path][:]
+                ws_data = read_typed(hdf_file[ws_path], slice(None))
                 if hw_idx < ws_data.shape[1]:
                     result['max_hw'] = float(np.nanmax(ws_data[:, hw_idx]))
                     result['found'] = True
@@ -421,7 +572,7 @@ class HdfStruc1D:
                 flow_path = f"{base_path}/Additional Variables/Flow"
 
             if flow_path in hdf_file:
-                flow_data = hdf_file[flow_path][:]
+                flow_data = read_typed(hdf_file[flow_path], slice(None))
                 if hw_idx < flow_data.shape[1]:
                     result['max_flow'] = float(np.nanmax(flow_data[:, hw_idx]))
                     result['flow_source'] = result['hw_source']
@@ -464,20 +615,20 @@ class HdfStruc1D:
                         source = f"{river}/{reach}/{rs} (Structure output)"
 
                         if "Headwater" in struct_group:
-                            hw_data = struct_group["Headwater"][:]
+                            hw_data = read_typed(struct_group["Headwater"], slice(None))
                             if i < hw_data.shape[1]:
                                 result['max_hw'] = float(np.nanmax(hw_data[:, i]))
                                 result['hw_source'] = source
                                 result['found'] = True
 
                         if "Tailwater" in struct_group:
-                            tw_data = struct_group["Tailwater"][:]
+                            tw_data = read_typed(struct_group["Tailwater"], slice(None))
                             if i < tw_data.shape[1]:
                                 result['max_tw'] = float(np.nanmax(tw_data[:, i]))
                                 result['tw_source'] = source
 
                         if "Flow" in struct_group:
-                            flow_data = struct_group["Flow"][:]
+                            flow_data = read_typed(struct_group["Flow"], slice(None))
                             if i < flow_data.shape[1]:
                                 result['max_flow'] = float(np.nanmax(flow_data[:, i]))
                                 result['flow_source'] = source
@@ -485,6 +636,7 @@ class HdfStruc1D:
                         break
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not extract from Structures group: {e}")
 
         return result
@@ -536,73 +688,76 @@ class HdfStruc1D:
             DataFrame with columns:
             - River: River name
             - Reach: Reach name
-            - RS: River station
+            - RS: River station; pump Name for pumping stations
             - Name: Cross section name (may include BR U/BR D markers)
             - Type: Structure type indicator (Bridge, Culvert, etc.) if detectable
 
         Notes
         -----
-        Structures are identified by BR U/BR D markers in cross section names
-        or by presence in dedicated Structures output group.
+        Unsteady Base Output Inline Structures, Bridges, Culverts and Pumping
+        Stations are linked to exact, unique geometry identities and validated
+        primary datasets/Variable_Unit labels. Pumps have empty River/Reach and
+        use their Name as RS (pass these values to get_structure_max_values).
+        Direct family records take precedence over duplicate legacy BR U/BR D
+        markers or generic Structures records. Malformed direct layouts raise
+        ValueError; an empty inventory retains the five documented columns.
         """
         structures = []
 
-        try:
-            with h5py.File(hdf_path, 'r') as hdf_file:
-                # Check unsteady results
-                unsteady_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Cross Sections/Cross Section Attributes"
-                if unsteady_path in hdf_file:
-                    attrs_data = hdf_file[unsteady_path][()]
+        with h5py.File(hdf_path, 'r') as hdf_file:
+            structures.extend(record for record, _ in
+                              HdfStruc1D._unsteady_family_structures(hdf_file))
+            # Check unsteady results
+            unsteady_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Cross Sections/Cross Section Attributes"
+            if unsteady_path in hdf_file:
+                attrs_data = hdf_file[unsteady_path][()]
 
-                    for attr in attrs_data:
-                        name = attr['Name'].decode('utf-8').strip() if 'Name' in attr.dtype.names and isinstance(attr['Name'], bytes) else ""
+                for attr in attrs_data:
+                    name = attr['Name'].decode('utf-8').strip() if 'Name' in attr.dtype.names and isinstance(attr['Name'], bytes) else ""
 
-                        # Identify structure markers
-                        is_structure = 'BR U' in name or 'BR D' in name or 'IC' in name or 'Culv' in name.lower()
+                    # Identify structure markers
+                    is_structure = 'BR U' in name or 'BR D' in name or 'IC' in name or 'Culv' in name.lower()
 
-                        if is_structure:
-                            river = attr['River'].decode('utf-8').strip() if isinstance(attr['River'], bytes) else str(attr['River']).strip()
-                            reach = attr['Reach'].decode('utf-8').strip() if isinstance(attr['Reach'], bytes) else str(attr['Reach']).strip()
-                            station = attr['Station'].decode('utf-8').strip() if isinstance(attr['Station'], bytes) else str(attr['Station']).strip()
+                    if is_structure:
+                        river = attr['River'].decode('utf-8').strip() if isinstance(attr['River'], bytes) else str(attr['River']).strip()
+                        reach = attr['Reach'].decode('utf-8').strip() if isinstance(attr['Reach'], bytes) else str(attr['Reach']).strip()
+                        station = attr['Station'].decode('utf-8').strip() if isinstance(attr['Station'], bytes) else str(attr['Station']).strip()
 
-                            struct_type = "Unknown"
-                            if 'BR' in name:
-                                struct_type = "Bridge"
-                            elif 'IC' in name:
-                                struct_type = "Inline"
-                            elif 'Culv' in name.lower():
-                                struct_type = "Culvert"
-
-                            structures.append({
-                                'River': river,
-                                'Reach': reach,
-                                'RS': station,
-                                'Name': name,
-                                'Type': struct_type
-                            })
-
-                # Check Structures group if exists
-                struct_attrs_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Structures/Structure Attributes"
-                if struct_attrs_path in hdf_file:
-                    struct_attrs = hdf_file[struct_attrs_path][()]
-                    for attr in struct_attrs:
-                        river = attr['River'].decode('utf-8').strip() if 'River' in attr.dtype.names and isinstance(attr['River'], bytes) else ""
-                        reach = attr['Reach'].decode('utf-8').strip() if 'Reach' in attr.dtype.names and isinstance(attr['Reach'], bytes) else ""
-                        rs = attr['RS'].decode('utf-8').strip() if 'RS' in attr.dtype.names and isinstance(attr['RS'], bytes) else ""
-                        name = attr['Name'].decode('utf-8').strip() if 'Name' in attr.dtype.names and isinstance(attr['Name'], bytes) else ""
+                        struct_type = "Unknown"
+                        if 'BR' in name:
+                            struct_type = "Bridge"
+                        elif 'IC' in name:
+                            struct_type = "Inline"
+                        elif 'Culv' in name.lower():
+                            struct_type = "Culvert"
 
                         structures.append({
                             'River': river,
                             'Reach': reach,
-                            'RS': rs,
+                            'RS': station,
                             'Name': name,
-                            'Type': 'Structure'
+                            'Type': struct_type
                         })
 
-        except Exception as e:
-            logger.error(f"Error listing 1D structures: {str(e)}")
+            # Check Structures group if exists
+            struct_attrs_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Structures/Structure Attributes"
+            if struct_attrs_path in hdf_file:
+                struct_attrs = hdf_file[struct_attrs_path][()]
+                for attr in struct_attrs:
+                    river = attr['River'].decode('utf-8').strip() if 'River' in attr.dtype.names and isinstance(attr['River'], bytes) else ""
+                    reach = attr['Reach'].decode('utf-8').strip() if 'Reach' in attr.dtype.names and isinstance(attr['Reach'], bytes) else ""
+                    rs = attr['RS'].decode('utf-8').strip() if 'RS' in attr.dtype.names and isinstance(attr['RS'], bytes) else ""
+                    name = attr['Name'].decode('utf-8').strip() if 'Name' in attr.dtype.names and isinstance(attr['Name'], bytes) else ""
 
-        df = pd.DataFrame(structures)
+                    structures.append({
+                        'River': river,
+                        'Reach': reach,
+                        'RS': rs,
+                        'Name': name,
+                        'Type': 'Structure'
+                    })
+
+        df = pd.DataFrame(structures, columns=['River', 'Reach', 'RS', 'Name', 'Type'])
         if not df.empty:
             df = df.drop_duplicates(subset=['River', 'Reach', 'RS']).reset_index(drop=True)
             logger.debug(f"Found {len(df)} 1D structures with results")

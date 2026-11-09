@@ -4,6 +4,7 @@ CheckFloodways - Floodway encroachment validation.
 Extracted from RasCheck.py for modular organization.
 """
 
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -13,6 +14,7 @@ import h5py
 
 from ..Decorators import standardize_input, log_call
 from ..LoggingConfig import get_logger
+from ..fast_hdf import read_attr, read_typed, reraise_required
 from .types import Severity, FlowType, CheckMessage, CheckResults
 from .thresholds import ValidationThresholds, get_default_thresholds
 from .messages import get_message_template, get_help_text, format_message
@@ -23,7 +25,7 @@ logger = get_logger(__name__)
 
 
 class CheckFloodways:
-    """Floodway encroachment validation."""
+    """Experimental floodway diagnostics; incomplete HDF coverage is not acceptance."""
 
     @staticmethod
     @log_call
@@ -36,7 +38,12 @@ class CheckFloodways:
         thresholds: Optional[ValidationThresholds] = None
     ) -> CheckResults:
         """
-        Check floodway encroachment analysis.
+        Run experimental floodway diagnostics on steady results.
+
+        Missing HDF datasets or profiles can produce empty or partial results.
+        Encroachment method/width coverage is incomplete across HDF layouts;
+        absence of messages does not establish that these checks ran. See the
+        floodway-check guide for current qualification limits.
 
         Validates:
         - Surcharge values against allowable limit
@@ -66,7 +73,9 @@ class CheckFloodways:
         try:
             steady_results = HdfResultsPlan.get_steady_results(plan_hdf)
         except Exception as e:
-            logger.warning(f"Could not read steady results: {e}")
+            reraise_required(e)
+            logger.warning("Could not read steady results for floodway checks")
+            logger.debug("Floodway steady-results read failure for %s: %s", plan_hdf, e)
             steady_results = None
 
         if steady_results is None or steady_results.empty:
@@ -139,7 +148,7 @@ class CheckFloodways:
                     reach=reach,
                     station=str(node_id),
                     message=format_message("FW_SC_01",
-                        sc=f"{surcharge:.2f}",
+                        sc=f"{surcharge:.2f}", station=str(node_id),
                         max=f"{surcharge_limit:.2f}"),
                     help_text=get_help_text("FW_SC_01"),
                     value=surcharge,
@@ -157,14 +166,14 @@ class CheckFloodways:
                     river=river,
                     reach=reach,
                     station=str(node_id),
-                    message=format_message("FW_SC_02", sc=f"{surcharge:.2f}"),
+                    message=format_message("FW_SC_02", sc=f"{surcharge:.2f}", station=str(node_id)),
                     help_text=get_help_text("FW_SC_02"),
                     value=surcharge
                 )
                 messages.append(msg)
                 record['issues'].append("FW_SC_02")
 
-            # FW_SC_03: Zero surcharge (exact match)
+            # FW_SC_03: Near-zero surcharge (absolute value below 0.005 ft)
             if not pd.isna(surcharge) and abs(surcharge) < 0.005:
                 msg = CheckMessage(
                     message_id="FW_SC_03",
@@ -173,7 +182,7 @@ class CheckFloodways:
                     river=river,
                     reach=reach,
                     station=str(node_id),
-                    message=get_message_template("FW_SC_03"),
+                    message=format_message("FW_SC_03", station=str(node_id)),
                     help_text=get_help_text("FW_SC_03"),
                     value=surcharge
                 )
@@ -189,7 +198,7 @@ class CheckFloodways:
                     river=river,
                     reach=reach,
                     station=str(node_id),
-                    message=format_message("FW_SC_04", sc=f"{surcharge:.3f}"),
+                    message=format_message("FW_SC_04", sc=f"{surcharge:.3f}", station=str(node_id)),
                     help_text=get_help_text("FW_SC_04"),
                     value=surcharge,
                     threshold=surcharge_limit
@@ -210,7 +219,7 @@ class CheckFloodways:
                         reach=reach,
                         station=str(node_id),
                         message=format_message("FW_Q_01",
-                            qfw=f"{fw_q:.0f}",
+                            station=str(node_id), qfw=f"{fw_q:.0f}",
                             qbf=f"{base_q:.0f}"),
                         help_text=get_help_text("FW_Q_01"),
                         value=q_pct
@@ -477,72 +486,10 @@ class CheckFloodways:
                                 )
                                 messages.append(msg)
 
-            # FW_WD_05: Steep floodway boundary slope check
-            # Need to compare encroachment stations between adjacent XS
-            encr_sorted = encr_data.sort_values(['river', 'reach', 'station'], ascending=[True, True, False])
-            prev_row = None
-            prev_reach_len = 100.0  # Default reach length if unknown
-
-            for _, row in encr_sorted.iterrows():
-                river = row.get('river', '')
-                reach = row.get('reach', '')
-                station = row.get('station', '')
-                encr_l = row.get('encr_sta_l', np.nan)
-                encr_r = row.get('encr_sta_r', np.nan)
-
-                if prev_row is not None and prev_row.get('river', '') == river and prev_row.get('reach', '') == reach:
-                    prev_encr_l = prev_row.get('encr_sta_l', np.nan)
-                    prev_encr_r = prev_row.get('encr_sta_r', np.nan)
-
-                    # Try to get actual reach length between stations
-                    try:
-                        prev_sta = float(prev_row.get('station', 0))
-                        curr_sta = float(station)
-                        reach_len = abs(prev_sta - curr_sta)
-                        if reach_len > 0:
-                            prev_reach_len = reach_len
-                    except (ValueError, TypeError):
-                        reach_len = prev_reach_len
-
-                    # Check left encroachment slope
-                    if not pd.isna(encr_l) and not pd.isna(prev_encr_l) and reach_len > 0:
-                        left_change = abs(encr_l - prev_encr_l)
-                        left_slope = left_change / reach_len
-                        if left_slope > 0.10:  # 10% slope threshold
-                            msg = CheckMessage(
-                                message_id="FW_WD_05",
-                                severity=Severity.WARNING,
-                                check_type="FLOODWAY",
-                                river=river,
-                                reach=reach,
-                                station=str(station),
-                                message=format_message("FW_WD_05", slope=f"{left_slope:.2f}", station=str(station)),
-                                help_text=get_help_text("FW_WD_05"),
-                                value=left_slope,
-                                threshold=0.10
-                            )
-                            messages.append(msg)
-
-                    # Check right encroachment slope
-                    if not pd.isna(encr_r) and not pd.isna(prev_encr_r) and reach_len > 0:
-                        right_change = abs(encr_r - prev_encr_r)
-                        right_slope = right_change / reach_len
-                        if right_slope > 0.10:  # 10% slope threshold
-                            msg = CheckMessage(
-                                message_id="FW_WD_05",
-                                severity=Severity.WARNING,
-                                check_type="FLOODWAY",
-                                river=river,
-                                reach=reach,
-                                station=str(station),
-                                message=format_message("FW_WD_05", slope=f"{right_slope:.2f}", station=str(station)),
-                                help_text=get_help_text("FW_WD_05"),
-                                value=right_slope,
-                                threshold=0.10
-                            )
-                            messages.append(msg)
-
-                prev_row = row
+            # FW_WD_05 is not evaluated: river-station identifiers are not
+            # longitudinal distances. No qualified spacing/coordinate contract
+            # is supplied here, so neither identifier differences nor a default
+            # reach length can establish a boundary transition ratio.
 
             # FW_ST_01: Structure encroachment doesn't match adjacent XS
             if struct_data is not None and not struct_data.empty:
@@ -628,6 +575,7 @@ class CheckFloodways:
                                 break
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not check encroachment data: {e}")
 
         return messages
@@ -635,95 +583,20 @@ class CheckFloodways:
     @staticmethod
     def _get_encroachment_stations(
         plan_hdf: Path,
-        floodway_profile: str
+        floodway_profile: str,
     ) -> Optional[pd.DataFrame]:
-        """
-        Extract encroachment stations from plan HDF file.
+        """Keep diagnostic callers tolerant while the public reader is strict."""
+        from ..hdf.HdfResultsPlan import HdfResultsPlan
 
-        Args:
-            plan_hdf: Path to plan HDF file
-            floodway_profile: Name of floodway profile
-
-        Returns:
-            DataFrame with columns: river, reach, station, encr_sta_l, encr_sta_r
-            or None if no encroachment data found
-        """
         try:
-            with h5py.File(plan_hdf, 'r') as hdf:
-                # Try multiple possible paths for encroachment data
-                encr_paths = [
-                    'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Cross Sections/Encroachment Stations',
-                    'Results/Steady/Output/Cross Sections/Encroachment Stations',
-                    'Geometry/Cross Sections/Encroachment Stations'
-                ]
-
-                encr_data = None
-                for path in encr_paths:
-                    if path in hdf:
-                        encr_data = hdf[path][:]
-                        break
-
-                if encr_data is None:
-                    return None
-
-                # Get cross section attributes for river/reach/station info
-                xs_attrs_path = 'Geometry/Cross Sections/Attributes'
-                if xs_attrs_path not in hdf:
-                    return None
-
-                xs_attrs = hdf[xs_attrs_path][:]
-
-                # Get profile names to find floodway profile index
-                profile_path = 'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Profile Names'
-                profile_idx = 0
-                if profile_path in hdf:
-                    profile_names = hdf[profile_path][:]
-                    for i, name in enumerate(profile_names):
-                        name_str = name.decode('utf-8').strip() if isinstance(name, bytes) else str(name).strip()
-                        if name_str == floodway_profile:
-                            profile_idx = i
-                            break
-
-                # Build encroachment data DataFrame
-                records = []
-                for i, xs in enumerate(xs_attrs):
-                    river = xs['River'].decode('utf-8').strip() if isinstance(xs['River'], bytes) else str(xs['River']).strip()
-                    reach = xs['Reach'].decode('utf-8').strip() if isinstance(xs['Reach'], bytes) else str(xs['Reach']).strip()
-                    station = xs['RS'].decode('utf-8').strip() if isinstance(xs['RS'], bytes) else str(xs['RS']).strip()
-
-                    # Get encroachment values - structure varies by HDF version
-                    if encr_data.ndim == 2:
-                        # 2D array: [xs_index, profile_index] or [xs_index, left/right]
-                        if encr_data.shape[1] >= 2:
-                            encr_l = float(encr_data[i, 0]) if i < encr_data.shape[0] else np.nan
-                            encr_r = float(encr_data[i, 1]) if i < encr_data.shape[0] else np.nan
-                        else:
-                            encr_l = np.nan
-                            encr_r = np.nan
-                    elif encr_data.ndim == 3:
-                        # 3D array: [xs_index, profile_index, left/right]
-                        if i < encr_data.shape[0] and profile_idx < encr_data.shape[1]:
-                            encr_l = float(encr_data[i, profile_idx, 0])
-                            encr_r = float(encr_data[i, profile_idx, 1]) if encr_data.shape[2] > 1 else np.nan
-                        else:
-                            encr_l = np.nan
-                            encr_r = np.nan
-                    else:
-                        encr_l = np.nan
-                        encr_r = np.nan
-
-                    records.append({
-                        'river': river,
-                        'reach': reach,
-                        'station': station,
-                        'encr_sta_l': encr_l,
-                        'encr_sta_r': encr_r
-                    })
-
-                return pd.DataFrame(records)
-
-        except Exception as e:
-            logger.debug(f"Could not extract encroachment stations: {e}")
+            return HdfResultsPlan.get_steady_encroachment_stations(
+                plan_hdf, floodway_profile,
+            )
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            logger.warning(
+                "Could not extract encroachment stations from %s for profile %r: %s",
+                plan_hdf, floodway_profile, exc,
+            )
             return None
 
     @staticmethod
@@ -812,7 +685,7 @@ class CheckFloodways:
         - FW_EM_02: No encroachment method specified at XS
         - FW_EM_03: Encroachment method varies within reach
         - FW_EM_04: No encroachment at non-structure XS
-        - FW_EM_05: Method 5 (target surcharge) specific checks
+        - FW_EM_05: Method 5 (target WSE increase and maximum energy change) specific checks
         - FW_EM_06: Encroachment at structures special handling
         - FW_EM_07: Encroachment optimization warnings
         - FW_EM_08: Encroachment iteration limits
@@ -855,7 +728,9 @@ class CheckFloodways:
                 station = str(row.get('station', ''))
                 encr_l = row.get('encr_sta_l', np.nan)
                 encr_r = row.get('encr_sta_r', np.nan)
-                encr_method = row.get('encr_method', 0)
+                encr_method = row.get('encr_method')
+                if pd.isna(encr_method):
+                    encr_method = None
 
                 reach_key = (river, reach)
                 xs_key = (river, reach, station)
@@ -864,7 +739,7 @@ class CheckFloodways:
                 # Track methods for reach consistency check
                 if reach_key not in reach_methods:
                     reach_methods[reach_key] = set()
-                if encr_method > 0:
+                if encr_method is not None and encr_method > 0:
                     reach_methods[reach_key].add(encr_method)
 
                 # FW_EM_01: Method 1 (Fixed encroachment stations) used
@@ -903,7 +778,7 @@ class CheckFloodways:
                 # FW_EM_04: No encroachment at non-structure XS
                 if not is_structure:
                     has_encr = not (pd.isna(encr_l) and pd.isna(encr_r))
-                    if not has_encr and encr_method == 0:
+                    if not has_encr and encr_method in (None, 0):
                         msg = CheckMessage(
                             message_id="FW_EM_04",
                             severity=Severity.WARNING,
@@ -917,9 +792,8 @@ class CheckFloodways:
                         )
                         messages.append(msg)
 
-                # FW_EM_05: Method 5 (target surcharge) specific check
+                # FW_EM_05: Method 5 (target WSE increase and maximum energy change) specific check
                 if encr_method == 5:
-                    target_surcharge = encr_params.get('target_surcharge', 1.0) if encr_params else 1.0
                     msg = CheckMessage(
                         message_id="FW_EM_05",
                         severity=Severity.INFO,
@@ -927,14 +801,14 @@ class CheckFloodways:
                         river=river,
                         reach=reach,
                         station=station,
-                        message=format_message("FW_EM_05", station=station, target=f"{target_surcharge:.2f}"),
+                        message=format_message("FW_EM_05", station=station),
                         help_text=get_help_text("FW_EM_05"),
-                        value=target_surcharge
+                        value=float(encr_method)
                     )
                     messages.append(msg)
 
                 # FW_EM_06: Encroachment at structure requires special handling
-                if is_structure and encr_method > 0:
+                if is_structure and encr_method is not None and encr_method > 0:
                     msg = CheckMessage(
                         message_id="FW_EM_06",
                         severity=Severity.WARNING,
@@ -996,13 +870,13 @@ class CheckFloodways:
                     messages.append(msg)
 
             # FW_EM_08: Check iteration limits from encroachment parameters
-            if encr_params:
-                max_iterations = encr_params.get('max_iterations', 20)
+            if encr_params and any(5 in methods for methods in reach_methods.values()):
+                max_iterations = encr_params.get('max_iterations')
                 # Standard default is 20; flag if less than 10
-                if max_iterations < 10:
+                if max_iterations is not None and max_iterations < 10:
                     # Get a representative station for the message
                     if not encr_data.empty:
-                        sample_row = encr_data.iloc[0]
+                        sample_row = encr_data[encr_data["encr_method"] == 5].iloc[0]
                         msg = CheckMessage(
                             message_id="FW_EM_08",
                             severity=Severity.WARNING,
@@ -1018,9 +892,107 @@ class CheckFloodways:
                         messages.append(msg)
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not check encroachment methods: {e}")
 
         return messages
+
+    # ------------------------------------------------------------------
+    # Plan (.p##) and steady flow (.f##) text inputs of a plan HDF
+    # ------------------------------------------------------------------
+
+    _PLAN_INFORMATION = "Plan Data/Plan Information"
+
+    @staticmethod
+    def _sibling_file(folder: Path, name: Optional[str]) -> Optional[Path]:
+        """``folder/name`` matched case-insensitively (HEC-RAS mixes ``.F01``/``.f01``)."""
+        if not name:
+            return None
+        exact = folder / name
+        if exact.is_file():
+            return exact
+        wanted = name.lower()
+        try:
+            for candidate in folder.iterdir():
+                if candidate.name.lower() == wanted and candidate.is_file():
+                    return candidate
+        except OSError:
+            return None
+        return None
+
+    @staticmethod
+    def _plan_info_names(plan_hdf: Path) -> Dict[str, Optional[str]]:
+        """``Plan Filename`` and ``Flow Filename`` from the plan HDF's Plan Information."""
+        names: Dict[str, Optional[str]] = {"Plan Filename": None, "Flow Filename": None}
+        with h5py.File(plan_hdf, 'r') as hdf:
+            info = hdf.get(CheckFloodways._PLAN_INFORMATION)
+            if info is None:
+                return names
+            for key in names:
+                if key in info.attrs:
+                    value = read_attr(info, key)
+                    if isinstance(value, (bytes, np.bytes_)):
+                        value = bytes(value).decode('utf-8', 'replace')
+                    names[key] = str(value).strip() or None
+        return names
+
+    @staticmethod
+    def _plan_text_inputs(plan_hdf: Path) -> Dict[str, Optional[Path]]:
+        """Locate the plan and steady flow text files of ``plan_hdf`` in its folder.
+
+        The plan file is ``Plan Information/Plan Filename`` (else the HDF name
+        without ``.hdf``); the flow file is ``Plan Information/Flow Filename``
+        (else the plan file's ``Flow File=f##`` with the plan's project name).
+        A missing or non-steady file is ``None``; nothing is substituted.
+        """
+        plan_hdf = Path(plan_hdf)
+        folder = plan_hdf.parent
+        names = CheckFloodways._plan_info_names(plan_hdf)
+        plan_name = names["Plan Filename"]
+        if plan_name is None and plan_hdf.name.lower().endswith('.hdf'):
+            plan_name = plan_hdf.name[:-4]
+        plan_path = CheckFloodways._sibling_file(folder, plan_name)
+
+        flow_name = names["Flow Filename"]
+        if flow_name is None and plan_path is not None:
+            with open(plan_path, 'r', encoding='utf-8', errors='replace') as plan_file:
+                for line in plan_file:
+                    if line.startswith('Flow File='):
+                        flow_name = f"{plan_path.name.rsplit('.', 1)[0]}.{line.split('=', 1)[1].strip()}"
+                        break
+        flow_path = None
+        if flow_name and re.fullmatch(r'.+\.f\d\d', flow_name, flags=re.IGNORECASE):
+            flow_path = CheckFloodways._sibling_file(folder, flow_name)
+        return {"plan": plan_path, "flow": flow_path}
+
+    @staticmethod
+    def _profile_number(profile_names: List[str], profile: str) -> Optional[int]:
+        """1-based steady profile number of ``profile`` (exact name, surrounding blanks ignored)."""
+        wanted = str(profile).strip()
+        matches = [i + 1 for i, name in enumerate(profile_names) if name.strip() == wanted]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _downstream_boundaries(flow_data: Dict, profile_number: int) -> Dict[tuple, Dict]:
+        """``{(river, reach): {"type", "known_ws", "slope"}}`` downstream boundaries of one profile."""
+        out: Dict[tuple, Dict] = {}
+        for block in flow_data.get('boundaries', []):
+            spec = block.get('downstream') or {}
+            key = (block.get('river'), block.get('reach'))
+            if 'profile' in block:
+                if block['profile'] != profile_number:
+                    continue
+                values = {k: spec.get(k) for k in ('known_ws', 'slope')}
+            else:
+                # Legacy "Boundary for River Rch & RM=" blocks list one value per profile.
+                values = {}
+                for k in ('known_ws', 'slope'):
+                    value = spec.get(k)
+                    if isinstance(value, list):
+                        value = value[profile_number - 1] if profile_number <= len(value) else None
+                    values[k] = value
+            out[key] = {"type": spec.get('type', 0), **values}
+        return out
 
     @staticmethod
     def _get_encroachment_parameters(
@@ -1028,53 +1000,71 @@ class CheckFloodways:
         floodway_profile: str
     ) -> Optional[Dict]:
         """
-        Extract encroachment parameters from plan HDF file.
+        Encroachment parameters of the floodway profile from the plan file.
+
+        HEC-RAS writes no encroachment input to the plan HDF. The records are
+        the ``Encroach Param``/``Encroach Node`` lines of the plan (``.p##``)
+        file, read with :meth:`RasFloodway.parse_encroachments`; the floodway
+        profile name is numbered from the steady flow file's ``Profile Names``.
+        Both files are located from the plan HDF (see ``_plan_text_inputs``).
 
         Args:
             plan_hdf: Path to plan HDF file
             floodway_profile: Name of floodway profile
 
         Returns:
-            Dictionary with encroachment parameters (target_surcharge, max_iterations, etc.)
-            or None if not found
+            ``None`` when the plan or flow file is missing, the profile name is
+            not in the flow file, or the plan has no encroachment record for
+            that profile. Otherwise a dict with ``profile_number``,
+            ``methods`` (sorted encroachment methods used), ``target_surcharge``
+            (only when every Method 4/5 node of the profile has a target and
+            all targets are equal), ``targets_complete`` (False when any
+            Method 4/5 node has a blank target), ``nodes_missing_target``
+            (``river``/``reach``/``node``/``method`` of those nodes),
+            ``encroach_param`` (the raw ``Encroach Param`` header from
+            :meth:`RasFloodway.get_encroach_param`) and ``plan_file``.
+            ``max_iterations`` and ``tolerance`` are not filled: no documented
+            plan-file field holds them.
         """
+        from ..RasFloodway import RasFloodway
+        from ..RasSteady import RasSteady
+
         try:
-            with h5py.File(plan_hdf, 'r') as hdf:
-                # Try multiple possible paths for encroachment parameters
-                param_paths = [
-                    'Plan Data/Encroachment Data',
-                    'Event Conditions/Steady Flow/Encroachment Data',
-                    'Plan Data/Plan Parameters/Encroachment'
-                ]
-
-                for path in param_paths:
-                    if path in hdf:
-                        param_group = hdf[path]
-                        params = {}
-
-                        # Extract target surcharge
-                        if 'Target Surcharge' in param_group.attrs:
-                            params['target_surcharge'] = float(param_group.attrs['Target Surcharge'])
-                        elif 'Target Surcharge' in param_group:
-                            params['target_surcharge'] = float(param_group['Target Surcharge'][()])
-
-                        # Extract max iterations
-                        if 'Max Iterations' in param_group.attrs:
-                            params['max_iterations'] = int(param_group.attrs['Max Iterations'])
-                        elif 'Maximum Iterations' in param_group.attrs:
-                            params['max_iterations'] = int(param_group.attrs['Maximum Iterations'])
-
-                        # Extract tolerance
-                        if 'Tolerance' in param_group.attrs:
-                            params['tolerance'] = float(param_group.attrs['Tolerance'])
-
-                        if params:
-                            return params
-
-                # Default values if not found
-                return {'target_surcharge': 1.0, 'max_iterations': 20, 'tolerance': 0.01}
+            inputs = CheckFloodways._plan_text_inputs(plan_hdf)
+            if inputs["plan"] is None or inputs["flow"] is None:
+                logger.debug("Encroachment parameters unavailable: plan/flow text file not found for %s",
+                             Path(plan_hdf).name)
+                return None
+            names = RasSteady.read_flow_file(inputs["flow"]).get('profile_names', [])
+            number = CheckFloodways._profile_number(names, floodway_profile)
+            if number is None:
+                return None
+            records = RasFloodway.parse_encroachments(inputs["plan"])
+            records = records[records['profile_number'] == number]
+            methods = sorted({int(m) for m in records['method'].dropna()})
+            if not methods:
+                return None
+            params = {
+                'profile_number': number,
+                'methods': methods,
+                'encroach_param': RasFloodway.get_encroach_param(inputs["plan"]),
+                'plan_file': inputs["plan"].name,
+            }
+            targeted = records[records['method'].isin([4, 5])]
+            missing = targeted[targeted['target_surcharge'].isna()]
+            params['nodes_missing_target'] = [
+                {'river': r['river'], 'reach': r['reach'], 'node': r['node'], 'method': int(r['method'])}
+                for _, r in missing.iterrows()
+            ]
+            params['targets_complete'] = missing.empty
+            targets = set(targeted['target_surcharge'].dropna())
+            # A blank target is unknown, not "the same as the others": no aggregate then.
+            if missing.empty and len(targets) == 1:
+                params['target_surcharge'] = float(targets.pop())
+            return params
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not extract encroachment parameters: {e}")
             return None
 
@@ -1088,10 +1078,19 @@ class CheckFloodways:
         """
         Check boundary conditions for floodway analysis.
 
+        HEC-RAS writes no steady boundary conditions to the plan HDF. They are
+        read from the steady flow (``.f##``) file located from the plan HDF
+        (``Plan Information/Flow Filename``) with
+        :meth:`RasSteady.read_flow_file`; profile names are numbered from that
+        file's ``Profile Names``. Downstream (``Dn``) boundaries are compared
+        per river/reach. No message is produced when the flow file or either
+        profile name is missing.
+
         Validates:
-        - FW_BC_01: Different starting WSE between base and floodway
-        - FW_BC_02: Same slope boundary used
-        - FW_BC_03: Known WSE boundary used
+        - FW_BC_01: Floodway Known WS differs from the base profile's Known WS
+          (INFO; value = floodway minus base)
+        - FW_BC_02: Floodway and base use Normal Depth with the same slope
+        - FW_BC_03: Floodway profile uses a Known WS boundary
 
         Args:
             plan_hdf: Path to plan HDF file
@@ -1102,62 +1101,69 @@ class CheckFloodways:
         Returns:
             List of CheckMessage objects for boundary condition issues
         """
+        from ..RasSteady import RasSteady
+
         messages = []
 
         try:
-            with h5py.File(plan_hdf, 'r') as hdf:
-                # Try to find boundary condition data
-                bc_paths = [
-                    'Plan Data/Plan Information/Boundary Conditions',
-                    'Event Conditions/Steady Flow/Boundary Conditions',
-                    'Plan Data/Boundary Conditions'
-                ]
+            flow_path = CheckFloodways._plan_text_inputs(plan_hdf)["flow"]
+            if flow_path is None:
+                logger.debug("Floodway boundary check skipped: no steady flow file for %s",
+                             Path(plan_hdf).name)
+                return messages
+            data = RasSteady.read_flow_file(flow_path)
+            names = data.get('profile_names', [])
+            base_number = CheckFloodways._profile_number(names, base_profile)
+            fw_number = CheckFloodways._profile_number(names, floodway_profile)
+            if base_number is None or fw_number is None:
+                return messages
+            base = CheckFloodways._downstream_boundaries(data, base_number)
+            floodway = CheckFloodways._downstream_boundaries(data, fw_number)
 
-                bc_data = None
-                for path in bc_paths:
-                    if path in hdf:
-                        bc_data = hdf[path]
-                        break
-
-                if bc_data is None:
-                    return messages
-
-                # Try to extract boundary condition type
-                bc_type = None
-                if 'Type' in bc_data.attrs:
-                    bc_type = bc_data.attrs['Type']
-                    if isinstance(bc_type, bytes):
-                        bc_type = bc_type.decode('utf-8')
-
-                # FW_BC_02: Same slope boundary
-                if bc_type and 'slope' in str(bc_type).lower():
-                    msg = CheckMessage(
-                        message_id="FW_BC_02",
-                        severity=Severity.INFO,
-                        check_type="FLOODWAY",
-                        river="",
-                        reach="",
-                        station="",
-                        message=get_message_template("FW_BC_02"),
-                        help_text=get_help_text("FW_BC_02")
-                    )
-                    messages.append(msg)
-
-                # FW_BC_03: Known WSE boundary
-                if bc_type and ('wse' in str(bc_type).lower() or 'known' in str(bc_type).lower()):
-                    msg = CheckMessage(
+            for (river, reach), fw_bc in floodway.items():
+                base_bc = base.get((river, reach), {})
+                if fw_bc['type'] == RasSteady.KNOWN_WS and fw_bc['known_ws'] is not None:
+                    if base_bc.get('type') == RasSteady.KNOWN_WS and base_bc.get('known_ws') is not None \
+                            and base_bc['known_ws'] != fw_bc['known_ws']:
+                        messages.append(CheckMessage(
+                            message_id="FW_BC_01",
+                            severity=Severity.INFO,
+                            check_type="FLOODWAY",
+                            river=river,
+                            reach=reach,
+                            station="",
+                            message=get_message_template("FW_BC_01"),
+                            help_text=get_help_text("FW_BC_01"),
+                            value=float(fw_bc['known_ws']) - float(base_bc['known_ws'])
+                        ))
+                    messages.append(CheckMessage(
                         message_id="FW_BC_03",
                         severity=Severity.INFO,
                         check_type="FLOODWAY",
-                        river="",
-                        reach="",
+                        river=river,
+                        reach=reach,
                         station="",
                         message=get_message_template("FW_BC_03"),
-                        help_text=get_help_text("FW_BC_03")
-                    )
-                    messages.append(msg)
+                        help_text=get_help_text("FW_BC_03"),
+                        value=float(fw_bc['known_ws'])
+                    ))
+                elif (fw_bc['type'] == RasSteady.NORMAL_DEPTH and fw_bc['slope'] is not None
+                        and base_bc.get('type') == RasSteady.NORMAL_DEPTH
+                        and base_bc.get('slope') == fw_bc['slope']):
+                    messages.append(CheckMessage(
+                        message_id="FW_BC_02",
+                        severity=Severity.INFO,
+                        check_type="FLOODWAY",
+                        river=river,
+                        reach=reach,
+                        station="",
+                        message=get_message_template("FW_BC_02"),
+                        help_text=get_help_text("FW_BC_02"),
+                        value=float(fw_bc['slope'])
+                    ))
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not check boundary conditions: {e}")
 
         return messages
@@ -1182,12 +1188,12 @@ class CheckFloodways:
         - FW_SW_05: Starting WSE inconsistent between profiles
         - FW_SW_06: Starting WSE produces supercritical flow
         - FW_SW_07: Starting WSE results in negative depth
-        - FW_SW_08: Starting WSE differs significantly from computed WSE
+        - FW_SW_08: Base/floodway WSE-drop difference over first two sorted sections
 
         Method-Specific Variants (added for encroachment method-specific validation):
         - FW_SW_02M1: Starting WSE difference - Method 1 (fixed stations) specific
         - FW_SW_02M4: Starting WSE difference - Method 4 (target surcharge) specific
-        - FW_SW_02M5: Starting WSE difference - Method 5 (target width reduction) specific
+        - FW_SW_02M5: Starting WSE difference - Method 5 (target WSE increase and maximum energy change) specific
         - FW_SW_03M1: Starting WSE below invert - Method 1 variant
         - FW_SW_03M4: Starting WSE below invert - Method 4 variant
         - FW_SW_04M1: Starting WSE above bank - Method 1 variant
@@ -1199,8 +1205,8 @@ class CheckFloodways:
         - Method 1: Fixed encroachment stations
         - Method 2: Fixed top widths
         - Method 3: Fixed percentage of conveyance reduction
-        - Method 4: Target surcharge (most common for FEMA)
-        - Method 5: Target width reduction
+        - Method 4: Target WSE increase
+        - Method 5: Target WSE increase and maximum energy change
 
         Args:
             plan_hdf: Path to plan HDF file (needed for encroachment method detection)
@@ -1233,8 +1239,6 @@ class CheckFloodways:
 
             # Get encroachment method data for method-specific checks
             encr_data = CheckFloodways._get_encroachment_stations(plan_hdf, floodway_profile)
-            encr_params = CheckFloodways._get_encroachment_parameters(plan_hdf, floodway_profile)
-
             # Build a lookup for encroachment methods by station
             encr_method_by_station = {}
             if encr_data is not None and not encr_data.empty:
@@ -1242,15 +1246,12 @@ class CheckFloodways:
                     key = (row.get('river', ''), row.get('reach', ''), str(row.get('station', '')))
                     encr_method_by_station[key] = row.get('encr_method', 0)
 
-            # Get target values from encroachment parameters
-            target_surcharge = encr_params.get('target_surcharge', 1.0) if encr_params else 1.0
-            target_width_reduction_pct = encr_params.get('target_width_reduction', 50.0) if encr_params else 50.0
-
             # Try to get cross section geometry for bank elevations
             xs_gdf = None
             try:
                 xs_gdf = HdfXsec.get_cross_sections(geom_hdf)
             except Exception as e:
+                reraise_required(e)
                 logger.debug(f"Could not read cross section geometry: {e}")
 
             # Find downstream boundary (lowest station in each reach)
@@ -1400,15 +1401,14 @@ class CheckFloodways:
                                 station=station,
                                 message=format_message("FW_SW_02M4",
                                     diff=f"{wse_diff:.2f}",
-                                    station=station,
-                                    target=f"{target_surcharge:.2f}"),
+                                    station=station),
                                 help_text=get_help_text("FW_SW_02M4"),
                                 value=wse_diff,
                                 threshold=threshold
                             )
                             messages.append(msg)
 
-                        # FW_SW_02M5: Method 5 (target width reduction) specific
+                        # FW_SW_02M5: Method 5 (target WSE increase and maximum energy change) specific
                         elif encr_method == 5:
                             msg = CheckMessage(
                                 message_id="FW_SW_02M5",
@@ -1419,8 +1419,7 @@ class CheckFloodways:
                                 station=station,
                                 message=format_message("FW_SW_02M5",
                                     diff=f"{wse_diff:.2f}",
-                                    station=station,
-                                    target_pct=f"{target_width_reduction_pct:.0f}"),
+                                    station=station),
                                 help_text=get_help_text("FW_SW_02M5"),
                                 value=wse_diff,
                                 threshold=threshold
@@ -1760,9 +1759,12 @@ class CheckFloodways:
                                     messages.append(msg)
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not check starting WSE: {e}")
 
         return messages
+
+    _STEADY_PROFILES = "Results/Steady/Output/Output Blocks/Base Output/Steady Profiles"
 
     @staticmethod
     def _check_floodway_lateral_weirs(
@@ -1774,9 +1776,22 @@ class CheckFloodways:
         """
         Check lateral weirs for floodway analysis.
 
+        Lateral structures are the ``Type == "Lateral"`` rows of the geometry
+        HDF's ``Geometry/Structures/Attributes``. Their steady results are
+        ``Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/
+        Lateral Structures/<River> <Reach> <RS>/Structure Variables`` in the
+        plan HDF (one row per profile; columns named by its ``Variable_Unit``
+        attribute; written by HEC-RAS 6.6 and 7.0.1).
+
         Validates:
-        - FW_LW_01: Lateral weir active in floodway profile
-        - FW_LW_02: Lateral weir flow exceeds 5% of main channel
+        - FW_LW_01: Lateral weir present (one message per lateral structure)
+        - FW_LW_02: ``Total Flow`` of the lateral structure exceeds 5% of the
+          river flow at its upstream end (``Flow HW US``) in the floodway
+          profile
+
+        FW_LW_02 is not evaluated for a structure whose result group or one of
+        those two columns is absent, when the floodway profile is not in the
+        plan's ``Profile Names``, or when ``Flow HW US`` is not positive.
 
         Args:
             plan_hdf: Path to plan HDF file
@@ -1789,99 +1804,82 @@ class CheckFloodways:
         """
         messages = []
 
+        def text(value):
+            if isinstance(value, (bytes, np.bytes_)):
+                value = bytes(value).decode('utf-8', 'replace')
+            return str(value).strip()
+
         try:
-            # Get lateral structure data from geometry HDF
             with h5py.File(geom_hdf, 'r') as hdf:
-                lat_path = 'Geometry/Lateral Structures/Attributes'
-                if lat_path not in hdf:
+                attrs_path = 'Geometry/Structures/Attributes'
+                if attrs_path not in hdf:
                     return messages
+                rows = read_typed(hdf[attrs_path], slice(None))
+                laterals = [(text(r['River']), text(r['Reach']), text(r['RS']))
+                            for r in rows if text(r['Type']) == 'Lateral']
 
-                lat_attrs = hdf[lat_path][:]
+            for river, reach, station in laterals:
+                # FW_LW_01: Lateral weir is present (may be active)
+                messages.append(CheckMessage(
+                    message_id="FW_LW_01",
+                    severity=Severity.WARNING,
+                    check_type="FLOODWAY",
+                    river=river,
+                    reach=reach,
+                    station=station,
+                    message=format_message("FW_LW_01", sta=station),
+                    help_text=get_help_text("FW_LW_01")
+                ))
+            if not laterals:
+                return messages
 
-                for attr in lat_attrs:
-                    river = attr['River'].decode('utf-8').strip() if isinstance(attr['River'], bytes) else str(attr['River']).strip()
-                    reach = attr['Reach'].decode('utf-8').strip() if isinstance(attr['Reach'], bytes) else str(attr['Reach']).strip()
-                    station = attr['RS'].decode('utf-8').strip() if isinstance(attr['RS'], bytes) else str(attr['RS']).strip()
-
-                    # FW_LW_01: Lateral weir is present (may be active)
-                    msg = CheckMessage(
-                        message_id="FW_LW_01",
-                        severity=Severity.WARNING,
-                        check_type="FLOODWAY",
-                        river=river,
-                        reach=reach,
-                        station=station,
-                        message=format_message("FW_LW_01", sta=station),
-                        help_text=get_help_text("FW_LW_01")
-                    )
-                    messages.append(msg)
-
-            # Check for lateral weir flow from plan results
+            base = CheckFloodways._STEADY_PROFILES
             with h5py.File(plan_hdf, 'r') as hdf:
-                # Try to find lateral structure flow data
-                lat_flow_paths = [
-                    'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Lateral Structures/Flow',
-                    'Results/Steady/Output/Lateral Structures/Flow'
-                ]
+                names_path = f'{base}/Profile Names'
+                if names_path not in hdf or f'{base}/Lateral Structures' not in hdf:
+                    return messages
+                names = [text(n) for n in read_typed(hdf[names_path], slice(None))]
+                matches = [i for i, name in enumerate(names) if name == str(floodway_profile).strip()]
+                if len(matches) != 1:
+                    return messages
+                profile_idx = matches[0]
 
-                for lat_flow_path in lat_flow_paths:
-                    if lat_flow_path not in hdf:
+                for river, reach, station in laterals:
+                    variables_path = f'{base}/Lateral Structures/{river} {reach} {station}/Structure Variables'
+                    if variables_path not in hdf:
+                        logger.debug("No steady lateral-structure results at %s", variables_path)
                         continue
-
-                    lat_flow = hdf[lat_flow_path][:]
-
-                    # Get profile names to find floodway profile index
-                    profile_path = 'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Profile Names'
-                    profile_idx = 0
-                    if profile_path in hdf:
-                        profile_names = hdf[profile_path][:]
-                        for i, name in enumerate(profile_names):
-                            name_str = name.decode('utf-8').strip() if isinstance(name, bytes) else str(name).strip()
-                            if name_str == floodway_profile:
-                                profile_idx = i
-                                break
-
-                    # Get main channel flow for comparison
-                    xs_flow_path = 'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Cross Sections/Flow'
-                    main_channel_flows = None
-                    if xs_flow_path in hdf:
-                        main_channel_flows = hdf[xs_flow_path][:]
-
-                    # Check lateral weir flow percentages
-                    for i, lat_f in enumerate(lat_flow):
-                        if lat_flow.ndim == 2:
-                            flow_val = float(lat_f[profile_idx]) if profile_idx < lat_f.shape[0] else 0
-                        else:
-                            flow_val = float(lat_f) if not np.isnan(lat_f) else 0
-
-                        if flow_val > 0 and main_channel_flows is not None:
-                            # Compare to nearby main channel flow
-                            if i < len(main_channel_flows):
-                                if main_channel_flows.ndim == 2:
-                                    mc_flow = float(main_channel_flows[i, profile_idx]) if profile_idx < main_channel_flows.shape[1] else 0
-                                else:
-                                    mc_flow = float(main_channel_flows[i])
-
-                                if mc_flow > 0:
-                                    pct = flow_val / mc_flow * 100
-                                    if pct > 5.0:
-                                        # FW_LW_02: Significant lateral weir flow
-                                        msg = CheckMessage(
-                                            message_id="FW_LW_02",
-                                            severity=Severity.WARNING,
-                                            check_type="FLOODWAY",
-                                            river="",
-                                            reach="",
-                                            station=str(i),
-                                            message=format_message("FW_LW_02", sta=str(i)),
-                                            help_text=get_help_text("FW_LW_02"),
-                                            value=pct,
-                                            threshold=5.0
-                                        )
-                                        messages.append(msg)
-                    break
+                    dataset = hdf[variables_path]
+                    if 'Variable_Unit' not in dataset.attrs:
+                        continue
+                    columns = [text(row[0]) for row in read_attr(dataset, 'Variable_Unit')]
+                    if 'Total Flow' not in columns or 'Flow HW US' not in columns:
+                        continue
+                    values = read_typed(dataset, slice(None))
+                    if values.ndim != 2 or profile_idx >= values.shape[0]:
+                        continue
+                    lateral_flow = float(values[profile_idx, columns.index('Total Flow')])
+                    river_flow = float(values[profile_idx, columns.index('Flow HW US')])
+                    if not (np.isfinite(lateral_flow) and np.isfinite(river_flow)) or river_flow <= 0:
+                        continue
+                    pct = abs(lateral_flow) / river_flow * 100
+                    if pct > 5.0:
+                        # FW_LW_02: Significant lateral weir flow
+                        messages.append(CheckMessage(
+                            message_id="FW_LW_02",
+                            severity=Severity.WARNING,
+                            check_type="FLOODWAY",
+                            river=river,
+                            reach=reach,
+                            station=station,
+                            message=format_message("FW_LW_02", sta=station),
+                            help_text=get_help_text("FW_LW_02"),
+                            value=pct,
+                            threshold=5.0
+                        ))
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not check lateral weirs: {e}")
 
         return messages
@@ -1951,16 +1949,16 @@ class CheckFloodways:
                 if 'Geometry/Structures/Attributes' not in hdf:
                     return messages
 
-                struct_attrs = hdf['Geometry/Structures/Attributes'][:]
+                struct_attrs = read_typed(hdf['Geometry/Structures/Attributes'], slice(None))
                 attr_names = struct_attrs.dtype.names
 
                 # Try to get table info and pier data
                 table_info = None
                 pier_data = None
                 if 'Geometry/Structures/Table Info' in hdf:
-                    table_info = hdf['Geometry/Structures/Table Info'][:]
+                    table_info = read_typed(hdf['Geometry/Structures/Table Info'], slice(None))
                 if 'Geometry/Structures/Pier Data' in hdf:
-                    pier_data = hdf['Geometry/Structures/Pier Data'][:]
+                    pier_data = read_typed(hdf['Geometry/Structures/Pier Data'], slice(None))
 
                 # Process each structure
                 for struct_idx, attr in enumerate(struct_attrs):
@@ -2455,7 +2453,7 @@ class CheckFloodways:
                         area_path = 'Results/Steady/Output/Cross Sections/Flow Area'
 
                     if area_path in plan_h:
-                        area_data = plan_h[area_path][:]
+                        area_data = read_typed(plan_h[area_path], slice(None))
 
                         # Get profile indices
                         profile_path = 'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles/Profile Names'
@@ -2465,7 +2463,7 @@ class CheckFloodways:
                         base_idx = -1
                         fw_idx = -1
                         if profile_path in plan_h:
-                            profile_names = plan_h[profile_path][:]
+                            profile_names = read_typed(plan_h[profile_path], slice(None))
                             for i, name in enumerate(profile_names):
                                 name_str = name.decode('utf-8').strip() if isinstance(name, bytes) else str(name).strip()
                                 if name_str == base_profile:
@@ -2477,9 +2475,9 @@ class CheckFloodways:
                             # Get structure attributes for matching
                             with h5py.File(geom_hdf, 'r') as geom_h:
                                 if 'Geometry/Structures/Attributes' in geom_h:
-                                    struct_attrs = geom_h['Geometry/Structures/Attributes'][:]
+                                    struct_attrs = read_typed(geom_h['Geometry/Structures/Attributes'], slice(None))
                                     xs_attrs_path = 'Geometry/Cross Sections/Attributes'
-                                    xs_attrs = geom_h[xs_attrs_path][:] if xs_attrs_path in geom_h else None
+                                    xs_attrs = read_typed(geom_h[xs_attrs_path], slice(None)) if xs_attrs_path in geom_h else None
 
                                     for struct_idx, attr in enumerate(struct_attrs):
                                         struct_type = attr['Type'].decode('utf-8').strip() if isinstance(attr['Type'], bytes) else str(attr['Type']).strip()
@@ -2530,9 +2528,12 @@ class CheckFloodways:
                                                     break
 
             except Exception as e:
+                reraise_required(e)
                 logger.debug(f"Could not check flow area reduction at structures: {e}")
 
         except Exception as e:
-            logger.warning(f"Could not check structure floodway encroachments: {e}")
+            reraise_required(e)
+            logger.warning("Could not check structure floodway encroachments")
+            logger.debug("Structure floodway encroachment check failure: %s", e)
 
         return messages

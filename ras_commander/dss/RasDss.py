@@ -17,6 +17,15 @@ Functions:
         Returns a list of all data pathnames in a DSS file.
     read_timeseries(dss_file, pathname, start_date=None, end_date=None):
         Reads a DSS time series by pathname and returns it as a pandas DataFrame.
+    read_grid(dss_file, pathname, *, allow_unqualified_native=False):
+        Reads one exact DSS spatial grid record and its metadata.
+    read_paired_data(dss_file, pathname, *, ignore_d_part=True, dtype="stored"):
+        Reads one paired-data record (every curve, labels, units, types,
+        stored precision) as a DataFrame.
+    get_file_version(dss_file):
+        Returns the major DSS version (6 or 7).
+    get_capabilities():
+        Returns the per-backend support matrix.
     read_multiple_timeseries(dss_file, pathnames):
         Reads multiple DSS time series, returning a dict of pathname to DataFrame
         (or None on failure).
@@ -28,9 +37,23 @@ Functions:
         DataFrame and appends results as a new column.
     write_grid_timeseries(dss_file, pathname, data, times, grid_info):
         Writes spatial grid records such as SHG gridded precipitation to DSS.
+    copy_grid_with_zero_tail(source_dss, output_dss, pathname, tail_intervals):
+        Rewrites one validated grid family to an atomic derivative and appends
+        explicit zero-valued intervals while preserving NoData cells.
     shutdown_jvm():
         Placeholder for JVM lifecycle management (not typically required with
-        pyjnius).
+        pyjnius). Deprecated no-op under the native backend.
+
+Backends:
+    Read methods (``get_catalog``, ``read_timeseries``,
+    ``read_multiple_timeseries``, ``read_paired_data``, ``get_file_version``
+    and everything built on them) use ``RasDss.backend``: ``"java"``
+    (default), ``"native"`` (optional dss-commander package, no JVM) or
+    ``"shadow"`` (native result, Java cross-check, differences logged). The
+    environment variable ``RAS_COMMANDER_DSS_BACKEND`` overrides the
+    attribute when set. ``read_grid`` under ``"native"`` requires
+    ``allow_unqualified_native=True`` until the native grid CRS is qualified.
+    Writes stay on Java under every backend.
 
 Lazy Loading:
     This module implements lazy loading for all heavy dependencies:
@@ -43,18 +66,26 @@ Lazy Loading:
     use DSS functionality don't pay the cost of loading Java/pyjnius.
 """
 
-import sys
-import os
-from pathlib import Path
-from typing import Any, List, Dict, Optional, Tuple, Union
 import logging
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+from math import isfinite
+from numbers import Real
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from uuid import uuid4
 
 # Lazy imports - these are always needed for type hints and basic operations
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 # Import decorator from parent package
 from ..Decorators import log_call
+from . import _backend, _errors
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +107,149 @@ class RasDss:
 
         # Get catalog
         paths = RasDss.get_catalog("file.dss")
+
+    Backends:
+        ``RasDss.backend`` selects how read methods access DSS files:
+        ``"java"`` (default; HEC Monolith via pyjnius), ``"native"``
+        (dss-commander, no JVM) or ``"shadow"`` (native result plus a logged
+        Java cross-check). ``RAS_COMMANDER_DSS_BACKEND`` overrides it when set.
     """
 
     _jvm_configured = False
     _monolith = None
+
+    #: Read backend: "java" (default in this release), "native" or "shadow".
+    #: The environment variable RAS_COMMANDER_DSS_BACKEND overrides it when set.
+    backend = _backend.DEFAULT_BACKEND
+
+    @staticmethod
+    @log_call
+    def get_backend() -> str:
+        """Return the backend the next read call will use.
+
+        Resolution order: ``RAS_COMMANDER_DSS_BACKEND`` (when set), then
+        ``RasDss.backend``. ``"shadow"`` resolves to ``"java"`` when
+        dss-commander is not installed (one warning is logged).
+
+        Raises:
+            ValueError: If the configured name is not java, native or shadow.
+            ImportError: If ``"native"`` is selected and dss-commander is not
+                installed.
+        """
+        return _backend.effective_backend(RasDss.backend)
+
+    _WINDOWS_JAVA_ROOTS = (Path("C:/Program Files/Java"), Path("C:/Program Files (x86)/Java"))
+    _WINDOWS_HEC_ROOT = Path("C:/Program Files/HEC")
+    _POSIX_JAVA_ROOTS = (Path("/usr/lib/jvm"), Path("/usr/lib64/jvm"),
+                         Path("/usr/java"), Path("/opt/java"), Path("/opt"))
+    _MACOS_JAVA_ROOTS = (Path("/Library/Java/JavaVirtualMachines"),
+                         Path("/System/Library/Java/JavaVirtualMachines"))
+
+    @staticmethod
+    def _jvm_library_names(system: Optional[str] = None) -> tuple:
+        """Select platform library names without loading a JVM."""
+        system = system or sys.platform
+        if system.startswith("win"):
+            return ("jvm.dll",)
+        return ("libjvm.dylib",) if system == "darwin" else ("libjvm.so",)
+
+    @staticmethod
+    def _has_jvm_lib(java_dir: Path, system: Optional[str] = None) -> bool:
+        """Check library-file presence; this does not qualify runtime compatibility."""
+        try:
+            return any(path.is_file() for name in RasDss._jvm_library_names(system)
+                       for path in java_dir.rglob(name))
+        except OSError:
+            return False
+
+    @staticmethod
+    def _java_home_from_executable() -> Optional[Path]:
+        """Resolve PATH's Java symlink chain to its installation directory."""
+        import shutil
+        found = shutil.which("java")
+        if not found:
+            return None
+        try:
+            executable = Path(found).resolve()
+        except (OSError, RuntimeError):
+            return None
+        return executable.parent.parent if executable.parent.name.lower() == "bin" else executable.parent
+
+    @staticmethod
+    def _java_home_candidates(system: Optional[str] = None) -> List[Path]:
+        """Keep installed roots first on Windows and PATH first on POSIX."""
+        system = system or sys.platform
+        executable_home = RasDss._java_home_from_executable()
+        candidates = []
+        if executable_home is not None and not system.startswith("win"):
+            candidates.append(executable_home)
+        if system.startswith("win"):
+            for root in RasDss._WINDOWS_JAVA_ROOTS:
+                for pattern in ("jre*", "jdk*", "jdk-*"):
+                    candidates.extend(sorted(root.glob(pattern), reverse=True))
+            for pattern in ("*/*/jre", "**/jre"):
+                candidates.extend(sorted(RasDss._WINDOWS_HEC_ROOT.glob(pattern), reverse=True))
+            if executable_home is not None:
+                candidates.append(executable_home)
+        else:
+            if system == "darwin":
+                for root in RasDss._MACOS_JAVA_ROOTS:
+                    candidates.extend(bundle / "Contents" / "Home"
+                                      for bundle in sorted(root.glob("*"), reverse=True))
+            for root in RasDss._POSIX_JAVA_ROOTS:
+                # Avoid recursively scanning unrelated application trees under /opt.
+                patterns = ("java-*", "jdk*", "jre*", "temurin*") if root == Path("/opt") else ("*",)
+                for pattern in patterns:
+                    candidates.extend(sorted(root.glob(pattern), reverse=True))
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _discover_java_home(system: Optional[str] = None) -> Optional[Path]:
+        """Find the first directory containing this platform's JVM library file."""
+        for candidate in RasDss._java_home_candidates(system):
+            if candidate.is_dir() and RasDss._has_jvm_lib(candidate, system):
+                return candidate
+        return None
+
+    @staticmethod
+    @log_call
+    def get_capabilities() -> pd.DataFrame:
+        """Return what each backend supports for every public DSS operation.
+
+        Does not start a JVM or import dss-commander's engine beyond an import
+        check.
+
+        Returns:
+            DataFrame with one row per operation and columns ``operation``,
+            ``java``, ``native``, ``shadow`` and ``note``. Cell values:
+
+            - ``"yes"``: supported on that backend;
+            - ``"gated"``: needs a qualified engine or an explicit opt-in
+              (``read_grid`` under ``native``) and otherwise raises
+              ``DssCapabilityError``. ``attrs["native_grid_qualified"]``
+              tells whether the installed wheel already qualifies;
+            - ``"java"``: always runs on Java, whatever the backend;
+            - ``"no"``: not provided.
+
+            ``attrs``: ``requested_backend`` (``RasDss.backend`` or the
+            environment override), ``native_installed`` (bool) and
+            ``native_grid_qualified`` (bool).
+
+        Example:
+            caps = RasDss.get_capabilities().set_index("operation")
+            if caps.loc["read_paired_data", "native"] == "yes":
+                rating = RasDss.read_paired_data(dss_file, pathname)
+        """
+        df = pd.DataFrame(
+            list(_backend.CAPABILITIES),
+            columns=["operation", "java", "native", "shadow", "note"],
+        )
+        df.attrs = {
+            "requested_backend": _backend.requested_backend(RasDss.backend),
+            "native_installed": _backend.native_available(),
+            "native_grid_qualified": _backend.native_grid_qualified(),
+        }
+        return df
 
     @staticmethod
     def _ensure_monolith():
@@ -93,10 +263,10 @@ class RasDss:
         RasDss._monolith = HecMonolithDownloader()
 
         if not RasDss._monolith.is_installed():
-            print("\n" + "="*80)
-            print("HEC Monolith libraries not found")
-            print("Installing automatically (one-time download, ~20 MB)...")
-            print("="*80)
+            logger.info(
+                "Installing HEC Monolith libraries for DSS operations "
+                "(one-time download, ~20 MB)"
+            )
             RasDss._monolith.install()
 
         return RasDss._monolith
@@ -130,48 +300,23 @@ class RasDss:
         classpath = monolith.get_classpath()
         library_path = monolith.get_library_path()
 
-        print("Configuring Java VM for DSS operations...")
+        logger.debug("Configuring Java VM for DSS operations")
 
-        # Set JAVA_HOME if not already set
+        # Honor explicit JAVA_HOME; auto-discover only when it is absent.
         if 'JAVA_HOME' not in os.environ:
-            # Dynamically discover Java installations using glob patterns.
-            # Search standard Java install locations plus HEC application bundles.
-            java_search_roots = [
-                Path("C:/Program Files/Java"),
-                Path("C:/Program Files (x86)/Java"),
-            ]
-            java_candidates = []
-            for root in java_search_roots:
-                if root.exists():
-                    # Collect all jre* and jdk* directories, sorted newest first
-                    java_candidates.extend(sorted(root.glob("jre*"), reverse=True))
-                    java_candidates.extend(sorted(root.glob("jdk*"), reverse=True))
-                    java_candidates.extend(sorted(root.glob("jdk-*"), reverse=True))
-
-            # Also check JREs bundled with HEC applications (HMS, RAS, etc.)
-            hec_apps = Path("C:/Program Files/HEC")
-            if hec_apps.exists():
-                java_candidates.extend(sorted(hec_apps.glob("*/*/jre"), reverse=True))
-                java_candidates.extend(sorted(hec_apps.glob("**/jre"), reverse=True))
-
-            def _has_jvm_lib(java_dir: Path) -> bool:
-                """Check that a Java directory contains a usable JVM library."""
-                if os.name == 'nt':
-                    return bool(list(java_dir.rglob("jvm.dll")))
-                else:
-                    return bool(list(java_dir.rglob("libjvm.so")))
-
-            for java_home in java_candidates:
-                if java_home.is_dir() and _has_jvm_lib(java_home):
-                    os.environ['JAVA_HOME'] = str(java_home)
-                    print(f"  Found Java: {java_home}")
-                    break
-            else:
+            java_home = RasDss._discover_java_home()
+            if java_home is None:
+                roots = (RasDss._WINDOWS_JAVA_ROOTS + (RasDss._WINDOWS_HEC_ROOT,)
+                         if sys.platform.startswith("win") else
+                         RasDss._MACOS_JAVA_ROOTS + RasDss._POSIX_JAVA_ROOTS
+                         if sys.platform == "darwin" else RasDss._POSIX_JAVA_ROOTS)
                 raise RuntimeError(
                     "Java not found. Please set JAVA_HOME environment variable "
-                    "or install Java JDK/JRE.\n"
-                    "Download from: https://www.oracle.com/java/technologies/downloads/"
+                    "or install Java JDK/JRE.\nSearched: java on PATH and "
+                    + ", ".join(str(root) for root in roots)
                 )
+            os.environ['JAVA_HOME'] = str(java_home)
+            logger.debug("Found Java runtime: %s", java_home)
 
         # Set classpath (must be done before first import from jnius)
         jnius_config.add_classpath(*classpath)
@@ -191,7 +336,7 @@ class RasDss:
             )
 
         RasDss._jvm_configured = True
-        print("[OK] Java VM configured")
+        logger.debug("Java VM configured for DSS operations")
 
     @staticmethod
     @log_call
@@ -210,7 +355,72 @@ class RasDss:
             print(f"Found {len(catalog)} pathnames")
             for pathname in catalog['pathname']:
                 print(pathname)
+
+        Backends:
+            Under ``"native"`` and ``"shadow"`` a missing file raises
+            ``FileNotFoundError`` (the Java path also refuses missing files)
+            and a file that is not DSS raises
+            ``dss_commander.DssFormatError`` (a ``RuntimeError``; Java
+            returns zero rows).
         """
+        backend = RasDss.get_backend()
+        if backend == "native":
+            return RasDss._get_catalog_native(dss_file)
+        if backend == "shadow":
+            return RasDss._get_catalog_shadow(dss_file)
+        return RasDss._get_catalog_java(dss_file)
+
+    @staticmethod
+    def _get_catalog_native(dss_file: Union[str, Path]) -> pd.DataFrame:
+        """Catalog through dss-commander (no JVM). Same frame as the Java path."""
+        from ras_commander.RasUtils import RasUtils
+
+        dc = _backend.import_native()
+        resolved = RasUtils.safe_resolve(Path(dss_file))
+        catalog = dc.get_catalog(resolved)
+        df = catalog[['pathname']].reset_index(drop=True).copy()
+        df.attrs = {}
+        return df
+
+    @staticmethod
+    def _get_catalog_shadow(dss_file: Union[str, Path]) -> pd.DataFrame:
+        """Native catalog, cross-checked against Java. Comparison never raises."""
+        import time
+
+        t0 = time.perf_counter()
+        try:
+            native_df = RasDss._get_catalog_native(dss_file)
+        except Exception as native_exc:
+            # Never run Java here: on a missing file it creates an empty DSS file.
+            _backend.record(
+                "catalog", "skipped",
+                f"java skipped: native {type(native_exc).__name__}",
+                dss_file=dss_file, native_error=native_exc,
+                native_seconds=time.perf_counter() - t0,
+            )
+            raise
+        native_s = time.perf_counter() - t0
+        try:
+            java_df, java_exc = None, None
+            t1 = time.perf_counter()
+            try:
+                java_df = RasDss._get_catalog_java(dss_file)
+            except Exception as exc:
+                java_exc = exc
+            java_s = time.perf_counter() - t1
+            outcome, label, diffs = _backend.classify_catalog(java_df, java_exc, native_df)
+            _backend.record(
+                "catalog", outcome, label, dss_file=dss_file, diffs=diffs,
+                java_seconds=java_s, native_seconds=native_s, java_error=java_exc,
+                detail={"entries": len(native_df)},
+            )
+        except Exception as exc:  # the comparison must never break the read
+            logger.warning("DSS shadow catalog comparison failed for %s: %s", dss_file, exc)
+        return native_df
+
+    @staticmethod
+    def _get_catalog_java(dss_file: Union[str, Path]) -> pd.DataFrame:
+        """Catalog through HEC Monolith (pyjnius)."""
         # Configure JVM (must be before first jnius import)
         RasDss._configure_jvm()
 
@@ -221,6 +431,9 @@ class RasDss:
         HecDss = autoclass('hec.heclib.dss.HecDss')
 
         dss_file = str(RasUtils.safe_resolve(Path(dss_file)))
+        # HecDss.open() creates a new, empty DSS file when the path does not exist.
+        # A read must never create a file.
+        RasDss._require_existing_dss_file(dss_file)
 
         # Open DSS file
         dss = None
@@ -239,7 +452,10 @@ class RasDss:
 
         finally:
             if dss is not None:
-                dss.done()
+                try:
+                    dss.done()
+                finally:
+                    RasDss._release_dss_file(dss_file)
 
     @staticmethod
     @log_call
@@ -254,17 +470,204 @@ class RasDss:
 
         Args:
             dss_file: Path to DSS file
-            pathname: DSS pathname (e.g., "/BASIN/LOC/FLOW//1HOUR/OBS/")
-            start_date: Optional start date filter
-            end_date: Optional end date filter
+            pathname: DSS pathname (e.g., "/BASIN/LOC/FLOW//1HOUR/OBS/").
+                The D part is ignored: the whole dataset is read.
+            start_date: Optional start of the window (inclusive). HEC strings
+                such as ``"01JAN2020 0000"``, ISO strings and datetimes are
+                accepted. Honored by the native and shadow backends; the Java
+                backend ignores it and returns the whole dataset.
+            end_date: Optional end of the window (inclusive; with both ends
+                given, an end between stamps moves forward to the next stamp).
+                Same backend rules as ``start_date``.
 
         Returns:
             pandas DataFrame with DatetimeIndex and 'value' column
+
+        Backends:
+            ``"native"`` and ``"shadow"`` return NaN for HEC missing values
+            (the Java path returns the raw -3.4028235e38 marker). A pathname
+            without data raises ``dss_commander.DssPathnameNotFoundError``
+            (a ``ValueError`` and ``RuntimeError``); paired data, grids and
+            other non-time-series records raise
+            ``dss_commander.DssUnsupportedRecordError`` (a ``RuntimeError``).
+
+            All-missing DSS6 data differs between the paths. HEC Monolith
+            reports a DSS6 regular request whose values are all -901/-902 as
+            not found (heclib's DSS6 "no data" rule). The native engine finds
+            the blocks and, after trimming the missing values, raises the same
+            ``DssPathnameNotFoundError``; a window that also contains valid
+            values is returned. ``"shadow"`` re-reads such a not-found case
+            with dss-commander's opt-in ``no_data="refuse"`` (HEC's rule) only
+            to label the comparison; that option is provided for Java/native
+            parity checks and testing and never changes the returned result.
+            Stored NaN values are values: the leading/trailing trim removes
+            HEC missing markers only, as heclib's ``ztsTrim`` does.
 
         Example:
             df = RasDss.read_timeseries("file.dss", "/BASIN/LOC/FLOW//1HOUR/OBS/")
             print(df.head())
         """
+        backend = RasDss.get_backend()
+        if backend == "native":
+            return RasDss._read_timeseries_native(dss_file, pathname, start_date, end_date)
+        if backend == "shadow":
+            return RasDss._read_timeseries_shadow(dss_file, pathname, start_date, end_date)
+        return RasDss._read_timeseries_java(dss_file, pathname)
+
+    @staticmethod
+    def _read_timeseries_native(
+        dss_file: Union[str, Path],
+        pathname: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        dss_handle: Any = None,
+    ) -> pd.DataFrame:
+        """Time series through dss-commander (no JVM).
+
+        ``dss_handle`` is an open ``dss_commander.DssFile`` to reuse; when it is
+        None the file is opened and closed for this call.
+        """
+        from ras_commander.RasUtils import RasUtils
+
+        resolved = RasUtils.safe_resolve(Path(dss_file))
+        if dss_handle is not None:
+            df = dss_handle.read_timeseries(pathname, start_date, end_date)
+        else:
+            dc = _backend.import_native()
+            with dc.open(resolved) as handle:
+                df = handle.read_timeseries(pathname, start_date, end_date)
+        # ras-commander's resolver stays authoritative for the dss_file attribute.
+        df.attrs['dss_file'] = str(resolved)
+        return df
+
+    @staticmethod
+    def _read_timeseries_shadow(
+        dss_file: Union[str, Path],
+        pathname: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        dss_handle: Any = None,
+    ) -> pd.DataFrame:
+        """Native time series, cross-checked against Java. Comparison never raises.
+
+        Java ignores the window, so its frame is cut to the same window before
+        comparison.
+
+        All-missing DSS6 data (Java/native difference): HEC Monolith reports a
+        DSS6 regular time-series request as not found when every value it reads is
+        -901 or -902 (heclib ``zrrtsi.f`` status 4). The native engine finds those
+        blocks by default and, after its default trim, reports "no values" with the
+        same ``DssPathnameNotFoundError`` type that an absent pathname raises. When
+        the native read raises not-found, shadow mode repeats it with
+        dss-commander's opt-in ``no_data="refuse"`` (HEC's rule; it raises
+        ``DssNoDataError`` with ``status == 4``) to label the case as the HEC
+        no-data rule rather than a missing record. The option exists for this
+        parity check and for testing: the returned frame or error is always the
+        default native result, as under ``"native"``. Wheels without
+        ``DssNoDataError`` keep the broader D4 labels.
+        """
+        import time
+
+        dc = _backend.import_native()
+        native_df, native_exc = None, None
+        t0 = time.perf_counter()
+        try:
+            native_df = RasDss._read_timeseries_native(
+                dss_file, pathname, start_date, end_date, dss_handle=dss_handle
+            )
+        except Exception as exc:
+            native_exc = exc
+        native_s = time.perf_counter() - t0
+
+        # Java runs only when it is safe and comparable: it crashes the JVM on
+        # paired data, creates missing files, and has nothing to say about bad
+        # arguments. Not-found is compared (it can expose native false negatives).
+        run_java = native_exc is None or isinstance(native_exc, dc.DssPathnameNotFoundError)
+        if not run_java:
+            _backend.record(
+                "read_timeseries", "skipped",
+                f"java skipped: native {type(native_exc).__name__}",
+                dss_file=dss_file, pathname=pathname, native_error=native_exc,
+                native_seconds=native_s,
+            )
+            raise native_exc
+        try:
+            java_df, java_exc = None, None
+            t1 = time.perf_counter()
+            try:
+                java_df = RasDss._read_timeseries_java(dss_file, pathname)
+            except Exception as exc:
+                java_exc = exc
+            java_s = time.perf_counter() - t1
+            windowed = start_date is not None or end_date is not None
+            if java_df is not None and windowed:
+                source = native_df if native_df is not None else java_df
+                interval = source.attrs.get('interval') or 0
+                java_df = _backend.cut_window(java_df, start_date, end_date, interval, dc)
+                if len(java_df) == 0:
+                    java_df, java_exc = None, ValueError(
+                        f"No data found for pathname: {pathname}"
+                    )
+            java_window_df, java_window_error = None, None
+            bounds = _backend.verification_window(native_df)
+            if (java_df is None and bounds is not None
+                    and isinstance(java_exc, ValueError)
+                    and str(java_exc) == f"No data found for pathname: {pathname}"):
+                try:
+                    java_window_df = RasDss._read_timeseries_java(
+                        dss_file, pathname, start_date=bounds[0], end_date=bounds[1]
+                    )
+                except Exception as exc:
+                    java_window_error = f"{type(exc).__name__}: {exc}"
+            def _native_reread(**options):
+                if dss_handle is not None:
+                    return dss_handle.read_timeseries(pathname, start_date, end_date, **options)
+                from ras_commander.RasUtils import RasUtils
+                with dc.open(RasUtils.safe_resolve(Path(dss_file))) as handle:
+                    return handle.read_timeseries(pathname, start_date, end_date, **options)
+
+            native_hec_no_data = native_exc is not None and _backend.native_refuses_no_data(
+                _native_reread, native_exc
+            )
+            outcome, label, diffs = _backend.classify_timeseries(
+                pathname, java_df, java_exc, native_df, native_exc,
+                java_window_df=java_window_df, native_hec_no_data=native_hec_no_data,
+            )
+            java_s = time.perf_counter() - t1
+            detail = {"windowed": windowed, "native_hec_no_data": native_hec_no_data,
+                      "java_window_verified": java_window_df is not None and outcome == "expected"
+                      and label.startswith("D3 "),
+                      "java_window_error": java_window_error}
+            if native_df is not None:
+                detail["values"] = len(native_df)
+            if java_df is not None:
+                detail["java_markers"] = _backend.java_marker_count(java_df)
+            _backend.record(
+                "read_timeseries", outcome, label, dss_file=dss_file,
+                pathname=pathname, diffs=diffs, java_seconds=java_s,
+                native_seconds=native_s, java_error=java_exc,
+                native_error=native_exc, detail=detail,
+            )
+        except Exception as exc:  # the comparison must never break the read
+            logger.warning(
+                "DSS shadow read_timeseries comparison failed for %s %s: %s",
+                dss_file, pathname, exc,
+            )
+        if native_exc is not None:
+            raise native_exc
+        return native_df
+
+    @staticmethod
+    def _read_timeseries_java(
+        dss_file: Union[str, Path],
+        pathname: str,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Whole Java dataset, or an explicit private shadow-verification window."""
+        if (start_date is None) != (end_date is None):
+            raise ValueError("Java verification requires both window bounds")
         # Configure JVM (must be before first jnius import)
         RasDss._configure_jvm()
 
@@ -276,6 +679,8 @@ class RasDss:
         TimeSeriesContainer = autoclass('hec.io.TimeSeriesContainer')
 
         dss_file = str(RasUtils.safe_resolve(Path(dss_file)))
+        # HecDss.open() creates a new, empty DSS file when the path does not exist.
+        RasDss._require_existing_dss_file(dss_file)
 
         # Open DSS file
         dss = None
@@ -283,23 +688,44 @@ class RasDss:
             dss = HecDss.open(dss_file)
             # Read time series
             # True = ignore D-part (date) for wildcards
-            container = dss.get(pathname, True)
+            container = (dss.get(pathname, start_date, end_date)
+                         if start_date is not None else dss.get(pathname, True))
 
             if container is None:
                 raise ValueError(f"No data found for pathname: {pathname}")
 
+            # Paired data, grids and other records come back as other container
+            # classes; casting them to TimeSeriesContainer misreads their fields.
+            container_class = str(container.getClass().getName())
+            if container_class != 'hec.io.TimeSeriesContainer':
+                raise TypeError(
+                    f"Pathname is not a time series record ({container_class}): {pathname}"
+                )
+
             # Cast to TimeSeriesContainer to access fields
             tsc = cast('hec.io.TimeSeriesContainer', container)
+
+            # An absent or all-missing dataset comes back as an empty container.
+            if int(tsc.numberValues) <= 0 or tsc.times is None or tsc.values is None:
+                raise ValueError(f"No data found for pathname: {pathname}")
 
             # Extract values and times from Java container
             # pyjnius automatically converts Java arrays to Python lists
             values = np.array(tsc.values)  # Java double[] -> numpy array
-            times = np.array(tsc.times)    # Java int[] -> numpy array (minutes since 1899-12-31)
+            times = np.array(tsc.times, dtype=np.int64)
 
-            # Convert HEC time to numpy datetime64
-            # HEC epoch: December 31, 1899 00:00
-            HEC_EPOCH = np.datetime64('1899-12-31T00:00:00')
-            datetimes = HEC_EPOCH + times.astype('timedelta64[m]')
+            # TimeSeriesContainer.times are counts of timeGranularitySeconds
+            # (60 for minutes, 1 for seconds) after julianBaseDate days past the
+            # HEC epoch (December 31, 1899 00:00). Older containers use minutes
+            # from the epoch, which is base 0 and granularity 60.
+            granularity = RasDss._tsc_granularity_seconds(tsc)
+            base_days = int(getattr(tsc, 'julianBaseDate', 0) or 0)
+            HEC_EPOCH = np.datetime64('1899-12-31T00:00:00', 's')
+            datetimes = (
+                HEC_EPOCH
+                + np.timedelta64(base_days, 'D')
+                + (times * granularity).astype('timedelta64[s]')
+            )
 
             # Create DataFrame
             df = pd.DataFrame({
@@ -310,16 +736,939 @@ class RasDss:
             df.attrs['pathname'] = pathname
             df.attrs['units'] = str(tsc.units) if tsc.units else ""
             df.attrs['type'] = str(tsc.type) if tsc.type else ""
-            df.attrs['interval'] = (
-                int(tsc.interval) if hasattr(tsc, 'interval') else None
-            )
+            df.attrs['interval'] = RasDss._tsc_interval_minutes(tsc, granularity)
             df.attrs['dss_file'] = dss_file
 
             return df
 
         finally:
             if dss is not None:
+                try:
+                    dss.done()
+                finally:
+                    RasDss._release_dss_file(dss_file)
+
+    @staticmethod
+    def _release_dss_file(dss_file: str) -> None:
+        """Release the bridge's native handle on one DSS file.
+
+        ``HecDss.done()`` and ``GriddedData.done()`` only drop the bridge's
+        file-cache reference; the native file can stay open, and locked,
+        until a deferred close runs. Pass the exact path string that was
+        used to open the file. The handle is shared, so other open bridge
+        objects on the same file reopen it on their next access. Failures
+        are logged at DEBUG and never raised, so a primary error is not
+        masked.
+        """
+        try:
+            from jnius import autoclass
+
+            HecDSSFileAccess = autoclass('hec.heclib.dss.HecDSSFileAccess')
+            HecDSSFileAccess.close(dss_file, True)
+        except Exception as exc:
+            logger.debug("Could not release DSS file %s (%s)", dss_file, exc)
+
+    @staticmethod
+    def _require_existing_dss_file(dss_file: Union[str, Path]) -> None:
+        """Raise before HEC code can create a missing DSS file during a read."""
+        path = Path(dss_file)
+        if not path.exists():
+            raise FileNotFoundError(f"DSS file not found: {dss_file}")
+        if not path.is_file():
+            raise IsADirectoryError(f"DSS path is not a file: {dss_file}")
+
+    @staticmethod
+    def _tsc_granularity_seconds(tsc) -> int:
+        """Seconds per unit of TimeSeriesContainer.times (60 when not reported)."""
+        getter = getattr(tsc, 'getTimeGranularitySeconds', None)
+        try:
+            value = int(getter()) if getter is not None else 60
+        except Exception:
+            value = 60
+        return value if value > 0 else 60
+
+    @staticmethod
+    def _tsc_interval_minutes(tsc, granularity: int) -> Optional[Union[int, float]]:
+        """Regular interval in minutes; 0 for irregular data; float below one minute.
+
+        TimeSeriesContainer.interval is counted in the container's time
+        granularity, so a 15-second series reports 15 with granularity 1.
+        """
+        if not hasattr(tsc, 'interval'):
+            return None
+        raw = int(tsc.interval)
+        seconds = raw * granularity
+        if seconds % 60 == 0:
+            return seconds // 60
+        return seconds / 60
+
+    # ------------------------------------------------------------------
+    # Paired data
+    # ------------------------------------------------------------------
+
+    #: Paired-data record type codes: 200 (PD, float32) and 205 (PDD, float64).
+    _PAIRED_DATA_RECORD_TYPES = (200, 205)
+    _PAIRED_DATA_DTYPES = ("stored", "float64")
+
+    @staticmethod
+    @log_call
+    def read_paired_data(
+        dss_file: Union[str, Path],
+        pathname: str,
+        *,
+        ignore_d_part: bool = True,
+        dtype: str = "stored",
+    ) -> pd.DataFrame:
+        """
+        Read one paired-data record (rating curve, damage curve, temporal
+        pattern, elevation-storage table, ...) with every curve.
+
+        Args:
+            dss_file: Path to an existing DSS file. The file is never created.
+            pathname: DSS pathname, for example
+                ``"/BASIN/LOC/STAGE-FLOW///RATING/"``.
+            ignore_d_part: When the exact pathname has no record, use the first
+                paired-data record in catalog order whose A, B, C, E and F parts
+                match (case-insensitive), as ``HecDss.get(pathname, True)``
+                does. Default ``True``.
+            dtype: ``"stored"`` (default) keeps the stored precision:
+                ``float32`` for PD records (type 200) and ``float64`` for PDD
+                records (type 205). ``"float64"`` widens both (exact).
+
+        Returns:
+            DataFrame with one row per ordinate and one column per curve:
+
+            - Index: the independent-variable ordinates, named ``"ordinate"``,
+              in stored order (not sorted).
+            - Columns: one per curve, in stored order. Named after the curve
+              labels when every curve has a distinct, non-blank label,
+              otherwise ``"curve_1"`` .. ``"curve_n"``.
+            - Values: stored bits (``dtype="stored"``). HEC missing markers
+              (-901, -902, -3.4028235e38) are returned as stored, not NaN.
+            - ``attrs`` (always these keys, in this order): ``pathname``
+              (as requested), ``record_pathname`` (the record read; differs
+              when the D part was ignored), ``dss_file``, ``record_type``
+              (200 or 205), ``dss_version`` (6 or 7), ``stored_dtype``
+              (``"float32"`` or ``"float64"``), ``n_ordinates``,
+              ``n_curves``, ``x_parameter``, ``y_parameter`` (from the C
+              part, for example ``"STAGE"``/``"FLOW"``), ``x_units``,
+              ``x_type``, ``y_units``, ``y_type`` (for example ``"LINEAR"``,
+              ``"LOG"``, ``"PROB"``), ``labels`` (one string per curve, ``""``
+              when absent; trailing blanks removed, leading blanks kept),
+              ``x_precision``, ``y_precision`` (``-1`` when not set),
+              ``time_zone`` (DSS7 only, else ``None``; never applied).
+
+        Backends:
+            ``"java"`` reads ``hec.io.PairedDataContainer`` through HEC
+            Monolith; ``"native"`` reads through dss-commander without a JVM;
+            ``"shadow"`` returns the native frame, also reads through Java,
+            and logs differences (see ``docs/user-guide/dss-native-backend.md``).
+            Both backends return the same schema and raise the same classes.
+
+        Raises:
+            FileNotFoundError: If ``dss_file`` does not exist.
+            IsADirectoryError: If ``dss_file`` is not a file.
+            ValueError: If ``pathname`` is not a string or ``dtype`` is invalid.
+            DssPathnameNotFoundError: No paired-data record matches (a
+                ``ValueError``).
+            DssRecordTypeError: The matching record is not paired data (a
+                ``TypeError`` and ``DssUnsupportedRecordError``).
+            DssReadError: The record exists but the backend failed to read it
+                (a ``DssFormatError``; the cause is chained).
+            ImportError: The selected backend's optional dependency (pyjnius or
+                dss-commander) is not installed.
+
+        Example:
+            rating = RasDss.read_paired_data("model.dss", "/BASIN/LOC/STAGE-FLOW///RATING/")
+            stage = rating.index.to_numpy()
+            flow = rating.iloc[:, 0].to_numpy()
+            print(rating.attrs["x_units"], rating.attrs["y_units"])
+        """
+        RasDss._check_paired_data_request(dss_file, pathname, dtype)
+        backend = RasDss.get_backend()
+        if backend == "native":
+            return RasDss._read_paired_data_native(dss_file, pathname, ignore_d_part, dtype)
+        if backend == "shadow":
+            return RasDss._read_paired_data_shadow(dss_file, pathname, ignore_d_part, dtype)
+        return RasDss._read_paired_data_java(dss_file, pathname, ignore_d_part, dtype)
+
+    @staticmethod
+    def _check_paired_data_request(dss_file: Union[str, Path], pathname: str, dtype: str) -> None:
+        if not isinstance(pathname, str):
+            raise ValueError(f"DSS pathname must be a string, got {type(pathname).__name__}")
+        if dtype not in RasDss._PAIRED_DATA_DTYPES:
+            raise ValueError(f"dtype must be one of {RasDss._PAIRED_DATA_DTYPES}, not {dtype!r}")
+        RasDss._check_existing_file(dss_file)
+
+    @staticmethod
+    def _paired_data_column_names(labels: List[str], n_curves: int) -> List[str]:
+        """Labels when every curve has a distinct non-blank label, else curve_1..n
+        (the rule of ``dss_commander.PairedData.column_names``)."""
+        if (len(labels) == n_curves and all(s.strip() for s in labels)
+                and len(set(labels)) == n_curves):
+            return list(labels)
+        return [f"curve_{i + 1}" for i in range(n_curves)]
+
+    @staticmethod
+    def _paired_data_frame(
+        *,
+        pathname: str,
+        record_pathname: str,
+        dss_file: str,
+        record_type: int,
+        dss_version: int,
+        ordinates: np.ndarray,
+        values: np.ndarray,
+        labels: List[str],
+        x_parameter: str,
+        y_parameter: str,
+        x_units: str,
+        x_type: str,
+        y_units: str,
+        y_type: str,
+        x_precision: int,
+        y_precision: int,
+        time_zone: Optional[str],
+        dtype: str,
+    ) -> pd.DataFrame:
+        """Assemble the canonical paired-data frame (shared by both backends)."""
+        stored = np.dtype(np.float32 if int(record_type) == 200 else np.float64)
+        target = stored if dtype == "stored" else np.dtype(np.float64)
+        x = np.asarray(ordinates).astype(target, copy=True)
+        n_ord = int(x.shape[0])
+        v = np.asarray(values)
+        n_curves = int(v.shape[0]) if v.ndim == 2 else (0 if v.size == 0 else 1)
+        v = v.reshape(n_curves, n_ord).astype(target, copy=True)
+        labels = [str(s).rstrip() for s in labels][:n_curves]
+        labels += [""] * (n_curves - len(labels))
+        names = RasDss._paired_data_column_names(labels, n_curves)
+        index = pd.Index(x, name="ordinate", dtype=target)
+        if n_curves:
+            df = pd.DataFrame({name: v[i] for i, name in enumerate(names)}, index=index)
+        else:
+            df = pd.DataFrame(index=index)
+        df.attrs = {
+            "pathname": pathname,
+            "record_pathname": record_pathname,
+            "dss_file": dss_file,
+            "record_type": int(record_type),
+            "dss_version": int(dss_version),
+            "stored_dtype": stored.name,
+            "n_ordinates": n_ord,
+            "n_curves": n_curves,
+            "x_parameter": x_parameter or "",
+            "y_parameter": y_parameter or "",
+            "x_units": x_units or "",
+            "x_type": x_type or "",
+            "y_units": y_units or "",
+            "y_type": y_type or "",
+            "labels": labels,
+            "x_precision": int(x_precision),
+            "y_precision": int(y_precision),
+            "time_zone": time_zone or None,
+        }
+        return df
+
+    @staticmethod
+    def _native_record_type(handle: Any, pathname: str) -> Optional[int]:
+        """Record type of a catalog entry (exact, case-insensitive), or None."""
+        try:
+            cat = handle.catalog()
+        except Exception:
+            return None
+        wanted = pathname.upper()
+        for p, t in zip(cat["pathname"], cat["record_type"]):
+            if str(p).upper() == wanted:
+                return int(t)
+        return None
+
+    @staticmethod
+    def _read_paired_data_native(
+        dss_file: Union[str, Path],
+        pathname: str,
+        ignore_d_part: bool = True,
+        dtype: str = "stored",
+    ) -> pd.DataFrame:
+        """Paired data through dss-commander (no JVM)."""
+        from ras_commander.RasUtils import RasUtils
+
+        dc = _backend.import_native()
+        resolved = RasUtils.safe_resolve(Path(dss_file))
+        with dc.open(resolved) as handle:
+            try:
+                pdata = handle.read_paired_data(
+                    pathname, ignore_d_part=ignore_d_part, dtype="stored"
+                )
+            except dc.DssUnsupportedRecordError as exc:
+                # A matching record of another kind (time series, grid, text):
+                # same class as the Java path. An unsupported PD encoding stays
+                # the plain native error.
+                rtype = RasDss._native_record_type(handle, pathname)
+                if rtype not in RasDss._PAIRED_DATA_RECORD_TYPES:
+                    raise _errors.get("DssRecordTypeError")(
+                        f"DSS pathname is not a paired-data record: {pathname}"
+                        + (f" (record type {rtype})" if rtype is not None else "")
+                    ) from exc
+                raise
+        return RasDss._paired_data_frame(
+            pathname=pathname,
+            record_pathname=pdata.pathname,
+            dss_file=str(resolved),
+            record_type=pdata.record_type,
+            dss_version=pdata.dss_version,
+            ordinates=pdata.ordinates,
+            values=pdata.values,
+            labels=list(pdata.labels),
+            x_parameter=pdata.parameters[0],
+            y_parameter=pdata.parameters[1],
+            x_units=pdata.units_independent,
+            x_type=pdata.type_independent,
+            y_units=pdata.units_dependent,
+            y_type=pdata.type_dependent,
+            x_precision=pdata.x_precision,
+            y_precision=pdata.y_precision,
+            time_zone=pdata.time_zone,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _read_paired_data_java(
+        dss_file: Union[str, Path],
+        pathname: str,
+        ignore_d_part: bool = True,
+        dtype: str = "stored",
+    ) -> pd.DataFrame:
+        """Paired data through HEC Monolith (``hec.io.PairedDataContainer``)."""
+        RasDss._configure_jvm()
+
+        from jnius import autoclass, cast
+        from ras_commander.RasUtils import RasUtils
+
+        HecDss = autoclass('hec.heclib.dss.HecDss')
+        HecDataManager = autoclass('hec.heclib.dss.HecDataManager')
+        dss_path = RasDss._check_existing_file(dss_file)
+        dss_file_str = str(RasUtils.safe_resolve(dss_path))
+        not_found = _errors.get("DssPathnameNotFoundError")
+
+        dss = None
+        try:
+            dss = HecDss.open(dss_file_str)
+            record = RasDss._java_matching_record(dss, pathname, ignore_d_part)
+            if record is None:
+                raise not_found(f"No data found for pathname: {pathname}")
+            try:
+                container = dss.get(pathname, bool(ignore_d_part))
+            except Exception as exc:
+                # The record exists, so this is a read failure, not "not found".
+                raise _errors.get("DssReadError")(
+                    f"HEC Monolith failed to read existing record {record}: {exc}"
+                ) from exc
+            if container is None:
+                raise _errors.get("DssReadError")(
+                    f"HEC Monolith returned no container for existing record {record}"
+                )
+            container_class = str(container.getClass().getName())
+            if container_class != 'hec.io.PairedDataContainer':
+                raise _errors.get("DssRecordTypeError")(
+                    f"DSS pathname is not a paired-data record: {pathname} "
+                    f"(container type: {container_class})"
+                )
+            pdc = cast('hec.io.PairedDataContainer', container)
+            n_ord = int(pdc.numberOrdinates)
+            n_curves = int(pdc.numberCurves)
+            raw_x = pdc.xOrdinates
+            x = np.asarray(raw_x if raw_x is not None else [], dtype=np.float64)[:n_ord]
+            rows = pdc.yOrdinates
+            if rows is not None and n_curves:
+                y = np.stack([np.asarray(rows[i], dtype=np.float64)[:n_ord]
+                              for i in range(n_curves)])
+            else:
+                y = np.empty((0, n_ord), dtype=np.float64)
+            labels: List[str] = []
+            if bool(pdc.labelsUsed) and pdc.labels is not None:
+                labels = [str(s) if s is not None else "" for s in pdc.labels]
+            # DataContainer.dataType is the record type (200 PD, 205 PDD).
+            record_type = int(getattr(pdc, 'dataType', 0) or 0)
+            if record_type not in RasDss._PAIRED_DATA_RECORD_TYPES:
+                record_type = 205 if bool(getattr(pdc, 'storedAsdoubles', False)) else 200
+            version = int(HecDataManager.getDssFileVersion(dss_file_str))
+
+            def text(value: Any) -> str:
+                return str(value) if value is not None else ""
+
+            return RasDss._paired_data_frame(
+                pathname=pathname,
+                record_pathname=text(pdc.fullName) or pathname,
+                dss_file=dss_file_str,
+                record_type=record_type,
+                dss_version=version,
+                ordinates=x,
+                values=y,
+                labels=labels,
+                x_parameter=text(pdc.xparameter),
+                y_parameter=text(pdc.yparameter),
+                x_units=text(pdc.xunits),
+                x_type=text(pdc.xtype),
+                y_units=text(pdc.yunits),
+                y_type=text(pdc.ytype),
+                x_precision=int(pdc.xprecision),
+                y_precision=int(pdc.yprecision),
+                time_zone=None,
+                dtype=dtype,
+            )
+        finally:
+            if dss is not None:
                 dss.done()
+
+    @staticmethod
+    def _java_matching_record(dss: Any, pathname: str, ignore_d_part: bool) -> Optional[str]:
+        """The record ``HecDss.get(pathname, ignore_d_part)`` would read, or None.
+
+        Exact pathname first (``recordExists``); with ``ignore_d_part``, the first
+        cataloged pathname whose A, B, C, E and F parts match case-insensitively.
+        """
+        if dss.recordExists(pathname):
+            return pathname
+        if not ignore_d_part:
+            return None
+        parts = pathname.split("/")
+        if len(parts) != 8:
+            return None
+        key = tuple(parts[i].upper() for i in (1, 2, 3, 5, 6))
+        catalog = dss.getCatalogedPathnames()
+        for i in range(catalog.size()):
+            candidate = str(catalog.get(i))
+            cparts = candidate.split("/")
+            if len(cparts) == 8 and tuple(cparts[i].upper() for i in (1, 2, 3, 5, 6)) == key:
+                return candidate
+        return None
+
+    @staticmethod
+    def _read_paired_data_shadow(
+        dss_file: Union[str, Path],
+        pathname: str,
+        ignore_d_part: bool = True,
+        dtype: str = "stored",
+    ) -> pd.DataFrame:
+        """Native paired data, cross-checked against Java. Comparison never raises."""
+        import time
+
+        not_found = _errors.get("DssPathnameNotFoundError")
+        native_df, native_exc = None, None
+        t0 = time.perf_counter()
+        try:
+            native_df = RasDss._read_paired_data_native(dss_file, pathname, ignore_d_part, dtype)
+        except Exception as exc:
+            native_exc = exc
+        native_s = time.perf_counter() - t0
+        # Java runs only where the result is comparable: data or not-found.
+        if native_exc is not None and not isinstance(native_exc, not_found):
+            _backend.record(
+                "read_paired_data", "skipped",
+                f"java skipped: native {type(native_exc).__name__}",
+                dss_file=dss_file, pathname=pathname, native_error=native_exc,
+                native_seconds=native_s,
+            )
+            raise native_exc
+        try:
+            java_df, java_exc = None, None
+            t1 = time.perf_counter()
+            try:
+                java_df = RasDss._read_paired_data_java(dss_file, pathname, ignore_d_part, dtype)
+            except Exception as exc:
+                java_exc = exc
+            java_s = time.perf_counter() - t1
+            outcome, label, diffs = _backend.classify_paired_data(
+                java_df, java_exc, native_df, native_exc
+            )
+            detail = {}
+            if native_df is not None:
+                detail = {"n_curves": native_df.attrs.get("n_curves"),
+                          "n_ordinates": native_df.attrs.get("n_ordinates"),
+                          "record_type": native_df.attrs.get("record_type")}
+            _backend.record(
+                "read_paired_data", outcome, label, dss_file=dss_file,
+                pathname=pathname, diffs=diffs, java_seconds=java_s,
+                native_seconds=native_s, java_error=java_exc,
+                native_error=native_exc, detail=detail,
+            )
+        except Exception as exc:  # the comparison must never break the read
+            logger.warning(
+                "DSS shadow read_paired_data comparison failed for %s %s: %s",
+                dss_file, pathname, exc,
+            )
+        if native_exc is not None:
+            raise native_exc
+        return native_df
+
+    # ------------------------------------------------------------------
+    # Grids: native and shadow routes (the Java route is _read_grid_java)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_hec_time_text(
+        value: Optional[pd.Timestamp], end_of_period: bool = False
+    ) -> Optional[str]:
+        """``HecTime``-style text used in Java grid metadata (``1 January 2020, 01:00``).
+
+        Monolith prints a midnight end time as ``24:00`` of the previous day.
+        """
+        if value is None or pd.isna(value):
+            return None
+        stamp = pd.Timestamp(value)
+        if end_of_period and stamp == stamp.normalize():
+            prev = stamp - pd.Timedelta(days=1)
+            return f"{prev.day} {prev.strftime('%B %Y')}, 24:00"
+        return f"{stamp.day} {stamp.strftime('%B %Y, %H:%M')}"
+
+    @staticmethod
+    def _read_grid_native(dss_file: Union[str, Path], pathname: str) -> Dict[str, Any]:
+        """One grid record through dss-commander, in the ``read_grid`` schema.
+
+        Cells, geometry, units and times are native. ``metadata["crs_qualified"]``
+        reports whether the installed wheel advertises qualified grid CRS strings.
+        """
+        from ras_commander.RasUtils import RasUtils
+
+        path_parts = RasDss._check_grid_request(dss_file, pathname)
+        dc = _backend.import_native()
+        dss_file_str = str(RasUtils.safe_resolve(Path(dss_file)))
+        with dc.open(dss_file_str) as handle:
+            try:
+                grid = handle.read_grid(pathname, missing="nan", order="native")
+            except dc.DssPathnameNotFoundError as exc:
+                raise dc.DssPathnameNotFoundError(
+                    f"No DSS record found for exact pathname {pathname} in {dss_file_str}"
+                ) from exc
+            except dc.DssUnsupportedRecordError as exc:
+                rtype = RasDss._native_record_type(handle, pathname)
+                if rtype is not None and not 400 <= rtype < 450:
+                    raise _errors.get("DssRecordTypeError")(
+                        f"DSS pathname is not a spatial grid record: {pathname} "
+                        f"(record type {rtype})"
+                    ) from exc
+                raise
+        return RasDss._grid_dict_from_native(grid, pathname, dss_file_str, path_parts)
+
+    @staticmethod
+    def _grid_dict_from_native(
+        grid: Any, pathname: str, dss_file_str: str, path_parts: List[str]
+    ) -> Dict[str, Any]:
+        """Map a ``dss_commander.Grid`` onto the ``read_grid`` dictionary."""
+        n_rows, n_cols = int(grid.ny), int(grid.nx)
+        values = np.ascontiguousarray(grid.data, dtype=np.float32)
+        grid_type = grid.grid_type if grid.grid_type != "undefined" else "GridInfo"
+        class_names = {"albers": "AlbersInfo", "specified": "SpecifiedGridInfo",
+                       "hrap": "HrapInfo", "GridInfo": "GridInfo"}
+        cell_size = float(grid.cell_size)
+        lower_left_cell = (int(grid.lower_left_cell_x), int(grid.lower_left_cell_y))
+        md = dict(grid.metadata)
+        projection: Dict[str, Any] = {}
+        origin = None
+        if grid.grid_type in ("albers", "specified"):
+            x0 = float(grid.x_coord_of_grid_cell_zero)
+            y0 = float(grid.y_coord_of_grid_cell_zero)
+            projection.update({"x_coord_cell_zero": x0, "y_coord_cell_zero": y0})
+            origin = (x0 + lower_left_cell[0] * cell_size, y0 + lower_left_cell[1] * cell_size)
+        albers = md.get("albers")
+        if grid.grid_type == "albers" and albers:
+            projection.update({
+                "datum_code": int(albers["datum"]),
+                "units": str(albers["units"]),
+                "standard_parallel_1": float(albers["first_standard_parallel"]),
+                "standard_parallel_2": float(albers["second_standard_parallel"]),
+                "central_meridian": float(albers["central_meridian"]),
+                "latitude_of_origin": float(albers["latitude_of_projection_origin"]),
+                "false_easting": float(albers["false_easting"]),
+                "false_northing": float(albers["false_northing"]),
+            })
+
+        def native_time(value: Any) -> Optional[pd.Timestamp]:
+            return None if value is None else pd.Timestamp(value)
+
+        native_start, native_end = native_time(grid.start_time), native_time(grid.end_time)
+        start_time = RasDss._parse_grid_dss_datetime(path_parts[3]) or native_start
+        end_time = RasDss._parse_grid_dss_datetime(path_parts[4]) or native_end
+        start_text = RasDss._format_hec_time_text(native_start)
+        end_text = RasDss._format_hec_time_text(native_end, end_of_period=True)
+        record_type = int(grid.record_type)
+        metadata = {
+            "pathname_parts": dict(zip("ABCDEF", path_parts)),
+            "grid_class": f"hec.heclib.grid.{class_names.get(grid_type, grid_type)}",
+            "grid_type_code": record_type - record_type % 10,
+            "data_type_code": int(grid.data_type),
+            "shape": (n_rows, n_cols),
+            "number_of_cells_x": n_cols,
+            "number_of_cells_y": n_rows,
+            "lower_left_cell": lower_left_cell,
+            "origin": origin,
+            "projection": projection,
+            "number_missing": int(np.isnan(values).sum()),
+            "nodata_value": float(np.float32(-np.finfo(np.float32).max)),
+            "compression": {
+                "method": md.get("compression_method"),
+                "base": md.get("compression_base"),
+                "scale_factor": md.get("compression_scale_factor"),
+                "element_size": md.get("sizeof_compressed_elements"),
+            },
+            "timing": {
+                "start": start_text,
+                "end": end_text,
+                "period": f"{start_text} to {end_text}" if start_text and end_text else None,
+            },
+            "crs_qualified": _backend.native_grid_qualified(),
+            "native": {
+                "record_type": record_type,
+                "dss_version": int(grid.dss_version),
+                "null_value": float(grid.null_value),
+                "srs_name": grid.srs_name,
+                "srs_definition_type": int(grid.srs_definition_type),
+                "extent": tuple(grid.extent),
+                "min_value": grid.min_value,
+                "max_value": grid.max_value,
+                "mean_value": grid.mean_value,
+                **md,
+            },
+        }
+        return {
+            "dss_file": dss_file_str,
+            "pathname": pathname,
+            "data": values,
+            "shape": (n_rows, n_cols),
+            "units": str(grid.data_units),
+            "data_type": grid.data_type_name or "",
+            "grid_type": grid_type,
+            "crs": str(grid.srs_definition or ""),
+            "cell_size": cell_size,
+            "start_time": start_time,
+            "end_time": end_time,
+            "metadata": metadata,
+            "row_order": "south_up",
+        }
+
+    @staticmethod
+    def _read_grid_shadow(dss_file: Union[str, Path], pathname: str) -> Dict[str, Any]:
+        """Grid read on both backends. Always returns Java's grid (or raises Java's
+        error); the native grid is only compared. Cell and metadata differences are
+        logged separately. The comparison never raises."""
+        import time
+
+        java_grid, java_exc, native_grid, native_exc = None, None, None, None
+        t0 = time.perf_counter()
+        try:
+            native_grid = RasDss._read_grid_native(dss_file, pathname)
+        except Exception as exc:
+            native_exc = exc
+        native_s = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        try:
+            java_grid = RasDss._read_grid_java(dss_file, pathname)
+        except Exception as exc:
+            java_exc = exc
+        java_s = time.perf_counter() - t1
+        try:
+            outcome, label, diffs = _backend.classify_grid(
+                java_grid, java_exc, native_grid, native_exc
+            )
+            _backend.record(
+                "read_grid", outcome, label, dss_file=dss_file, pathname=pathname,
+                diffs=diffs, java_seconds=java_s, native_seconds=native_s,
+                java_error=java_exc, native_error=native_exc,
+                detail={"returned": "java"},
+            )
+        except Exception as exc:  # the comparison must never break the read
+            logger.warning("DSS shadow read_grid comparison failed for %s %s: %s",
+                           dss_file, pathname, exc)
+        if java_exc is not None:
+            raise java_exc
+        return java_grid
+
+    @staticmethod
+    @log_call
+    def read_grid(
+        dss_file: Union[str, Path],
+        pathname: str,
+        *,
+        allow_unqualified_native: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Read one spatial grid record from an exact DSS pathname.
+
+        Args:
+            dss_file: Path to an existing DSS file.
+            pathname: Exact six-part DSS grid pathname. Wildcards are not
+                accepted; D and E parts identify the record's time window.
+
+        Returns:
+            Dictionary containing:
+
+            - ``dss_file``: Absolute DSS file path.
+            - ``pathname``: Exact pathname requested.
+            - ``data``: Two-dimensional ``float32`` array in HEC row-major order.
+                Row zero is south, columns run west to east. Flip rows before
+                using a north-up raster transform or the native precipitation writer.
+                The HEC grid no-data sentinel is represented as ``numpy.nan``.
+            - ``shape``: ``(rows, columns)``.
+            - ``units`` and ``data_type``: DSS parameter metadata.
+            - ``grid_type``: ``"albers"``, ``"specified"``, ``"hrap"``, or
+                the runtime grid-info class name for another grid type.
+            - ``crs`` and ``cell_size``: Spatial reference and resolution.
+            - ``start_time`` and ``end_time``: Naive ``pandas.Timestamp``
+                values parsed from pathname parts D and E when present.
+            - ``metadata``: Grid dimensions, cell indexes, origin/projection,
+                compression, type codes, missing-value count, and raw timing.
+
+            - ``row_order``: Always ``"south_up"`` (row zero is the southern
+                row), on every backend.
+
+        Args (keyword-only):
+            allow_unqualified_native: Opt in to the native grid reader under
+                ``backend="native"`` when the installed dss-commander does not
+                advertise qualified grid CRS strings (feature
+                ``"grid_srs_monolith_parity"`` in ``dss_commander.FEATURES``).
+                Cells, geometry, units and times are native; ``crs`` may be
+                wrong or empty for legacy Albers grids, and
+                ``metadata["crs_qualified"]`` is ``False``. Ignored, with a
+                warning, under ``"java"`` and ``"shadow"``. Default ``False``.
+
+        Backends:
+            ``"java"`` (default) reads through HEC Monolith. ``"native"``
+            raises ``DssCapabilityError`` unless the wheel advertises
+            qualified grid CRS or ``allow_unqualified_native`` is ``True``; it
+            never falls back to Java. ``"shadow"`` always returns Java's grid
+            (and raises Java's error, even when the native read succeeded);
+            the native grid is only compared. It reads natively,
+            and logs cell and metadata differences separately; a CRS
+            disagreement is logged as the known difference ``G-CRS``.
+
+        Raises:
+            FileNotFoundError: If ``dss_file`` does not exist.
+            IsADirectoryError: If ``dss_file`` is not a file.
+            ValueError: If the pathname is malformed or uses wildcards.
+            DssPathnameNotFoundError: If no record has the exact pathname
+                (a ``ValueError``).
+            DssRecordTypeError: If the exact pathname identifies a non-grid
+                record (a ``TypeError`` and ``DssUnsupportedRecordError``).
+            DssCapabilityError: Native backend, unqualified wheel and no
+                ``allow_unqualified_native`` (a ``NotImplementedError``).
+            ImportError: If pyjnius (Java) or dss-commander (native) is not
+                installed.
+            RuntimeError: If the grid read fails or returns invalid data.
+        """
+        RasDss._check_grid_request(dss_file, pathname)
+        backend = RasDss.get_backend()
+        if backend == "native":
+            if not (allow_unqualified_native or _backend.native_grid_qualified()):
+                raise _errors.get("DssCapabilityError")(_backend.NATIVE_GRID_GATE_MESSAGE)
+            return RasDss._read_grid_native(dss_file, pathname)
+        if allow_unqualified_native:
+            logger.warning(
+                "read_grid: allow_unqualified_native=True is ignored under the %r "
+                "backend; the Java grid is returned%s.", backend,
+                " and the native grid is only compared" if backend == "shadow" else "",
+            )
+        if backend == "shadow":
+            return RasDss._read_grid_shadow(dss_file, pathname)
+        return RasDss._read_grid_java(dss_file, pathname)
+
+    @staticmethod
+    def _check_grid_request(dss_file: Union[str, Path], pathname: str) -> List[str]:
+        """Backend-independent argument checks; returns the six pathname parts."""
+        if not isinstance(pathname, str):
+            raise ValueError(f"DSS pathname must be a string, got {type(pathname).__name__}")
+        if "*" in pathname or "?" in pathname:
+            raise ValueError(
+                "read_grid requires an exact DSS pathname without wildcard "
+                f"characters: {pathname}"
+            )
+        _, path_parts = RasDss._split_dss_pathname(pathname)
+        dss_path = Path(dss_file)
+        if not dss_path.exists():
+            raise FileNotFoundError(f"DSS file not found: {dss_path}")
+        if not dss_path.is_file():
+            raise IsADirectoryError(f"DSS path is not a file: {dss_path}")
+        return path_parts
+
+    @staticmethod
+    def _read_grid_java(dss_file: Union[str, Path], pathname: str) -> Dict[str, Any]:
+        """One grid record through HEC Monolith (pyjnius). Internal Java-only
+        callers (grid writers) use this directly."""
+        path_parts = RasDss._check_grid_request(dss_file, pathname)
+        dss_path = Path(dss_file)
+
+        RasDss._configure_jvm()
+
+        from jnius import autoclass, cast
+        from ras_commander.RasUtils import RasUtils
+
+        HecDss = autoclass('hec.heclib.dss.HecDss')
+        GridInfo = autoclass('hec.heclib.grid.GridInfo')
+        dss_file_str = str(RasUtils.safe_resolve(dss_path))
+
+        dss = None
+        try:
+            dss = HecDss.open(dss_file_str)
+            if not dss.recordExists(pathname):
+                raise _errors.get("DssPathnameNotFoundError")(
+                    f"No DSS record found for exact pathname {pathname} "
+                    f"in {dss_file_str}"
+                )
+
+            container = dss.get(pathname)
+            if container is None:
+                raise RuntimeError(
+                    f"HEC-DSS returned no container for existing pathname: {pathname}"
+                )
+
+            container_class = str(container.getClass().getName())
+            if container_class != "hec.io.GridContainer":
+                raise _errors.get("DssRecordTypeError")(
+                    f"DSS pathname is not a spatial grid record: {pathname} "
+                    f"(container type: {container_class})"
+                )
+
+            grid_container = cast('hec.io.GridContainer', container)
+            grid_data = grid_container.getGridData()
+            if grid_data is None:
+                raise RuntimeError(f"Grid record contains no grid data: {pathname}")
+
+            grid_info_base = grid_data.getGridInfo()
+            if grid_info_base is None:
+                raise RuntimeError(f"Grid record contains no grid metadata: {pathname}")
+
+            grid_class = str(grid_info_base.getClass().getName())
+            grid_info = cast(grid_class, grid_info_base)
+            n_cols = int(grid_info.getNumberOfCellsX())
+            n_rows = int(grid_info.getNumberOfCellsY())
+            if n_rows <= 0 or n_cols <= 0:
+                raise RuntimeError(
+                    f"Grid record has invalid dimensions {n_rows}x{n_cols}: {pathname}"
+                )
+
+            values = np.asarray(grid_data.getData(), dtype=np.float32)
+            expected_size = n_rows * n_cols
+            if values.size != expected_size:
+                raise RuntimeError(
+                    f"Grid record returned {values.size} values for dimensions "
+                    f"{n_rows}x{n_cols} ({expected_size} expected): {pathname}"
+                )
+
+            nodata_value = np.float32(GridInfo.getGridNodataValue())
+            values = values.reshape((n_rows, n_cols), order="C").copy()
+            values[values == nodata_value] = np.nan
+
+            grid_class_name = grid_class.rsplit('.', 1)[-1]
+            grid_type_names = {
+                "AlbersInfo": "albers",
+                "SpecifiedGridInfo": "specified",
+                "HrapInfo": "hrap",
+            }
+            grid_type = grid_type_names.get(grid_class_name, grid_class_name)
+
+            cell_size = float(grid_info.getCellSize())
+            lower_left_cell = (
+                int(grid_info.getLowerLeftCellX()),
+                int(grid_info.getLowerLeftCellY()),
+            )
+            projection: Dict[str, Any] = {}
+            origin = None
+
+            if grid_class_name in {"AlbersInfo", "SpecifiedGridInfo"}:
+                x_cell_zero = float(grid_info.getXCoordOfGridCellZero())
+                y_cell_zero = float(grid_info.getYCoordOfGridCellZero())
+                projection.update({
+                    "x_coord_cell_zero": x_cell_zero,
+                    "y_coord_cell_zero": y_cell_zero,
+                })
+                origin = (
+                    x_cell_zero + lower_left_cell[0] * cell_size,
+                    y_cell_zero + lower_left_cell[1] * cell_size,
+                )
+
+            if grid_class_name == "AlbersInfo":
+                projection.update({
+                    "datum_code": int(grid_info.getProjectionDatum()),
+                    "units": str(grid_info.getProjectionUnits()),
+                    "standard_parallel_1": float(grid_info.getFirstStandardParallel()),
+                    "standard_parallel_2": float(grid_info.getSecondStandardParallel()),
+                    "central_meridian": float(grid_info.getCentralMeridian()),
+                    "latitude_of_origin": float(
+                        grid_info.getLatitudeOfProjectionOrigin()
+                    ),
+                    "false_easting": float(grid_info.getFalseEasting()),
+                    "false_northing": float(grid_info.getFalseNorthing()),
+                })
+
+            raw_start_time = str(grid_info.getStartTime())
+            raw_end_time = str(grid_info.getEndTime())
+            start_time = RasDss._parse_grid_dss_datetime(path_parts[3])
+            end_time = RasDss._parse_grid_dss_datetime(path_parts[4])
+            if start_time is None:
+                try:
+                    start_time = pd.Timestamp(pd.to_datetime(raw_start_time))
+                except (TypeError, ValueError):
+                    pass
+            if end_time is None:
+                try:
+                    end_time = pd.Timestamp(pd.to_datetime(raw_end_time))
+                except (TypeError, ValueError):
+                    pass
+
+            metadata = {
+                "pathname_parts": dict(zip("ABCDEF", path_parts)),
+                "grid_class": grid_class,
+                "grid_type_code": int(grid_info.getGridType()),
+                "data_type_code": int(grid_info.getDataType()),
+                "shape": (n_rows, n_cols),
+                "number_of_cells_x": n_cols,
+                "number_of_cells_y": n_rows,
+                "lower_left_cell": lower_left_cell,
+                "origin": origin,
+                "projection": projection,
+                "number_missing": int(grid_data.getNumberMissing()),
+                "nodata_value": float(nodata_value),
+                "compression": {
+                    "method": int(grid_info.getCompressionMethod()),
+                    "base": float(grid_info.getCompressionBase()),
+                    "scale_factor": float(grid_info.getCompressionScaleFactor()),
+                    "element_size": int(grid_info.getSizeOfCompressedElements()),
+                },
+                "timing": {
+                    "start": raw_start_time,
+                    "end": raw_end_time,
+                    "period": str(grid_info.getTimePeriod()),
+                },
+            }
+
+            return {
+                "dss_file": dss_file_str,
+                "pathname": pathname,
+                "data": values,
+                "shape": (n_rows, n_cols),
+                "units": str(grid_info.getDataUnits()),
+                "data_type": str(grid_info.getDataTypeName()),
+                "grid_type": grid_type,
+                "crs": str(grid_info.getSpatialReferenceSystem()),
+                "cell_size": cell_size,
+                "start_time": start_time,
+                "end_time": end_time,
+                "metadata": metadata,
+                "row_order": "south_up",
+            }
+        except (ValueError, TypeError):
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to read DSS grid record: {exc}\n"
+                f"  File: {dss_file_str}\n"
+                f"  Pathname: {pathname}"
+            ) from exc
+        finally:
+            if dss is not None:
+                try:
+                    dss.done()
+                finally:
+                    RasDss._release_dss_file(dss_file_str)
 
     @staticmethod
     @log_call
@@ -343,14 +1692,58 @@ class RasDss:
             for path, df in data.items():
                 print(f"{path}: {len(df)} points")
         """
+        backend = RasDss.get_backend()
+        if backend in ("native", "shadow"):
+            return RasDss._read_multiple_timeseries_native(
+                dss_file, pathnames, shadow=(backend == "shadow")
+            )
+
         results = {}
         for pathname in pathnames:
             try:
                 results[pathname] = RasDss.read_timeseries(dss_file, pathname)
             except Exception as e:
-                print(f"Warning: Could not read {pathname}: {e}")
+                logger.warning("Could not read DSS pathname: %s", pathname)
+                logger.debug("DSS read failure for %s: %s", pathname, e)
                 results[pathname] = None
 
+        return results
+
+    @staticmethod
+    def _read_multiple_timeseries_native(
+        dss_file: Union[str, Path],
+        pathnames: List[str],
+        shadow: bool = False,
+    ) -> Dict[str, pd.DataFrame]:
+        """Read several pathnames with one open dss-commander file.
+
+        Keeps the Java contract: a pathname that fails maps to None and logs a
+        warning.
+        """
+        from ras_commander.RasUtils import RasUtils
+
+        dc = _backend.import_native()
+        resolved = RasUtils.safe_resolve(Path(dss_file))
+        reader = (
+            RasDss._read_timeseries_shadow if shadow else RasDss._read_timeseries_native
+        )
+        results = {}
+        try:
+            handle = dc.open(resolved)
+        except Exception as e:
+            for pathname in pathnames:
+                logger.warning("Could not read DSS pathname: %s", pathname)
+                logger.debug("DSS read failure for %s: %s", pathname, e)
+                results[pathname] = None
+            return results
+        with handle:
+            for pathname in pathnames:
+                try:
+                    results[pathname] = reader(dss_file, pathname, dss_handle=handle)
+                except Exception as e:
+                    logger.warning("Could not read DSS pathname: %s", pathname)
+                    logger.debug("DSS read failure for %s: %s", pathname, e)
+                    results[pathname] = None
         return results
 
     @staticmethod
@@ -399,7 +1792,7 @@ class RasDss:
         Args:
             boundaries_df: DataFrame from ras.boundaries_df
             project_dir: Project directory (for resolving relative DSS paths)
-            ras_object: RasPrj object (alternative to project_dir)
+            ras_object (RasPrj, optional): RasPrj object (alternative to project_dir)
 
         Returns:
             Enhanced DataFrame with 'dss_timeseries' column containing extracted data
@@ -443,7 +1836,7 @@ class RasDss:
             logger.debug("No DSS-defined boundaries found")
             return result_df
 
-        logger.info(f"Found {len(dss_boundaries)} DSS-defined boundaries")
+        logger.debug(f"Found {len(dss_boundaries)} DSS-defined boundaries")
 
         # Extract time series for each DSS boundary
         success_count = 0
@@ -485,7 +1878,8 @@ class RasDss:
                 fail_count += 1
 
         logger.info(
-            f"Extraction complete: {success_count} success, {fail_count} failed"
+            "DSS boundary extraction complete: "
+            f"{len(dss_boundaries)} found, {success_count} read, {fail_count} failed"
         )
 
         return result_df
@@ -497,7 +1891,25 @@ class RasDss:
 
         Note: With pyjnius, JVM shutdown is typically not needed.
         This is a placeholder for API compatibility.
+
+        Deprecated: under the native backend no JVM is started and this method
+        is a no-op that emits ``DeprecationWarning``. It will be removed with the
+        Java backend.
         """
+        try:
+            backend = _backend.requested_backend(RasDss.backend)
+        except ValueError:
+            backend = None
+        if backend == "native":
+            import warnings
+
+            warnings.warn(
+                "RasDss.shutdown_jvm() is a no-op under the native DSS backend "
+                "and will be removed with the Java backend.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return
         logger.debug("pyjnius handles JVM lifecycle automatically")
         pass
 
@@ -512,7 +1924,8 @@ class RasDss:
         Check DSS pathname format validity.
 
         Validates against DSS pathname specification:
-        - Format: /A/B/C/D/E/F/ (common) or //A/B/C/D/E/F/ (accepted)
+        - Format: /A/B/C/D/E/F/
+        - A blank A-part is represented as //B/C/D/E/F/
         - Parts: A (basin/project), B (location), C (parameter),
                  D (date), E (interval), F (scenario)
 
@@ -520,7 +1933,7 @@ class RasDss:
             pathname: DSS pathname to validate
 
         Returns:
-            ValidationResult with detailed diagnostics
+            ValidationResult: Result with detailed diagnostics
 
         Example:
             >>> from ras_commander.dss import RasDss
@@ -536,7 +1949,7 @@ class RasDss:
             if (
                 pathname.startswith('/')
                 and pathname.endswith('/')
-                and pathname.strip('/').count('/') == 5
+                and len(pathname[1:-1].split('/')) == 6
             ):
                 return {'passed': True, 'message': 'Format appears valid (validation framework not available)'}
             else:
@@ -561,20 +1974,13 @@ class RasDss:
                 details={"pathname": pathname}
             )
 
-        # Split and validate parts
-        # DSS path format is typically: /A/B/C/D/E/F/
-        # Split by '/' gives: ['', 'A', 'B', 'C', 'D', 'E', 'F', '']
-        # Some tools use: //A/B/C/D/E/F/
-        # Split by '/' gives: ['', '', 'A', 'B', 'C', 'D', 'E', 'F', '']
-        parts = pathname.split('/')
-        if pathname.startswith('//'):
-            expected_len = 9
-            part_values = parts[2:-1]  # skip two empties + trailing empty
-        else:
-            expected_len = 8
-            part_values = parts[1:-1]  # skip leading empty + trailing empty
+        # Preserve empty components while removing only the required outer
+        # separators.  ``//B/C/D/E/F/`` is a normal six-part DSS pathname with
+        # an empty A-part; stripping all slashes would incorrectly reduce it to
+        # five parts.
+        part_values = pathname[1:-1].split('/')
 
-        if len(parts) != expected_len:
+        if len(part_values) != 6:
             return ValidationResult(
                 check_name="path_format",
                 severity=ValidationSeverity.ERROR,
@@ -582,12 +1988,12 @@ class RasDss:
                 message=(
                     "DSS path must have 6 parts "
                     "(/A/B/C/D/E/F/), got "
-                    f"{len(pathname.strip('/').split('/'))}: {pathname}"
+                    f"{len(part_values)}: {pathname}"
                 ),
                 details={
                     "pathname": pathname,
                     "expected_parts": 6,
-                    "actual_parts": len(pathname.strip('/').split('/'))
+                    "actual_parts": len(part_values)
                 }
             )
 
@@ -640,7 +2046,7 @@ class RasDss:
             dss_file: Path to DSS file (str or Path)
 
         Returns:
-            ValidationResult with file existence check outcome
+            ValidationResult: Result with file existence check outcome
 
         Example:
             >>> from pathlib import Path
@@ -718,7 +2124,7 @@ class RasDss:
             pathname: DSS pathname to check
 
         Returns:
-            ValidationResult with existence check outcome
+            ValidationResult: Result with existence check outcome
 
         Example:
             >>> result = RasDss.check_pathname_exists(
@@ -829,7 +2235,7 @@ class RasDss:
             expected_end: Expected end date (optional, datetime or string)
 
         Returns:
-            ValidationResult with data availability check outcome
+            ValidationResult: Result with data availability check outcome
 
         Example:
             >>> from datetime import datetime
@@ -949,7 +2355,7 @@ class RasDss:
             end_date: Optional end date for availability check
 
         Returns:
-            ValidationReport with all validation results
+            ValidationReport: Result with all validation results
 
         Example:
             >>> report = RasDss.check_pathname(
@@ -1074,6 +2480,84 @@ class RasDss:
 
     @staticmethod
     @log_call
+    def write_precip_grid_arrays(
+        dss_file: Union[str, Path],
+        pathname: str,
+        data: np.ndarray,
+        interval_bounds: Union[List, np.ndarray, pd.DatetimeIndex],
+        *,
+        transform: Any,
+        crs: Any,
+        units: str,
+        nodata: Optional[float] = None,
+        overwrite: bool = False,
+        grid_reference_origin: Optional[Tuple[float, float]] = None,
+    ) -> List[str]:
+        """Write interval precipitation arrays directly to a new native DSS7 file.
+
+        Uses optional MIT-licensed gyanz/pydsstools, without Java or Vortex.
+        Install ``ras-commander[dss-native]`` on a supported Python/platform.
+        NetCDF precipitation generation and existing Java DSS APIs are unchanged.
+
+        Args:
+            dss_file: Output file. Existing files require explicit overwrite;
+                overwrite replaces the entire file, it does not append records.
+            pathname: Six-part template, e.g. ``/UTM15/BASIN/PRECIP///ATLAS14/``.
+                D/E must be blank and become each interval's start/end.
+            data: Nonnegative interval depths, shape (time, row, column).
+                Row zero is north, columns run west to east. NaN and masked
+                cells are NoData. Infinity and negative depths are rejected.
+            interval_bounds: Exactly n_times+1 increasing, timezone-naive,
+                whole-minute datetimes. No timezone conversion is performed;
+                use the same clock as the receiving model. Unequal intervals
+                are supported; DSS end-of-day timestamps use 2400.
+            transform: Rasterio/Affine transform or six coefficients in
+                (a,b,c,d,e,f) order (not GDAL geotransform order), mapping
+                pixel corners. Requires north-up, unrotated square cells.
+            crs: Explicit projected CRS accepted by pyproj. No reprojection
+                occurs. Reproject geographic Atlas 14 grids before calling.
+            units: ``inches``/``IN`` or ``mm``. Numeric values are unchanged;
+                the records represent PER-CUM depth over each D/E interval,
+                not cumulative storm totals or precipitation rates.
+            nodata: Optional input sentinel, in the same units as data.
+            overwrite: Replace the whole output file after successful writing.
+            grid_reference_origin: Optional physical (x, y) coordinate of the
+                lower-left corner of cell (0, 0), in CRS units. The raster's
+                lower-left corner must
+                align with this reference at whole-cell offsets. Required when
+                a receiving model addresses rainfall by fixed grid-cell indexes,
+                such as legacy HMS HRAP file discretizations; use the model's
+                reference, commonly (0, 0). None preserves local indexing from
+                the raster lower-left corner. Neither choice reprojects data.
+
+        Returns:
+            Exact record pathnames written. Output uses DSS7 specified-time
+            grids; no generic promise of RAS/HMS version compatibility is made.
+
+        Raises:
+            ImportError: Native optional dependencies are unavailable.
+            ValueError: Array, pathname, units, geometry, or times are invalid.
+            FileExistsError: Output exists and overwrite is false.
+            RuntimeError: Written records could not be read back.
+
+        Notes:
+            A temporary sibling file is closed and its record metadata read
+            back before publication. No per-timestep raster files are created.
+            New output publication requires filesystem hard-link support to
+            refuse a concurrently created target atomically.
+            See https://github.com/gyanz/pydsstools for the upstream library.
+        """
+        from ._native_grid import write_precip_grid_arrays
+
+        return write_precip_grid_arrays(
+            dss_file, pathname, data, interval_bounds,
+            transform=transform, crs=crs, units=units,
+            nodata=nodata, overwrite=overwrite,
+            grid_reference_origin=grid_reference_origin,
+        )
+
+    @staticmethod
+    @log_call
     def write_grid_timeseries(
         dss_file: Union[str, Path],
         pathname: str,
@@ -1081,6 +2565,8 @@ class RasDss:
         times: Union[List, np.ndarray, pd.DatetimeIndex],
         grid_info: Dict[str, Any],
         create_if_missing: bool = True,
+        *,
+        dss_version: Optional[int] = None,
     ) -> List[str]:
         """
         Write a time-varying spatial grid series to HEC-DSS.
@@ -1098,13 +2584,15 @@ class RasDss:
                 preserved; Parts D and E are replaced with each timestep's
                 start/end window.
             data: 3-D array with shape ``(n_times, n_rows, n_cols)``.
+                HEC row order: row zero is south, columns run west to east.
+                For north-up raster arrays pass ``data[:, ::-1, :]``.
                 NaN/inf values and values equal to ``grid_info["nodata_value"]``
                 are written as the HEC grid no-data sentinel.
-            times: Datetime values. Pass ``n_times + 1`` values to provide
-                explicit interval boundaries, or ``n_times`` values to provide
-                interval end times. For ``n_times`` period data, the interval is
-                inferred from ``grid_info["interval_minutes"]``, consecutive
-                times, the pathname D/E parts, or 60 minutes.
+            times: Timezone-naive datetime values. Pass ``n_times + 1`` values
+                to provide explicit interval boundaries, or ``n_times`` values
+                to provide interval end times. For ``n_times`` period data, the
+                interval is inferred from ``grid_info["interval_minutes"]``,
+                consecutive times, the pathname D/E parts, or 60 minutes.
             grid_info: Grid metadata. Common keys are:
                 - ``cellsize`` or ``cell_size``: cell size in CRS units.
                 - ``origin``: physical lower-left coordinate ``(x, y)``.
@@ -1119,6 +2607,11 @@ class RasDss:
                 - ``compression``: ``"PRECIP_2_BYTE"``, ``"ZLIB"``, or
                   ``None``. Defaults to ``"PRECIP_2_BYTE"``.
             create_if_missing: Create DSS file if it doesn't exist.
+            dss_version: Major DSS version to use when creating a new file.
+                Pass 6 or 7 explicitly, or omit it to preserve the bridge's
+                current default. Existing files must match an explicit value.
+                For DSS6, default precipitation compression is configured with
+                the version-specific safe base/scale ordering.
 
         Returns:
             List of DSS pathnames written, one per timestep.
@@ -1126,7 +2619,9 @@ class RasDss:
         Raises:
             FileNotFoundError: If DSS file doesn't exist and
                 create_if_missing=False.
-            ValueError: If inputs are malformed or grid metadata is incomplete.
+            ValueError: If inputs are malformed, timestamps are timezone-aware,
+                grid metadata is incomplete, ``dss_version`` is invalid, or an
+                existing file does not match the requested version.
             ImportError: If pyjnius is not installed.
             RuntimeError: If the Java grid write operation fails.
 
@@ -1136,13 +2631,20 @@ class RasDss:
             writes through ``hec.heclib.grid.GriddedData.storeGriddedData()``
             because it is the stable Java API path from pyjnius for grid data.
         """
-        RasDss._configure_jvm()
-
-        from jnius import autoclass
-        from ras_commander.RasUtils import RasUtils
-
+        dss_version = RasDss._validate_dss_version(dss_version)
         if grid_info is None:
             raise ValueError("grid_info is required")
+        grid_info = dict(grid_info)
+
+        # HEC Monolith's DSS6 precipitation-compression setter exposes its
+        # base and scale positions opposite to DSS7. Supply the known-safe V6
+        # defaults when the caller selects DSS6 and has not overridden them.
+        compression = grid_info.get("compression", "PRECIP_2_BYTE")
+        if dss_version == 6 and isinstance(compression, str):
+            compression_text = compression.upper().replace("-", "_")
+            if compression_text in {"PRECIP", "PRECIP2BYTE", "PRECIP_2_BYTE"}:
+                grid_info.setdefault("compression_base", 100.0)
+                grid_info.setdefault("compression_scale_factor", 0.0)
 
         grid_array = np.asarray(data, dtype=np.float32)
         if grid_array.ndim != 3:
@@ -1170,13 +2672,35 @@ class RasDss:
         )
 
         dss_path = Path(dss_file)
-        if not dss_path.exists():
+        file_existed = dss_path.exists()
+        if file_existed and not dss_path.is_file():
+            raise IsADirectoryError(f"DSS path is not a file: {dss_path}")
+        if file_existed and dss_version is not None:
+            existing_version = RasDss._get_file_version_java(dss_path)
+            if existing_version != dss_version:
+                raise ValueError(
+                    f"Existing DSS file is version {existing_version}, not "
+                    f"requested version {dss_version}: {dss_path}"
+                )
+        if not file_existed:
             if not create_if_missing:
                 raise FileNotFoundError(f"DSS file not found: {dss_path}")
             dss_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info(f"DSS file will be created: {dss_path}")
+            logger.info(f"DSS file will be created: {dss_path.name}")
+            logger.debug(f"DSS file creation path: {dss_path}")
+
+        RasDss._configure_jvm()
+
+        from jnius import autoclass
+        from ras_commander.RasUtils import RasUtils
 
         dss_file_str = str(RasUtils.safe_resolve(dss_path))
+
+        # GriddedData creates a missing file with the bridge default. When the
+        # caller requests DSS6 or DSS7 explicitly, create that empty database
+        # first so the grid writer attaches to the requested file format.
+        if not file_existed and dss_version is not None:
+            RasDss._create_empty_dss(dss_path, dss_version)
 
         GridInfo = autoclass('hec.heclib.grid.GridInfo')
         GridData = autoclass('hec.heclib.grid.GridData')
@@ -1199,7 +2723,7 @@ class RasDss:
 
             for index, (start_time, end_time) in enumerate(time_windows):
                 d_part = RasDss._format_grid_dss_datetime(start_time)
-                e_part = RasDss._format_grid_dss_datetime(end_time)
+                e_part = RasDss._format_native_grid_end_datetime(end_time)
                 record_parts = list(path_parts)
                 record_parts[3] = d_part
                 record_parts[4] = e_part
@@ -1271,7 +2795,576 @@ class RasDss:
             ) from e
         finally:
             if writer is not None:
-                writer.done()
+                try:
+                    writer.done()
+                finally:
+                    RasDss._release_dss_file(dss_file_str)
+
+    @staticmethod
+    @log_call
+    def copy_grid_with_zero_tail(
+        source_dss: Union[str, Path],
+        output_dss: Union[str, Path],
+        pathname: str,
+        tail_intervals: int,
+        *,
+        time_shift_minutes: int = 0,
+        output_pathname: Optional[str] = None,
+        x_shift: float = 0.0,
+        y_shift: float = 0.0,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a non-destructive grid derivative with an explicit zero tail.
+
+        The output contains only the uniquely matched source grid family and
+        the appended tail. Source records are streamed one frame at a time and
+        rewritten with their decoded values and write-relevant metadata;
+        unrelated source records are not copied. Optional time, pathname, and
+        whole-cell origin translations are mechanical metadata transforms.
+
+        The intended workflow is upstream preparation of a run-local gridded
+        precipitation or rainfall-excess DSS derivative for a HEC-RAS
+        rain-on-grid scenario. A caller can preserve an immutable AORC-like
+        source, express UTC grid timestamps on the model clock with an
+        explicitly chosen shift, rename the forcing family, apply an approved
+        whole-cell origin translation, and append explicit zero-forcing
+        intervals so post-storm routing or recession can continue after the
+        source rainfall ends. In the source PR workflow, ``RasScenario``
+        accepted the already-prepared ``forcing_excess_dss`` and wired it to
+        Gridded/DSS precipitation; it did not call this preparation method.
+
+        This method does not calculate rainfall or rainfall excess,
+        scientifically transpose a storm, reproject, resample, or interpolate
+        grids, infer a time zone, or decide engineering suitability. Those
+        scientific and study-specific decisions remain caller responsibilities.
+
+        ``overwrite=False`` publishes with an atomic hard-link create-if-absent
+        operation. Filesystems without compatible hard-link support fail closed
+        with ``OSError``; the method never falls back to a clobbering replace.
+        ``overwrite=True`` atomically replaces the destination and therefore
+        replaces its file metadata and hard-link identity. Output symlinks,
+        junctions, and other reparse points are rejected before resolution.
+
+        Args:
+            source_dss: Existing source DSS file, which is never modified.
+            output_dss: Destination DSS file for the derivative.
+            pathname: Six-part family selector whose D and E parts are blank.
+            tail_intervals: Positive number of zero-valued records to append.
+            time_shift_minutes: Signed whole-minute shift for every window.
+            output_pathname: Optional output family selector with blank D/E.
+                When omitted, caller-supplied A/B/C/F casing is preserved even
+                though source-family selection is case-insensitive.
+            x_shift: Signed x-origin translation in source grid units. It must
+                be an exact whole-cell increment.
+            y_shift: Signed y-origin translation in source grid units. It must
+                be an exact whole-cell increment.
+            overwrite: Atomically replace an existing destination after full
+                temporary readback. When false, publish only by atomic hard
+                link if the destination still does not exist.
+
+        Returns:
+            A dictionary describing source coverage, translations, DSS
+            version, accepted source SHA-256, rewritten source paths, and
+            appended tail paths.
+
+        Raises:
+            FileNotFoundError: If the source DSS does not exist.
+            FileExistsError: If the destination exists without ``overwrite``.
+            IsADirectoryError: If a DSS path is not a regular file.
+            ValueError: If inputs, family timing, metadata, or NoData masks are
+                unsafe or ambiguous.
+            ImportError: If the optional Java bridge is unavailable.
+            OSError: If directory, hard-link publication, or replacement fails.
+            RuntimeError: If source stability, grid I/O, or complete temporary
+                readback verification fails.
+
+        Notes:
+            D/E tokens must use exact ``DDMMMYYYY:HHMM`` minute syntax. A
+            narrow ``2400`` token is accepted as next-day midnight. Native
+            HEC-DSS grid catalogs spell midnight record ends as prior-day
+            ``2400`` and midnight record starts as same-day ``0000``; returned
+            pathnames follow that role-specific convention. The source is
+            SHA-256 checked before access, after the validation pass, and after
+            the streaming write pass. Any detected mismatch aborts before
+            publication. Every temporary record is reopened and compared
+            exactly before publish.
+        """
+        from ras_commander.RasUtils import RasUtils
+
+        raw_output = Path(output_dss)
+        if RasDss._is_reparse_point(raw_output):
+            raise ValueError(
+                "output_dss must not be a symlink, junction, or reparse point"
+            )
+        source = RasUtils.safe_resolve(Path(source_dss))
+        output_parent = RasUtils.safe_resolve(raw_output.parent)
+        output = output_parent / raw_output.name
+        if not source.exists():
+            raise FileNotFoundError(f"DSS file not found: {source}")
+        if not source.is_file():
+            raise IsADirectoryError(f"DSS path is not a file: {source}")
+
+        same_file = source == output
+        if output.exists() and not same_file:
+            try:
+                same_file = os.path.samefile(source, output)
+            except OSError:
+                same_file = False
+        if same_file:
+            raise ValueError("output_dss must differ from source_dss")
+
+        if type(tail_intervals) is not int or tail_intervals <= 0:
+            raise ValueError("tail_intervals must be a positive integer")
+        if type(time_shift_minutes) is not int:
+            raise ValueError("time_shift_minutes must be an integer")
+        if type(overwrite) is not bool:
+            raise ValueError("overwrite must be a boolean")
+        x_shift = RasDss._normalize_finite_real(x_shift, "x_shift")
+        y_shift = RasDss._normalize_finite_real(y_shift, "y_shift")
+
+        _, selector_parts = RasDss._validate_grid_family_selector(
+            pathname,
+            "pathname",
+        )
+        derivative_pathname = (
+            pathname if output_pathname is None else output_pathname
+        )
+        _, derivative_parts = RasDss._validate_grid_family_selector(
+            derivative_pathname,
+            "output_pathname",
+        )
+        canonical_derivative_pathname = RasDss._build_dss_pathname(
+            "/",
+            derivative_parts,
+        )
+
+        if output.exists() and not output.is_file():
+            raise IsADirectoryError(f"Output DSS path is not a file: {output}")
+        if output.exists() and not overwrite:
+            raise FileExistsError(f"Output DSS already exists: {output}")
+
+        RasDss._best_effort_close_dss_file(source, "before initial source hash")
+        source_sha256 = RasDss._sha256_file(source)
+        reference: Optional[Dict[str, Any]] = None
+        reference_signature: Optional[Dict[str, Any]] = None
+        nodata_mask: Optional[np.ndarray] = None
+        try:
+            catalog = RasDss.get_catalog(source)
+            records = RasDss._select_grid_family_records(
+                catalog,
+                pathname,
+                selector_parts,
+            )
+            for record in records:
+                grid = RasDss._read_grid_java(source, record[2])
+                signature, mask = RasDss._validate_grid_record_metadata(
+                    grid,
+                    record,
+                    reference_signature,
+                    nodata_mask,
+                )
+                if reference is None:
+                    reference = grid
+                    reference_signature = signature
+                    nodata_mask = mask
+            source_version = RasDss._get_file_version_java(source)
+        finally:
+            RasDss._best_effort_close_dss_file(
+                source,
+                "after source catalog/prevalidation",
+            )
+
+        if reference is None or reference_signature is None or nodata_mask is None:
+            raise ValueError("Grid family records could not be read completely")
+        del grid
+        if RasDss._sha256_file(source) != source_sha256:
+            raise RuntimeError("Source DSS changed during grid-family validation")
+
+        metadata = reference["metadata"]
+        cell_size = float(reference["cell_size"])
+        x_shift_cells = RasDss._whole_grid_cell_shift(
+            x_shift,
+            cell_size,
+            "x_shift",
+        )
+        y_shift_cells = RasDss._whole_grid_cell_shift(
+            y_shift,
+            cell_size,
+            "y_shift",
+        )
+        lower_left = tuple(metadata["lower_left_cell"])
+        output_lower_left = (
+            int(lower_left[0]) + x_shift_cells,
+            int(lower_left[1]) + y_shift_cells,
+        )
+        RasDss._validate_java_int32(output_lower_left[0], "lower-left x cell")
+        RasDss._validate_java_int32(output_lower_left[1], "lower-left y cell")
+
+        interval = records[0][1] - records[0][0]
+        source_boundaries = [records[0][0]] + [
+            end for _, end, _ in records
+        ]
+        output_boundaries = RasDss._translated_grid_boundaries(
+            source_boundaries,
+            interval,
+            time_shift_minutes,
+            tail_intervals,
+        )
+        output_source_end = output_boundaries[len(records)]
+
+        expected_catalog_pathnames = RasDss._expected_native_grid_pathnames(
+            canonical_derivative_pathname,
+            output_boundaries,
+        )
+
+        zero_frame = np.where(
+            nodata_mask,
+            np.float32(np.nan),
+            np.float32(0.0),
+        )
+        grid_info = RasDss._grid_write_info_from_record(
+            reference,
+            output_lower_left,
+        )
+        expected_output_signature = dict(reference_signature)
+        expected_output_signature["lower_left_cell"] = output_lower_left
+        projection = reference_signature["projection"]
+        expected_output_signature["origin"] = (
+            float(projection["x_coord_cell_zero"])
+            + output_lower_left[0] * cell_size,
+            float(projection["y_coord_cell_zero"])
+            + output_lower_left[1] * cell_size,
+        )
+        del reference
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(
+            f".{output.stem}.{uuid4().hex}.tmp{output.suffix or '.dss'}"
+        )
+        while temporary.exists():
+            temporary = output.with_name(
+                f".{output.stem}.{uuid4().hex}.tmp{output.suffix or '.dss'}"
+            )
+
+        written_count = 0
+        source_value_digests: List[str] = []
+        try:
+            RasDss._create_empty_dss(temporary, source_version)
+            try:
+                for index, record in enumerate(records):
+                    grid = RasDss._read_grid_java(source, record[2])
+                    RasDss._validate_grid_record_metadata(
+                        grid,
+                        record,
+                        reference_signature,
+                        nodata_mask,
+                    )
+                    frame = np.asarray(grid["data"], dtype=np.float32)
+                    source_value_digests.append(RasDss._grid_value_digest(frame))
+                    returned = RasDss.write_grid_timeseries(
+                        dss_file=temporary,
+                        pathname=canonical_derivative_pathname,
+                        data=frame[np.newaxis, :, :],
+                        times=[
+                            output_boundaries[index].to_pydatetime(),
+                            output_boundaries[index + 1].to_pydatetime(),
+                        ],
+                        grid_info=grid_info,
+                        create_if_missing=False,
+                    )
+                    RasDss._validate_grid_writer_return(
+                        returned,
+                        canonical_derivative_pathname,
+                        output_boundaries[index],
+                        output_boundaries[index + 1],
+                    )
+                    written_count += 1
+            finally:
+                RasDss._best_effort_close_dss_file(
+                    source,
+                    "after source reread/write",
+                )
+
+            if RasDss._sha256_file(source) != source_sha256:
+                raise RuntimeError("Source DSS changed during grid-family rewrite")
+            del frame, grid
+
+            source_count = len(records)
+            for tail_index in range(tail_intervals):
+                index = source_count + tail_index
+                returned = RasDss.write_grid_timeseries(
+                    dss_file=temporary,
+                    pathname=canonical_derivative_pathname,
+                    data=zero_frame[np.newaxis, :, :],
+                    times=[
+                        output_boundaries[index].to_pydatetime(),
+                        output_boundaries[index + 1].to_pydatetime(),
+                    ],
+                    grid_info=grid_info,
+                    create_if_missing=False,
+                )
+                RasDss._validate_grid_writer_return(
+                    returned,
+                    canonical_derivative_pathname,
+                    output_boundaries[index],
+                    output_boundaries[index + 1],
+                )
+                written_count += 1
+
+            if written_count != len(expected_catalog_pathnames):
+                raise RuntimeError(
+                    "Grid derivative writer return count does not match the "
+                    "independently expected record count"
+                )
+
+            temporary_version = RasDss._get_file_version_java(temporary)
+            if temporary_version != source_version:
+                raise RuntimeError(
+                    "Grid derivative changed DSS major version: "
+                    f"source={source_version}, output={temporary_version}"
+                )
+            temporary_paths = list(
+                RasDss.get_catalog(temporary)["pathname"].astype(str)
+            )
+            if (
+                len(temporary_paths) != len(expected_catalog_pathnames)
+                or set(temporary_paths) != set(expected_catalog_pathnames)
+            ):
+                raise RuntimeError(
+                    "Temporary grid derivative catalog does not match the "
+                    "independently expected pathnames"
+                )
+
+            for index, expected_pathname in enumerate(expected_catalog_pathnames):
+                output_grid = RasDss._read_grid_java(temporary, expected_pathname)
+                RasDss._validate_grid_record_metadata(
+                    output_grid,
+                    (
+                        output_boundaries[index],
+                        output_boundaries[index + 1],
+                        expected_pathname,
+                    ),
+                    expected_output_signature,
+                    nodata_mask,
+                )
+                output_frame = np.asarray(output_grid["data"], dtype=np.float32)
+                if index < len(records):
+                    if (
+                        RasDss._grid_value_digest(output_frame)
+                        != source_value_digests[index]
+                    ):
+                        raise RuntimeError(
+                            "Temporary grid derivative changed decoded source "
+                            f"values or orientation: {expected_pathname}"
+                        )
+                else:
+                    output_mask = ~np.isfinite(output_frame)
+                    if not np.array_equal(output_mask, nodata_mask):
+                        raise RuntimeError(
+                            "Temporary grid derivative changed the tail NoData "
+                            f"footprint: {expected_pathname}"
+                        )
+                    if np.any(output_frame[~output_mask] != np.float32(0.0)):
+                        raise RuntimeError(
+                            "Temporary grid derivative tail contains nonzero "
+                            f"data: {expected_pathname}"
+                        )
+
+            RasDss._close_dss_file(temporary)
+            if overwrite:
+                os.replace(temporary, output)
+            else:
+                try:
+                    os.link(temporary, output)
+                except FileExistsError as exc:
+                    raise FileExistsError(
+                        "Output DSS appeared while the derivative was being built: "
+                        f"{output}"
+                    ) from exc
+                except OSError as exc:
+                    raise OSError(
+                        "Atomic no-clobber DSS publication requires hard-link "
+                        f"support in the output directory: {output.parent}"
+                    ) from exc
+                try:
+                    temporary.unlink()
+                except OSError as exc:
+                    logger.warning(
+                        "Published derivative but could not remove temporary "
+                        "hard-link alias: %s (%s)",
+                        temporary,
+                        exc,
+                    )
+        finally:
+            RasDss._cleanup_temporary_dss(temporary)
+
+        rewritten_count = len(records)
+        rewritten_pathnames = expected_catalog_pathnames[:rewritten_count]
+        shifted_pathnames = []
+        for record, rewritten_pathname in zip(records, rewritten_pathnames):
+            _, record_parts = RasDss._split_dss_pathname(record[2])
+            canonical_source_pathname = RasDss._build_dss_pathname(
+                "/",
+                record_parts,
+            )
+            if canonical_source_pathname != rewritten_pathname:
+                shifted_pathnames.append(rewritten_pathname)
+        return {
+            "source_dss": str(source),
+            "output_dss": str(output),
+            "source_sha256": source_sha256,
+            "dss_version": source_version,
+            "pathname": pathname,
+            "output_pathname": canonical_derivative_pathname,
+            "source_record_count": rewritten_count,
+            "appended_record_count": tail_intervals,
+            "interval_minutes": int(interval.total_seconds() // 60),
+            "time_shift_minutes": time_shift_minutes,
+            "x_shift": x_shift,
+            "y_shift": y_shift,
+            "output_lower_left_cell": output_lower_left,
+            "source_start": records[0][0].isoformat(),
+            "source_end": records[-1][1].isoformat(),
+            "output_start": output_boundaries[0].isoformat(),
+            "output_source_end": output_source_end.isoformat(),
+            "padded_end": output_boundaries[-1].isoformat(),
+            "written_source_pathnames": rewritten_pathnames,
+            "shifted_pathnames": shifted_pathnames,
+            "appended_pathnames": expected_catalog_pathnames[rewritten_count:],
+        }
+
+    @staticmethod
+    @log_call
+    def get_file_version(dss_file: Union[str, Path]) -> int:
+        """Return the major HEC-DSS file version (6 or 7).
+
+        Args:
+            dss_file: Existing DSS file to inspect. The file is never created
+                or modified.
+
+        Returns:
+            ``6`` or ``7`` (``int``).
+
+        Backends:
+            ``"java"`` asks HEC Monolith (``HecDataManager.getDssFileVersion``).
+            ``"native"`` reads the file header through dss-commander without a
+            JVM. ``"shadow"`` returns the native answer and logs any
+            disagreement with Java.
+
+        Raises:
+            FileNotFoundError: If the path does not exist.
+            IsADirectoryError: If the path is not a file.
+            DssInvalidFileError: If the file is not a supported DSS 6 or DSS 7
+                database (a ``ValueError`` and ``DssFormatError``).
+        """
+        RasDss._check_existing_file(dss_file)
+        backend = RasDss.get_backend()
+        if backend == "native":
+            return RasDss._get_file_version_native(dss_file)
+        if backend == "shadow":
+            return RasDss._get_file_version_shadow(dss_file)
+        return RasDss._get_file_version_java(dss_file)
+
+    @staticmethod
+    def _check_existing_file(dss_file: Union[str, Path]) -> Path:
+        dss_path = Path(dss_file)
+        if not dss_path.exists():
+            raise FileNotFoundError(f"DSS file not found: {dss_path}")
+        if not dss_path.is_file():
+            raise IsADirectoryError(f"DSS path is not a file: {dss_path}")
+        return dss_path
+
+    @staticmethod
+    def _get_file_version_native(dss_file: Union[str, Path]) -> int:
+        """Header version through dss-commander (no JVM)."""
+        from ras_commander.RasUtils import RasUtils
+
+        dss_path = RasDss._check_existing_file(dss_file)
+        dc = _backend.import_native()
+        try:
+            signature = dc.file_signature(RasUtils.safe_resolve(dss_path))
+        except dc.DssFormatError as exc:
+            raise _errors.get("DssInvalidFileError")(
+                f"File is not a supported HEC-DSS database: {dss_path}"
+            ) from exc
+        version = int(signature["version"])
+        if version not in (6, 7):
+            raise _errors.get("DssInvalidFileError")(
+                f"File is not a supported HEC-DSS database: {dss_path}"
+            )
+        return version
+
+    @staticmethod
+    def _get_file_version_shadow(dss_file: Union[str, Path]) -> int:
+        """Native version, cross-checked against Java. Comparison never raises."""
+        import time
+
+        invalid = _errors.get("DssInvalidFileError")
+        native_version, native_exc = None, None
+        t0 = time.perf_counter()
+        try:
+            native_version = RasDss._get_file_version_native(dss_file)
+        except Exception as exc:
+            native_exc = exc
+        native_s = time.perf_counter() - t0
+        if native_exc is not None and not isinstance(native_exc, invalid):
+            _backend.record(
+                "file_version", "skipped",
+                f"java skipped: native {type(native_exc).__name__}",
+                dss_file=dss_file, native_error=native_exc, native_seconds=native_s,
+            )
+            raise native_exc
+        try:
+            java_version, java_exc = None, None
+            t1 = time.perf_counter()
+            try:
+                java_version = RasDss._get_file_version_java(dss_file)
+            except Exception as exc:
+                java_exc = exc
+            java_s = time.perf_counter() - t1
+            outcome, label, diffs = _backend.classify_file_version(
+                java_version, java_exc, native_version, native_exc
+            )
+            _backend.record(
+                "file_version", outcome, label, dss_file=dss_file, diffs=diffs,
+                java_seconds=java_s, native_seconds=native_s, java_error=java_exc,
+                native_error=native_exc,
+                detail={"java_version": java_version, "native_version": native_version},
+            )
+        except Exception as exc:  # the comparison must never break the read
+            logger.warning("DSS shadow file_version comparison failed for %s: %s", dss_file, exc)
+        if native_exc is not None:
+            raise native_exc
+        return native_version
+
+    @staticmethod
+    def _get_file_version_java(dss_file: Union[str, Path]) -> int:
+        """Header version through HEC Monolith. Internal Java-only callers
+        (writers) use this directly."""
+        dss_path = RasDss._check_existing_file(dss_file)
+
+        RasDss._configure_jvm()
+
+        from jnius import autoclass
+        from ras_commander.RasUtils import RasUtils
+
+        HecDataManager = autoclass('hec.heclib.dss.HecDataManager')
+        resolved_path = str(RasUtils.safe_resolve(dss_path))
+        version = int(HecDataManager.getDssFileVersion(resolved_path))
+        if version not in (6, 7):
+            raise _errors.get("DssInvalidFileError")(
+                f"File is not a supported HEC-DSS database: {dss_path}"
+            )
+        return version
+
+    @staticmethod
+    def _validate_dss_version(dss_version: Optional[int]) -> Optional[int]:
+        """Validate an optional explicit HEC-DSS creation version."""
+        if dss_version is None:
+            return None
+        if type(dss_version) is not int or dss_version not in (6, 7):
+            raise ValueError("dss_version must be the integer 6, 7, or None")
+        return dss_version
 
     @staticmethod
     @log_call
@@ -1283,6 +3376,8 @@ class RasDss:
         units: str = "CFS",
         data_type: str = "INST-VAL",
         create_if_missing: bool = True,
+        *,
+        dss_version: Optional[int] = None,
     ) -> None:
         """
         Write a time series to a DSS file.
@@ -1293,8 +3388,9 @@ class RasDss:
         Args:
             dss_file: Path to DSS file (created if missing and create_if_missing=True)
             pathname: DSS pathname (e.g., "//BASIN/LOCATION/FLOW//1HOUR/FORECAST/")
-            times: Array of datetime values (datetime objects, DatetimeIndex, or
-                   numpy datetime64 array)
+            times: Array of timezone-naive datetime values (datetime objects,
+                   DatetimeIndex, or numpy datetime64 array). Values must be
+                   aligned exactly to whole minutes.
             values: Array of numeric values (same length as times)
             units: Data units string (e.g., "CFS", "FEET", "MM", "IN")
             data_type: DSS data type string:
@@ -1303,10 +3399,16 @@ class RasDss:
                 - "PER-CUM"  - Period cumulative
                 - "INST-CUM" - Instantaneous cumulative
             create_if_missing: Create DSS file if it doesn't exist (default True)
+            dss_version: Major DSS version to use when creating a new file.
+                Pass 6 or 7 explicitly, or omit it to preserve the bridge's
+                current default. Existing files must match an explicit value.
 
         Raises:
             FileNotFoundError: If DSS file doesn't exist and create_if_missing=False
-            ValueError: If times and values have different lengths
+            ValueError: If times and values have different lengths, are empty,
+                or contain timestamps that cannot be represented exactly as
+                HEC int32 epoch minutes; if ``dss_version`` is invalid; or if
+                an existing file does not match the requested version.
             ImportError: If pyjnius is not installed
             RuntimeError: If Java write operation fails
 
@@ -1333,10 +3435,9 @@ class RasDss:
             on first use. The HEC epoch is 1899-12-31 00:00:00; times are stored
             as integer minutes since that epoch.
         """
-        RasDss._configure_jvm()
-
-        from jnius import autoclass
         from ras_commander.RasUtils import RasUtils
+
+        dss_version = RasDss._validate_dss_version(dss_version)
 
         # Validate inputs
         values = np.asarray(values, dtype=np.float64)
@@ -1347,19 +3448,31 @@ class RasDss:
         if len(times) == 0:
             raise ValueError("times and values must not be empty")
 
+        # Validate the model-clock representation before JVM setup or any
+        # filesystem mutation.
+        hec_times = RasDss._datetimes_to_hec_times(times)
+
         # Resolve DSS file path
         dss_path = Path(dss_file)
-        if not dss_path.exists():
+        file_existed = dss_path.exists()
+        if file_existed and not dss_path.is_file():
+            raise IsADirectoryError(f"DSS path is not a file: {dss_path}")
+        if file_existed and dss_version is not None:
+            existing_version = RasDss._get_file_version_java(dss_path)
+            if existing_version != dss_version:
+                raise ValueError(
+                    f"Existing DSS file is version {existing_version}, not "
+                    f"requested version {dss_version}: {dss_path}"
+                )
+        if not file_existed:
             if not create_if_missing:
                 raise FileNotFoundError(f"DSS file not found: {dss_path}")
             # HecDss.open() will create the file
             dss_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info(f"DSS file will be created: {dss_path}")
+            logger.info(f"DSS file will be created: {dss_path.name}")
+            logger.debug(f"DSS file creation path: {dss_path}")
 
         dss_file_str = str(RasUtils.safe_resolve(dss_path))
-
-        # Convert times to HEC epoch (minutes since 1899-12-31)
-        hec_times = RasDss._datetimes_to_hec_times(times)
 
         # Detect interval from time spacing
         if len(hec_times) > 1:
@@ -1368,9 +3481,14 @@ class RasDss:
         else:
             interval_minutes = 60  # Default 1 hour
 
+        RasDss._configure_jvm()
+
+        from jnius import autoclass, cast
+
         # Load Java classes
         HecDss = autoclass('hec.heclib.dss.HecDss')
         TimeSeriesContainer = autoclass('hec.io.TimeSeriesContainer')
+        HecTimeArray = autoclass('hec.heclib.util.HecTimeArray')
 
         # Create TimeSeriesContainer
         tsc = TimeSeriesContainer()
@@ -1378,24 +3496,33 @@ class RasDss:
         tsc.units = units
         tsc.type = data_type
         tsc.interval = interval_minutes
+        tsc.setStoreAsDoubles(True)
 
-        # Set times array (Java int[])
+        # Use typed Java setters. PyJNIus cannot reliably assign primitive
+        # array fields directly, and HecDss.put() has an ambiguous overload.
         n = len(values)
+        time_status = tsc.setTimes(HecTimeArray(hec_times.tolist()))
+        value_status = tsc.setValues(values.tolist())
+        if time_status != 0 or value_status != 0:
+            raise RuntimeError(
+                "HEC time-series container rejected input arrays: "
+                f"times={time_status}, values={value_status}"
+            )
         tsc.numberValues = n
-
-        # Convert numpy arrays to Java-compatible arrays
-        # pyjnius handles int[] and double[] conversion from Python lists
-        tsc.times = hec_times.tolist()
-        tsc.values = values.tolist()
 
         # Open DSS file and write
         dss = None
         try:
-            dss = HecDss.open(dss_file_str)
-            dss.put(tsc)
-            logger.info(
-                f"Wrote {n} values to {pathname} in {Path(dss_file_str).name} "
-                f"(units={units}, type={data_type}, interval={interval_minutes}min)"
+            dss = (
+                HecDss.open(dss_file_str, dss_version)
+                if dss_version is not None and not file_existed
+                else HecDss.open(dss_file_str)
+            )
+            dss.put(cast('hec.io.DataContainer', tsc))
+            logger.info(f"Wrote {n} values to {Path(dss_file_str).name}")
+            logger.debug(
+                f"DSS write details: file={dss_file_str}, pathname={pathname}, "
+                f"units={units}, type={data_type}, interval={interval_minutes}min"
             )
         except Exception as e:
             raise RuntimeError(
@@ -1406,7 +3533,10 @@ class RasDss:
             ) from e
         finally:
             if dss is not None:
-                dss.done()
+                try:
+                    dss.done()
+                finally:
+                    RasDss._release_dss_file(dss_file_str)
 
     @staticmethod
     @log_call
@@ -1418,6 +3548,8 @@ class RasDss:
         units: str = "CFS",
         data_type: str = "INST-VAL",
         create_if_missing: bool = True,
+        *,
+        dss_version: Optional[int] = None,
     ) -> None:
         """
         Write a time series DataFrame to a DSS file.
@@ -1428,11 +3560,14 @@ class RasDss:
         Args:
             dss_file: Path to DSS file
             pathname: DSS pathname
-            df: DataFrame with DatetimeIndex and value column
+            df: DataFrame with a timezone-naive DatetimeIndex and value column
             value_column: Name of column containing values (default "value")
             units: Data units string
             data_type: DSS data type string
             create_if_missing: Create DSS file if it doesn't exist
+            dss_version: Major DSS version (6 or 7) for new-file creation.
+                Omit it to preserve the current default. Existing files must
+                match an explicit value.
 
         Example:
             >>> # Read from one DSS file, write to another
@@ -1458,7 +3593,637 @@ class RasDss:
             units=units,
             data_type=data_type,
             create_if_missing=create_if_missing,
+            dss_version=dss_version,
         )
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        """Return whether an existing path is a symlink/junction/reparse point."""
+        if not os.path.lexists(path):
+            return False
+        try:
+            path_stat = os.lstat(path)
+        except OSError as exc:
+            raise OSError(f"Could not safely inspect output path: {path}") from exc
+        file_attributes = int(getattr(path_stat, "st_file_attributes", 0))
+        if file_attributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+            return True
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(is_junction and is_junction())
+
+    @staticmethod
+    def _normalize_finite_real(value: Real, label: str) -> float:
+        """Normalize one accepted Real scalar to a finite float."""
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"{label} must be a finite number")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label} must be a finite number") from exc
+        if not isfinite(normalized):
+            raise ValueError(f"{label} must be a finite number")
+        return normalized
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        """Return a streaming SHA-256 digest without materializing the file."""
+        digest = sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _validate_java_int32(value: int, label: str) -> None:
+        """Reject values that cannot be passed safely to a Java int."""
+        if value < -(2**31) or value > 2**31 - 1:
+            raise ValueError(f"Translated {label} exceeds Java int32 bounds: {value}")
+
+    @staticmethod
+    def _translated_grid_boundaries(
+        source_boundaries: List[pd.Timestamp],
+        interval: pd.Timedelta,
+        time_shift_minutes: int,
+        tail_intervals: int,
+    ) -> List[pd.Timestamp]:
+        """Translate source boundaries and append tail boundaries safely."""
+        try:
+            shift = pd.Timedelta(minutes=time_shift_minutes)
+            translated = [pd.Timestamp(value) + shift for value in source_boundaries]
+            boundary = translated[-1]
+            for _ in range(tail_intervals):
+                boundary = boundary + interval
+                translated.append(boundary)
+        except Exception as exc:
+            raise ValueError(
+                "Time shift or zero-tail extension exceeds supported datetime bounds"
+            ) from exc
+        return translated
+
+    @staticmethod
+    def _format_native_grid_end_datetime(value: pd.Timestamp) -> str:
+        """Format a grid-window end using native HEC-DSS midnight spelling."""
+        timestamp = pd.Timestamp(value)
+        if timestamp == timestamp.normalize():
+            try:
+                previous_day = timestamp - pd.Timedelta(days=1)
+            except Exception as exc:
+                raise ValueError(
+                    "Grid end time cannot be represented with native 2400 syntax"
+                ) from exc
+            return previous_day.strftime("%d%b%Y:2400").upper()
+        return RasDss._format_grid_dss_datetime(timestamp)
+
+    @staticmethod
+    def _expected_native_grid_pathnames(
+        pathname: str,
+        boundaries: List[pd.Timestamp],
+    ) -> List[str]:
+        """Build exact pathnames as stored by native HEC-DSS grid catalogs."""
+        _, parts = RasDss._split_dss_pathname(pathname)
+        expected = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            record_parts = list(parts)
+            record_parts[3] = RasDss._format_grid_dss_datetime(start)
+            record_parts[4] = RasDss._format_native_grid_end_datetime(end)
+            expected.append(RasDss._build_dss_pathname("/", record_parts))
+        return expected
+
+    @staticmethod
+    def _validate_grid_writer_return(
+        returned: Any,
+        pathname: str,
+        expected_start: pd.Timestamp,
+        expected_end: pd.Timestamp,
+    ) -> str:
+        """Require one exact-family writer result with the expected time window."""
+        if not isinstance(returned, list) or len(returned) != 1:
+            raise RuntimeError(
+                "Grid derivative writer returned an unexpected ordered pathname: "
+                f"{returned}"
+            )
+        returned_pathname = returned[0]
+        try:
+            prefix, returned_parts = RasDss._split_dss_pathname(returned_pathname)
+            _, family_parts = RasDss._split_dss_pathname(pathname)
+            start = RasDss._parse_strict_grid_dss_datetime(returned_parts[3])
+            end = RasDss._parse_strict_grid_dss_datetime(returned_parts[4])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Grid derivative writer returned an unexpected ordered pathname: "
+                f"{returned}"
+            ) from exc
+        if (
+            prefix != "/"
+            or tuple(returned_parts[index] for index in (0, 1, 2, 5))
+            != tuple(family_parts[index] for index in (0, 1, 2, 5))
+            or start != pd.Timestamp(expected_start)
+            or end != pd.Timestamp(expected_end)
+        ):
+            raise RuntimeError(
+                "Grid derivative writer returned an unexpected ordered pathname: "
+                f"{returned}"
+            )
+        return returned_pathname
+
+    @staticmethod
+    def _grid_value_digest(data: np.ndarray) -> str:
+        """Hash float32 grid values with canonical NaN and signed-zero bits."""
+        normalized = np.array(data, dtype="<f4", order="C", copy=True)
+        if normalized.ndim != 2:
+            raise ValueError("Grid data digest requires a two-dimensional frame")
+        nan_mask = ~np.isfinite(normalized)
+        zero_mask = normalized == np.float32(0.0)
+        bits = normalized.view("<u4")
+        bits[nan_mask] = np.uint32(0x7FC00000)
+        bits[zero_mask] = np.uint32(0)
+        return sha256(bits.tobytes(order="C")).hexdigest()
+
+    @staticmethod
+    def _validate_grid_family_selector(
+        pathname: str,
+        label: str,
+    ) -> Tuple[str, List[str]]:
+        """Validate an exact A/B/C/F grid-family selector."""
+        prefix, parts = RasDss._split_dss_pathname(pathname)
+        if parts[3] or parts[4]:
+            raise ValueError(
+                f"{label} must select a grid family with blank D and E parts"
+            )
+        if any("*" in part or "?" in part for part in parts):
+            raise ValueError(f"{label} must not contain wildcard characters")
+        return prefix, parts
+
+    @staticmethod
+    def _select_grid_family_records(
+        catalog: pd.DataFrame,
+        pathname: str,
+        selector_parts: List[str],
+    ) -> List[Tuple[pd.Timestamp, pd.Timestamp, str]]:
+        """Return one validated, ordered grid family from a DSS catalog."""
+        if not isinstance(catalog, pd.DataFrame) or "pathname" not in catalog:
+            raise ValueError("DSS catalog must contain a pathname column")
+
+        selector_key = tuple(
+            selector_parts[index].casefold() for index in (0, 1, 2, 5)
+        )
+        family_variants = set()
+        records: List[Tuple[pd.Timestamp, pd.Timestamp, str]] = []
+        for candidate in catalog["pathname"].astype(str):
+            try:
+                _, candidate_parts = RasDss._split_dss_pathname(candidate)
+            except ValueError:
+                continue
+            candidate_key = tuple(
+                candidate_parts[index].casefold() for index in (0, 1, 2, 5)
+            )
+            if candidate_key != selector_key:
+                continue
+
+            family_variants.add(
+                tuple(candidate_parts[index] for index in (0, 1, 2, 5))
+            )
+            start = RasDss._parse_strict_grid_dss_datetime(candidate_parts[3])
+            end = RasDss._parse_strict_grid_dss_datetime(candidate_parts[4])
+            if start is None or end is None or end <= start:
+                raise ValueError(
+                    f"Grid record has an invalid time window: {candidate}"
+                )
+            records.append((start, end, candidate))
+
+        if not records:
+            raise ValueError(
+                f"No grid records matched pathname family {pathname}"
+            )
+        if len(family_variants) != 1:
+            raise ValueError(
+                "Grid family selector is ambiguous across case-distinct "
+                f"A/B/C/F parts: {sorted(family_variants)}"
+            )
+
+        records.sort(key=lambda item: (item[0], item[1], item[2]))
+        windows = [(start, end) for start, end, _ in records]
+        if len(set(windows)) != len(windows):
+            raise ValueError(
+                "Grid family selector is ambiguous because multiple records "
+                "use the same time window"
+            )
+
+        intervals = {end - start for start, end, _ in records}
+        if len(intervals) != 1:
+            raise ValueError("Matched grid records do not use one uniform interval")
+        for previous, current in zip(records, records[1:]):
+            if current[0] != previous[1]:
+                raise ValueError(
+                    "Matched grid records are not contiguous: "
+                    f"{previous[2]} then {current[2]}"
+                )
+        return records
+
+    @staticmethod
+    def _grid_record_metadata_signature(grid: Dict[str, Any]) -> Dict[str, Any]:
+        """Return all available write-relevant metadata for comparison."""
+        metadata = grid.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError("Grid record is missing metadata")
+        if metadata.get("lower_left_cell") is None:
+            raise ValueError("Grid record is missing lower-left cell metadata")
+        compression = metadata.get("compression")
+        if not isinstance(compression, dict):
+            raise ValueError("Grid record is missing compression metadata")
+
+        return {
+            "shape": tuple(grid.get("shape", ())),
+            "metadata_shape": tuple(metadata.get("shape", ())),
+            "number_of_cells": (
+                metadata.get("number_of_cells_x"),
+                metadata.get("number_of_cells_y"),
+            ),
+            "cell_size": grid.get("cell_size"),
+            "lower_left_cell": tuple(metadata["lower_left_cell"]),
+            "origin": metadata.get("origin"),
+            "grid_type": grid.get("grid_type"),
+            "grid_class": metadata.get("grid_class"),
+            "grid_type_code": metadata.get("grid_type_code"),
+            "crs": grid.get("crs"),
+            "units": grid.get("units"),
+            "data_type": grid.get("data_type"),
+            "data_type_code": metadata.get("data_type_code"),
+            "nodata_value": metadata.get("nodata_value"),
+            "projection": metadata.get("projection"),
+            # element_size is the compressed payload length and legitimately
+            # varies by record. Method/base/scale are the write configuration.
+            "compression": {
+                key: compression.get(key)
+                for key in ("method", "base", "scale_factor")
+            },
+        }
+
+    @staticmethod
+    def _validate_grid_family_metadata(
+        grids: List[Dict[str, Any]],
+        records: List[Tuple[pd.Timestamp, pd.Timestamp, str]],
+    ) -> np.ndarray:
+        """Validate family metadata and return its stable NoData footprint."""
+        if len(grids) != len(records) or not grids:
+            raise ValueError("Grid family records could not be read completely")
+        reference_signature = None
+        reference_mask = None
+        for grid, record in zip(grids, records):
+            signature, mask = RasDss._validate_grid_record_metadata(
+                grid,
+                record,
+                reference_signature,
+                reference_mask,
+            )
+            if reference_signature is None:
+                reference_signature = signature
+                reference_mask = mask
+        if reference_mask is None:
+            raise ValueError("Grid family records could not be read completely")
+        return reference_mask
+
+    @staticmethod
+    def _validate_grid_record_metadata(
+        grid: Dict[str, Any],
+        record: Tuple[pd.Timestamp, pd.Timestamp, str],
+        reference_signature: Optional[Dict[str, Any]],
+        reference_mask: Optional[np.ndarray],
+    ) -> Tuple[Dict[str, Any], np.ndarray]:
+        """Validate one streamed grid record against a compact reference."""
+        start, end, record_path = record
+        RasDss._validate_grid_raw_timing(grid, start, end, record_path)
+        signature = RasDss._grid_record_metadata_signature(grid)
+        data = np.asarray(grid.get("data"), dtype=np.float32)
+        if data.ndim != 2 or data.shape != tuple(signature["shape"]):
+            raise ValueError(
+                f"Grid record data shape does not match its metadata: {record_path}"
+            )
+        if tuple(signature["metadata_shape"]) != data.shape:
+            raise ValueError(
+                f"Grid record metadata shape does not match its data: {record_path}"
+            )
+        expected_cells = (data.shape[1], data.shape[0])
+        if tuple(signature["number_of_cells"]) != expected_cells:
+            raise ValueError(
+                f"Grid record cell counts do not match its data: {record_path}"
+            )
+
+        nodata = ~np.isfinite(data)
+        reported_missing = grid["metadata"].get("number_missing")
+        if reported_missing is None or int(reported_missing) != int(nodata.sum()):
+            raise ValueError(
+                f"Grid record NoData count disagrees with its data: {record_path}"
+            )
+
+        if reference_signature is None:
+            cell_size = signature["cell_size"]
+            if (
+                isinstance(cell_size, bool)
+                or not isinstance(cell_size, Real)
+                or not isfinite(float(cell_size))
+                or float(cell_size) <= 0
+            ):
+                raise ValueError(f"Grid family has invalid cell size: {cell_size}")
+            if signature["grid_type"] not in {"albers", "specified"}:
+                raise ValueError(
+                    "Grid family uses an unsupported metadata class for safe "
+                    f"rewrite: {signature['grid_class']}"
+                )
+            if signature["origin"] is None:
+                raise ValueError("Grid family is missing a physical grid origin")
+            return signature, nodata.copy()
+
+        mismatched = [
+            name
+            for name, value in signature.items()
+            if value != reference_signature[name]
+        ]
+        if mismatched:
+            raise ValueError(
+                "Matched grid records have inconsistent write metadata "
+                f"({', '.join(mismatched)}): {record_path}"
+            )
+        if reference_mask is None or not np.array_equal(nodata, reference_mask):
+            raise ValueError(
+                "Matched grid records do not share one stable NoData footprint: "
+                f"{record_path}"
+            )
+        return signature, nodata
+
+    @staticmethod
+    def _validate_grid_raw_timing(
+        grid: Dict[str, Any],
+        expected_start: pd.Timestamp,
+        expected_end: pd.Timestamp,
+        record_path: str,
+    ) -> None:
+        """Require independent raw and normalized timing to match a pathname."""
+        metadata = grid.get("metadata")
+        timing = metadata.get("timing") if isinstance(metadata, dict) else None
+        if not isinstance(timing, dict):
+            raise ValueError(
+                f"Grid record is missing raw timing metadata: {record_path}"
+            )
+        raw_start = RasDss._parse_grid_raw_datetime(timing.get("start"))
+        raw_end = RasDss._parse_grid_raw_datetime(timing.get("end"))
+        if raw_start is None or raw_end is None:
+            raise ValueError(
+                f"Grid record has missing or invalid raw timing metadata: {record_path}"
+            )
+        if raw_start != expected_start or raw_end != expected_end:
+            raise ValueError(
+                "Grid record raw timing metadata disagrees with its pathname: "
+                f"{record_path}"
+            )
+        top_start = grid.get("start_time")
+        top_end = grid.get("end_time")
+        if (
+            top_start is None
+            or top_end is None
+            or pd.Timestamp(top_start) != expected_start
+            or pd.Timestamp(top_end) != expected_end
+        ):
+            raise ValueError(
+                "Grid record normalized timing disagrees with its pathname: "
+                f"{record_path}"
+            )
+
+    @staticmethod
+    def _parse_grid_raw_datetime(value: Any) -> Optional[pd.Timestamp]:
+        """Parse only the exact pathname or Java raw grid time spellings."""
+        parsed = RasDss._parse_strict_grid_dss_datetime(value)
+        if parsed is not None:
+            return parsed
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(
+            r"(\d{1,2}) "
+            r"(January|February|March|April|May|June|July|August|September|"
+            r"October|November|December) "
+            r"(\d{4}), (\d{2}):(\d{2})",
+            value,
+        )
+        if match is None:
+            return None
+        day_text, month_text, year_text, hour_text, minute_text = match.groups()
+        months = {
+            "January": 1,
+            "February": 2,
+            "March": 3,
+            "April": 4,
+            "May": 5,
+            "June": 6,
+            "July": 7,
+            "August": 8,
+            "September": 9,
+            "October": 10,
+            "November": 11,
+            "December": 12,
+        }
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if hour == 24:
+            if minute != 0:
+                return None
+            hour = 0
+            day_offset = 1
+        elif 0 <= hour <= 23 and 0 <= minute <= 59:
+            day_offset = 0
+        else:
+            return None
+        try:
+            parsed_datetime = datetime(
+                int(year_text),
+                months[month_text],
+                int(day_text),
+                hour,
+                minute,
+            ) + timedelta(days=day_offset)
+            return pd.Timestamp(parsed_datetime)
+        except (OverflowError, ValueError):
+            return None
+
+    @staticmethod
+    def _whole_grid_cell_shift(
+        shift: float,
+        cell_size: float,
+        label: str,
+    ) -> int:
+        """Return an exact whole-cell quotient for a spatial translation."""
+        try:
+            quotient = Decimal(str(shift)) / Decimal(str(cell_size))
+        except (InvalidOperation, ZeroDivisionError) as exc:
+            raise ValueError(f"{label} cannot be resolved in grid cells") from exc
+        integral = quotient.to_integral_value()
+        if quotient != integral:
+            raise ValueError(f"{label} must be an exact whole grid-cell increment")
+        return int(integral)
+
+    @staticmethod
+    def _grid_write_info_from_record(
+        grid: Dict[str, Any],
+        output_lower_left: Tuple[int, int],
+    ) -> Dict[str, Any]:
+        """Map one validated read-grid result back to writer metadata."""
+        metadata = grid["metadata"]
+        projection = dict(metadata.get("projection") or {})
+        compression = dict(metadata.get("compression") or {})
+        required_compression = {"method", "base", "scale_factor"}
+        missing_compression = sorted(required_compression - compression.keys())
+        if missing_compression:
+            raise ValueError(
+                "Grid record is missing compression fields required for rewrite: "
+                f"{missing_compression}"
+            )
+        required_projection = {
+            "x_coord_cell_zero",
+            "y_coord_cell_zero",
+        }
+        if grid["grid_type"] == "albers":
+            required_projection.update(
+                {
+                    "datum_code",
+                    "units",
+                    "standard_parallel_1",
+                    "standard_parallel_2",
+                    "central_meridian",
+                    "latitude_of_origin",
+                    "false_easting",
+                    "false_northing",
+                }
+            )
+        missing_projection = sorted(required_projection - projection.keys())
+        if missing_projection:
+            raise ValueError(
+                "Grid record is missing projection fields required for rewrite: "
+                f"{missing_projection}"
+            )
+        grid_info = {
+            "cell_size": float(grid["cell_size"]),
+            "lower_left_cell_x": int(output_lower_left[0]),
+            "lower_left_cell_y": int(output_lower_left[1]),
+            "crs": grid["crs"],
+            "grid_type": grid["grid_type"],
+            "units": grid["units"],
+            "data_type": grid["data_type"],
+            "nodata_value": metadata.get("nodata_value"),
+            "compression": compression.get("method"),
+            "compression_element_size": 0,
+            # The Java setter's final two positional values are exposed in the
+            # opposite order by getCompressionBase()/getCompressionScaleFactor().
+            "compression_base": compression.get("scale_factor", 0.0),
+            "compression_scale_factor": compression.get("base", 100.0),
+        }
+        if grid["grid_type"] in {"albers", "specified"}:
+            grid_info.update(
+                {
+                    "x_coord_cell_zero": projection.get(
+                        "x_coord_cell_zero",
+                        0.0,
+                    ),
+                    "y_coord_cell_zero": projection.get(
+                        "y_coord_cell_zero",
+                        0.0,
+                    ),
+                }
+            )
+        if grid["grid_type"] == "albers":
+            grid_info.update(
+                {
+                    "projection_datum": projection.get("datum_code"),
+                    "projection_units": projection.get("units"),
+                    "standard_parallel_1": projection.get("standard_parallel_1"),
+                    "standard_parallel_2": projection.get("standard_parallel_2"),
+                    "central_meridian": projection.get("central_meridian"),
+                    "latitude_of_origin": projection.get("latitude_of_origin"),
+                    "false_easting": projection.get("false_easting"),
+                    "false_northing": projection.get("false_northing"),
+                }
+            )
+        return grid_info
+
+    @staticmethod
+    def _create_empty_dss(dss_file: Path, dss_version: int) -> None:
+        """Create an empty DSS file at an explicit major version."""
+        if dss_file.exists():
+            raise FileExistsError(f"Temporary DSS path already exists: {dss_file}")
+        if dss_version not in (6, 7):
+            raise ValueError(f"Unsupported DSS version: {dss_version}")
+
+        RasDss._configure_jvm()
+
+        from jnius import autoclass
+
+        from ras_commander.RasUtils import RasUtils
+
+        HecDss = autoclass("hec.heclib.dss.HecDss")
+        resolved_path = str(RasUtils.safe_resolve(dss_file))
+        dss = None
+        try:
+            dss = HecDss.open(resolved_path, dss_version)
+            if dss is None:
+                raise RuntimeError(
+                    f"HEC-DSS did not create version {dss_version}: {dss_file}"
+                )
+        finally:
+            if dss is not None:
+                try:
+                    dss.done()
+                finally:
+                    RasDss._release_dss_file(resolved_path)
+        if not dss_file.is_file():
+            raise RuntimeError(
+                f"HEC-DSS did not create temporary file: {dss_file}"
+            )
+
+    @staticmethod
+    def _close_dss_file(dss_file: Path) -> None:
+        """Release native DSS handles associated with one resolved path."""
+        RasDss._configure_jvm()
+
+        from jnius import autoclass
+
+        from ras_commander.RasUtils import RasUtils
+
+        GriddedData = autoclass("hec.heclib.grid.GriddedData")
+        GriddedData.close(str(RasUtils.safe_resolve(dss_file)), True)
+
+    @staticmethod
+    def _best_effort_close_dss_file(dss_file: Path, phase: str) -> None:
+        """Path-close one DSS without masking a phase's primary exception."""
+        try:
+            RasDss._close_dss_file(dss_file)
+        except Exception as exc:
+            logger.warning(
+                "Could not close DSS %s %s (%s)",
+                dss_file,
+                phase,
+                exc,
+            )
+
+    @staticmethod
+    def _cleanup_temporary_dss(dss_file: Path) -> None:
+        """Best-effort close and removal that never masks a primary error."""
+        try:
+            if dss_file.exists():
+                RasDss._close_dss_file(dss_file)
+        except Exception as exc:
+            logger.warning(
+                "Could not close temporary DSS during cleanup: %s (%s)",
+                dss_file,
+                exc,
+            )
+        try:
+            dss_file.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning(
+                "Could not remove temporary DSS during cleanup: %s (%s)",
+                dss_file,
+                exc,
+            )
 
     @staticmethod
     def _split_dss_pathname(pathname: str) -> Tuple[str, List[str]]:
@@ -1499,6 +4264,9 @@ class RasDss:
         """Parse a DSS grid D/E datetime part, returning None when blank."""
         if not value:
             return None
+        if value.endswith(":2400"):
+            day = pd.Timestamp(pd.to_datetime(value[:-5], format="%d%b%Y"))
+            return day + pd.Timedelta(days=1)
         try:
             return pd.Timestamp(pd.to_datetime(value, format="%d%b%Y:%H%M"))
         except ValueError:
@@ -1506,6 +4274,56 @@ class RasDss:
                 return pd.Timestamp(pd.to_datetime(value.replace(":", " ")))
             except Exception:
                 return None
+
+    @staticmethod
+    def _parse_strict_grid_dss_datetime(value: str) -> Optional[pd.Timestamp]:
+        """Parse exact minute-granularity DSS grid time with a 2400 exception."""
+        if not isinstance(value, str) or not value:
+            return None
+        match = re.fullmatch(
+            r"(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
+            r"(\d{4}):(\d{2})(\d{2})",
+            value,
+        )
+        if match is None:
+            return None
+        day_text, month_text, year_text, hour_text, minute_text = match.groups()
+        months = {
+            "JAN": 1,
+            "FEB": 2,
+            "MAR": 3,
+            "APR": 4,
+            "MAY": 5,
+            "JUN": 6,
+            "JUL": 7,
+            "AUG": 8,
+            "SEP": 9,
+            "OCT": 10,
+            "NOV": 11,
+            "DEC": 12,
+        }
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if hour == 24:
+            if minute != 0:
+                return None
+            hour = 0
+            day_offset = 1
+        elif 0 <= hour <= 23 and 0 <= minute <= 59:
+            day_offset = 0
+        else:
+            return None
+        try:
+            parsed = datetime(
+                int(year_text),
+                months[month_text],
+                int(day_text),
+                hour,
+                minute,
+            ) + timedelta(days=day_offset)
+            return pd.Timestamp(parsed)
+        except (OverflowError, ValueError):
+            return None
 
     @staticmethod
     def _split_grid_datetime_part(value: str) -> Tuple[str, str]:
@@ -1536,6 +4354,51 @@ class RasDss:
         return data_type_codes[normalized]
 
     @staticmethod
+    def _reject_timezone_aware_times(
+        times: Union[List, np.ndarray, pd.DatetimeIndex],
+    ) -> None:
+        """Reject timestamps whose model-clock representation is ambiguous.
+
+        HEC-DSS records store calendar-clock values without timezone metadata.
+        Silently converting aware timestamps would choose a model clock on the
+        caller's behalf, so writers require callers to convert to the intended
+        clock and remove timezone metadata explicitly.
+        """
+        if isinstance(times, pd.DatetimeIndex):
+            if times.tz is not None:
+                raise ValueError(
+                    "times must be timezone-naive; explicitly convert to the "
+                    "intended HEC-RAS model clock and remove timezone metadata "
+                    "before writing"
+                )
+            return
+
+        if (
+            isinstance(times, np.ndarray)
+            and np.issubdtype(times.dtype, np.datetime64)
+        ):
+            return
+
+        values = [times] if isinstance(times, (str, bytes)) else list(times)
+        for value in values:
+            parsed = value
+            if isinstance(value, str):
+                try:
+                    parsed = pd.Timestamp(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            if getattr(parsed, "tzinfo", None) is not None or getattr(
+                parsed,
+                "tz",
+                None,
+            ) is not None:
+                raise ValueError(
+                    "times must be timezone-naive; explicitly convert to the "
+                    "intended HEC-RAS model clock and remove timezone metadata "
+                    "before writing"
+                )
+
+    @staticmethod
     def _grid_time_windows(
         times: Union[List, np.ndarray, pd.DatetimeIndex],
         n_times: int,
@@ -1544,9 +4407,8 @@ class RasDss:
         pathname_parts: List[str],
     ) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
         """Convert user times into per-grid start/end windows."""
+        RasDss._reject_timezone_aware_times(times)
         dt_index = pd.DatetimeIndex(pd.to_datetime(times))
-        if dt_index.tz is not None:
-            dt_index = dt_index.tz_convert(None)
 
         if len(dt_index) == n_times + 1:
             return [
@@ -1781,28 +4643,45 @@ class RasDss:
             times: Array of datetime-like values
 
         Returns:
-            numpy int array of minutes since HEC epoch (1899-12-31 00:00:00)
+            numpy int32 array of minutes since HEC epoch
+            (1899-12-31 00:00:00)
         """
-        HEC_EPOCH = np.datetime64('1899-12-31T00:00:00')
+        hec_epoch = np.datetime64('1899-12-31T00:00:00', 'm')
+        RasDss._reject_timezone_aware_times(times)
 
-        if isinstance(times, pd.DatetimeIndex):
-            dt64 = times.values.astype('datetime64[m]')
-        elif isinstance(times, np.ndarray):
-            dt64 = times.astype('datetime64[m]')
-        else:
-            # List of datetime objects
-            dt64 = np.array(times, dtype='datetime64[m]')
+        try:
+            if isinstance(times, pd.DatetimeIndex):
+                datetime_values = times.values.astype('datetime64[us]')
+            elif isinstance(times, np.ndarray):
+                datetime_values = times.astype('datetime64[us]')
+            else:
+                datetime_values = pd.to_datetime(times).to_numpy(
+                    dtype='datetime64[us]'
+                )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("times must contain valid datetime values") from exc
 
-        # Calculate minutes since HEC epoch
-        delta = dt64 - HEC_EPOCH
-        minutes = delta.astype(np.int64)
+        if np.isnat(datetime_values).any():
+            raise ValueError("times must not contain NaT values")
 
-        if minutes.max() > np.iinfo(np.int32).max:
-            logger.warning(
-                f"HEC epoch minutes ({minutes.max()}) exceeds int32 range; "
-                "passing as int64 — verify HEC-DSS Java bridge accepts int64"
-            )
-        return minutes
+        minute_values = datetime_values.astype('datetime64[m]')
+        if not np.array_equal(
+            datetime_values,
+            minute_values.astype('datetime64[us]'),
+        ):
+            raise ValueError("times must be aligned exactly to whole minutes")
+
+        minutes = (
+            (minute_values - hec_epoch)
+            .astype('timedelta64[m]')
+            .astype(np.int64)
+        )
+        if minutes.size:
+            int32_info = np.iinfo(np.int32)
+            if minutes.min() < int32_info.min or minutes.max() > int32_info.max:
+                raise ValueError("times exceed the supported HEC int32 minute range")
+
+        return minutes.astype(np.int32)
 
 
 if __name__ == "__main__":

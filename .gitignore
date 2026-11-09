@@ -73,7 +73,16 @@ research/**/temp/
 research/**/.ipynb_checkpoints/
 research/**/*.pyc
 research/**/__pycache__/
-/feature_dev_notes
+/feature_dev_notes/*
+!/feature_dev_notes/README.md
+!/feature_dev_notes/multicore_raster_processing/
+!/feature_dev_notes/multicore_raster_processing/*.md
+!/feature_dev_notes/structured_execution_evidence/
+!/feature_dev_notes/structured_execution_evidence/*.md
+!/feature_dev_notes/Mesh_Grid_Anchor/
+!/feature_dev_notes/Mesh_Grid_Anchor/**
+!/feature_dev_notes/rust_hdf_acceleration/
+!/feature_dev_notes/rust_hdf_acceleration/*.md
 /research
 !/research/
 !/research/fixtures/
@@ -98,6 +107,9 @@ examples/example_projects.csv
 # Ignore remote worker credentials and API keys
 examples/RemoteWorkers.json
 RemoteWorkers.json
+# Timestamped backups can contain the same credentials as the live files.
+RemoteWorkers.json.*.bak
+examples/RemoteWorkers.json.*.bak
 examples/usgs_api_key.txt
 usgs_api_key.txt
 /troubleshooting
@@ -116,6 +128,17 @@ docs/notebooks/
 docs/cognitive-infrastructure/agents.md
 docs/cognitive-infrastructure/skills.md
 docs/cognitive-infrastructure/commands.md
+
+# Ignore the agent-native API surface (generated at build time by
+# .claude/scripts/generate_api_surface.py; served under /ras)
+docs/version.json
+docs/llms/api/
+
+# Ignore generated example-gallery data + thumbnails (built from examples/notebooks.yml
+# by .claude/scripts/generate_examples_index.py). docs/examples/index.md is a committed
+# snapshot (kept current); index.json + thumbnails are build artifacts.
+docs/examples/index.json
+docs/assets/thumbs/
 
 # Ignore M3 model downloads (large files, downloaded via M3Model.extract_model())
 m3_models/
@@ -164,8 +187,12 @@ check_*.py
 !ras_commander/check/check_*.py
 fix_*.py
 run_*.py
+!scripts/qualification/execution_evidence/run_io.py
+!scripts/benchmarks/run_raster_profile_matrix.py
 test_*.py
 !tests/test_*.py
+!tests/qualification/
+!tests/qualification/test_*.py
 monitor_*.py
 cayce_*.py
 ai_tools/generate_*.py  # Only ignore AI tool generators, not scripts/
@@ -227,6 +254,7 @@ ras_commander/sources/*
 !ras_commander/sources/base.py
 !ras_commander/sources/county/
 !ras_commander/sources/federal/
+!ras_commander/sources/state/
 
 # Claude Code workspace directories
 examples/.claude/
@@ -247,3 +275,4 @@ terminal-logs/
 .env.local
 .pypirc
 /agent_tasks/plans
+rust/step05/target/

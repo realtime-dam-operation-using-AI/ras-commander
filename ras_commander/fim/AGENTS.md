@@ -1,0 +1,241 @@
+# ras_commander.fim Contract
+
+Local rules for the optional ras2fim-2D flood inundation mapping (FIM) subpackage.
+Parent `ras_commander/AGENTS.md` and root `AGENTS.md` still apply.
+
+## Scope
+
+- `RasFim.map_profiles` maps 2D cell WSE profiles with the ras2fim-2D Step 05 method through the external
+  `ras2fim-batch` engine. It is not RAS Mapper stored mapping; never describe the products as
+  equivalent to `RasProcess.store_maps()` output.
+- The engine is optional: the `fim` extra installs ras-commander-fast-map on
+  qualified Windows/Linux x64 platforms. Resolve explicit `engine_path`, then
+  `RAS_COMMANDER_FIM_ENGINE`, PATH, and the installed distribution's script.
+  Runtime mapping never builds/downloads/installs it or falls back to Python arithmetic.
+- Do not reimplement the engine numerics in Python or Rust here. Python owns sample preparation,
+  SciPy Delaunay export, grid derivation, product writing, and the manifest. The engine source
+  is https://github.com/gpt-cmdr/ras-commander-fast-map. The Step05 numerical path remains identical to the reviewed ras2fim-2D
+  copy; the independent horizontal module has its own method contract and qualification.
+- `map_horizontal_profiles` is a separate, explicit cell-constant method. Rust is the default;
+  NumPy is an explicit qualification reference, never a fallback. It uses float32 cell WSE,
+  terrain-lattice ownership and native float32 visibility WSE >= terrain + 0.001
+  before subtraction. Preserve operation order: a post-subtraction tolerance is
+  not equivalent. Zero min_depth adds no cutoff; positive optional filters apply
+  to depth and WSE after native visibility. Method /2 requires engine0.7 or newer. It does not implement native sloping, 1D or structure-specific rendering.
+  Its manifest records `method_id`, `backend`, threshold and grid. Shared product names
+  are layout conventions; determine the method from the manifest.
+
+## Invariants
+
+- Horizontal/sloping polygon coverage requires `global-terrain-lattice/1`.
+  Normalize AOI coordinates against the full terrain transform once; evaluate
+  scanlines and pixel centers globally, with lower-y and left endpoints
+  included, upper-y and right excluded (northward y). No crop-origin arithmetic
+  or geometric epsilon enters intersections. Keep cell ownership/interpolation
+  unchanged; older engines must refuse polygon requests rather than silently
+  using legacy mask ties. The explicit NumPy reference follows this rule.
+
+- `map_sloping_profiles` is a separate experimental native plain-sloping method,
+  `rasmapper-plain-sloping/1`. It reads complete HDF topology and virtual cell WSE
+  through the Rust HDF backend; Rust reconstructs hydraulic face connections,
+  corner values and polygon/square pixel weights. Preserve binary32 operation
+  order, side-specific disconnected corner values and native intrinsic plot
+  tolerance. It has no additional depth cutoff. The optional `slopingPretty`
+  mode adds native corner-to-face weight donation and optional
+  shallow-to-horizontal selection. Keep plain defaults unchanged;
+  the selected method/options must appear in the engine report and manifest.
+  Depth-weighted faces require the advertised engine capability and stored
+  corner ground elevations read by the native HDF backend. Cache-only inputs
+  require a verified preparation receipt binding the plan and terrain sources.
+  `prepare_corner_elevations` is an explicit Windows/7.0.1 native preparation
+  operation, separate from production mapping and its clocks. Never sample
+  missing corner elevations or load HEC-RAS inside ordinary mapping.
+- Cell-face mapping requires `native_donation_history`. Preserve retained donor
+  scratch in fixed 256-point ranges per source terrain tile. Replay complete
+  physical cell geometry, including predecessors outside AOIs, for affected
+  cells; independently clearing pixel scratch changes native values. Keep the
+  original source TIFF lattice/tile layout. Full Windows weighted+shallow Max
+  checks pass all five models, including River and Creek, with complete mask/bit
+  equality. Arbitrary retiled terrain and multi-source mosaics are unqualified.
+- Sloping cell polygons come from `_invalid_cells.load_cells` (non-strict
+  native assembly). A self-intersecting cell follows `invalid_cells`
+  (default `repair`: noded face regions minus valid-cell area, largest part,
+  lower-left tie-break; `hull`, `omit`, or AOI-scoped `raise`). Overlaps among
+  valid cells touching its hull, closed transitively over overlaps, resolve in
+  ascending cell ID. Never drop unclaimed area: split cells keep every piece
+  as same-address Polygon rows; consumed cells own no pixels and are recorded.
+  Overlaps elsewhere still refuse. Only ownership changes, never stencils or
+  topology. Record every affected cell in the manifest `invalid_cells`. The
+  default reproduced native 7.0.1 sloping pixels around Glaise Creek's three
+  cells (limited evidence; `omit` left holes). Valid meshes stay identical.
+- Horizontal, whole-simulation and comparison mapping assemble strictly first
+  and call `_invalid_cells.load_cells` only after `MeshCellPolygonError`, so
+  valid meshes keep their strict polygons. `get_cells_from_plan_hdf` fixes
+  ownership (split cell = one MultiPolygon row, record in
+  `attrs["fim_invalid_cells"]`); mapping requires the same policy, explodes
+  recorded splits into per-piece rows and applies AOI-scoped `raise`.
+  Comparison footprints keep omitted/consumed cells. Step 05 refuses rebuilt
+  tables. Glaise native 7.0.1 horizontal and whole-simulation maps match
+  `repair` (one native WSE-only pixel at a crossing point; depth matches).
+- Sloping AOIs constrain terrain/ownership/output pixels only. Keep the complete
+  geometry for hydraulic connectivity and corner reconstruction across boundaries.
+  Geometry, terrain and ownership are reused across all profiles in one request.
+- Sloping raw-mask/bit qualification targets native 7.0.1. Max profiles on Davis
+  pipes/conduits and Bald Eagle dam/bridge meshes, plus two Davis timesteps,
+  currently pass. Bounded Max tests also pass on Spring River and Spring Creek
+  with full global topology. Final Windows Max checks also match the full
+  physical 2D footprints of both eBFE fixtures. This evidence does not establish
+  full-extent Linux eBFE or unweighted face-mode eBFE,
+  other native versions, 1D,
+  storage areas outside the physical 2D footprint, or all option combinations.
+- `terrain_hdf` (sloping, horizontal, whole simulation) maps on the original
+  priority-1 source TIFF with the engine's `terrain_scope`
+  (`top-priority-source-footprint/1`). Priority comes only from source
+  `Priority` attributes (0 highest) or, when none exist, the terrain's own VRT
+  order; both must agree when present. Refuse partial, duplicate or conflicting
+  declarations, modified terrains, non-256 tiling and storage-area plans
+  unless `storage_areas=True` (then the engine refuses storage-area pixels
+  outside the footprint). A
+  `canonicalize_terrain_crs` copy is accepted only through its receipt and a
+  fresh pixel-hash match. Engine `unsupported:` refusals surface as
+  `FimUnsupportedError` (`_engine.EngineRefusal`) so callers fall back to an
+  exported terrain; never widen the footprint or mosaic lower-priority sources.
+- `terrain_crs_fnv1a64` (Step05, sloping and prepared sloping) accepts only an
+  engine WKT hash equal to `terrain-info`'s `crs_wkt_fnv1a64`, and only when the
+  engine reports no EPSG code. rasterio must still resolve an EPSG code equal to
+  the results CRS. Record the accepted `crs_identity`; never infer or default a hash.
+- `map_whole_simulation` stages every stored output time's raw cell WSE, cell
+  minimum elevations and float64 hours since the plan's simulation start; the
+  engine owns the wet gate and accumulation. Arrival time and percent
+  inundated are the qualified defaults; duration and irregular intervals need
+  `allow_unqualified`. Storage-area plans are refused unless
+  `storage_areas=True`.
+- `storage_areas` (sloping, horizontal, whole simulation) stages the plan's
+  storage-area polygons and per-profile WSE for the engine's
+  `storage-area-level-pool/1` (`_storage_areas.py`). Never infer the Water
+  Surface column order: prove it per area against its own Stage series. Keep
+  overlap with 2D cells or between storage areas refused; velocity, supplied
+  WSEL and prepared models refuse the option. `RasFim.supports_storage_areas()`
+  is the capability check.
+- Sloping `velocity=True` stages HDF face normals with face polyline lengths and
+  per-profile face velocities (Max: `Maximum Face Velocity`). Plain sloping
+  with HDF profiles only. Native velocity validity masks can differ from the
+  rendered depth mask on a small fraction of edge pixels (bridges p05 Max:
+  826 native-only and 1,196 extra of 973,532); values on common pixels match.
+- `_sloping_oracle.py` is a development reference reader only. Production mapping
+  must not import it or depend on installed HEC-RAS DLLs. Never commit decompiled
+  vendor source, captured project geometry, or generated raster evidence.
+
+- Model-backed 2D mapping entry points reject any 1D river centerline/reach or cross-section geometry before
+  mesh selection or engine execution. Coupled pipe hydraulic tables alone are permitted.
+  Preserve source-HDF provenance on extracted cell tables; standalone polygon tables cannot
+  establish the dimensional scope of an unseen source model.
+  Explicit qualification-gated 1D and coupled APIs perform their own dimensional
+  admission; they do not route mixed inputs through the 2D-only entry points.
+- Step05 preparation is global. Wet samples, triangulation, query axes, and the wet mask use every wet
+  cell before any AOI. An AOI selects output pixels on the final grid only. Never subset or
+  retriangulate for an AOI.
+- Preserve the upstream sample order and float semantics; changes need qualification against the
+  retained Step 05 oracle. The defaults (`grid_anchor="ras2fim"`, `coplanar="error"`) are the
+  upstream recipe; the opt-in `grid_anchor="terrain"` and `coplanar="ignore"` are recorded
+  departures and never become defaults silently.
+- Horizontal ownership and terrain are prepared once for the constrained terrain window and
+  reused across profiles. Spatially filter geometry before checking/rasterizing it. Reject
+  overlapping interiors instead of smoothing or averaging across cells. Planned array
+  admission excludes polygonization and is not a hard RSS limit.
+- Inputs are read-only. Products go to a new or empty `output_folder`. Input file identities are
+  checked after mapping.
+- Failures are explicit: missing engine, engine exit codes other than 0/2, inconsistent units, and
+  unsupported inputs raise or mark the profile `failed`; `map_profiles` raises `FimMappingError`
+  after writing `fim_manifest.json`.
+- Cell centres come from `HdfMesh.get_mesh_cell_points`, never raw HDF paths.
+- Sloping uses typed centers (`include_geometry=False`) and reuses immutable,
+  source-indexed per-mesh timestep views. Retain required-native payload reads
+  and per-read source identity validation. Overlap predicate batches are bounded;
+  batching must not omit candidate pairs or alter ownership.
+- Sloping `writer_threads` explicitly scopes GDAL compression settings, including
+  the default of one, and restores the enclosing setting on exceptions. Rust
+  `threads` and compression workers are separate budgets that can overlap.
+- Sloping `max_inflight_profiles` defaults to one. All in-flight profiles share
+  one Rayon pool; cap effective admission by requested concurrency, threads,
+  profile count and available planned memory. Keep stencils/terrain/ownership
+  immutable, preserve per-profile arithmetic and ordered stream/report emission.
+  Failures clean already delivered products. Require an advertised capability
+  for concurrency, retaining sequential compatibility with older engines.
+- The returned manifest columns are declared as `fim_product_manifest` in `ras_commander/schemas.py`.
+
+## Catalog workflow for agents
+
+- Use `RasFim.map_catalog` for multiple area/timestep groups. Read
+  `docs/native-mapping-engine.md` sections "Build jobs from a watershed layer" and
+  "Choose a throughput policy" before planning a large catalog.
+- Each job supplies one selected watershed polygon (or an intentional bbox),
+  complete source HDF/qualified terrain paths, a safe unique `job_id`, and an
+  ordered list of zero-based saved-time indices or `"Max"`. Select one feature
+  from multi-feature files/GeoDataFrames; do not pass the entire watershed union
+  to every reach. Preserve CRS, holes, duplicate times and requested ordering.
+- Start with `strategy="reuse"`, one worker, bounded preparation waves and
+  default caches for overlapping times on one model. Test parallel independent
+  jobs only under the same global CPU/RAM limits. `max_inflight_profiles` shares
+  a worker's pool; it is not another CPU allocation. Count per-worker working,
+  prepared and headroom reservations before choosing `max_workers`.
+- Fast-Map 0.11.0 release-line capabilities add hydraulic/multiple-window
+  retention and native sloping TIFF delivery. Inspect capability flags; use
+  `product_writer="native"` only when supported and compatible with the job.
+  Rasterio remains the default. Keep source arrays/global topology complete;
+  let the engine window terrain and mask outputs. Do not crop/retile cell-face
+  terrain or subset hydraulic dependencies to obtain a smaller request.
+- Check both `catalog_status` and per-row statuses. Preserve receipts and
+  source identities; report total wall time and sampled tree memory with
+  hardware/options. A returned partial manifest is not success. Use a fresh
+  output folder for retries and benchmarking. No silent fallback, auto terrain
+  preparation, added depth cutoff, or universal area-to-speedup assumption.
+
+## Testing
+
+- Supplied `wsel_profiles` tables bind complete mesh-local cell IDs to the original
+  source HDF. Require every mesh and every physical/ghost row; never fill absent
+  IDs from Max or a timestep. NaN explicitly means dry and becomes finite float32
+  minimum; reject infinity/overflow. Preserve float32 bits and caller ordering of
+  profile columns while aligning row IDs. Caller snapshots/staged hashes identify
+  the source, and an AOI never relaxes completeness. Aggregation, decimal rounding,
+  elevation-unit/datum correctness and new-terrain qualification remain caller
+  responsibilities. The mapping terrain stays independent of hydraulic geometry.
+
+- Unit tests use synthetic frames and a simulated engine. Engine-backed tests are opt-in through
+  `RAS_COMMANDER_FIM_ENGINE` and `RAS_COMMANDER_FIM_FIXTURE`; they never run HEC-RAS.
+- Do not commit fixtures, prepared inputs, engine builds, or products.
+
+- `compare_with_rasmapper` generates native horizontal maps only through `RasProcess`,
+  uses the same re-entrant project lock, verifies/restores the original rasmap bytes in finally,
+  and rejects reference resampling. Its scope is the selected 2D cell footprint/AOI, not native
+  1D/structure/sloping rendering. Report reference missing WSE separately from finite pairs.
+- Comparison performance belongs in `DataFrame.attrs["performance"]` and its JSON receipt.
+  Separate native stored-map generation, independent optional filtered delivery writes, Rust
+  batch time and comparison scanning. Do not multiply shared batch preparation by profile count
+  or promote a speed ratio for unmatched AOI, mesh or storage-area scope.
+
+## Deterministic boundaries
+
+`map_inundation_boundaries` is `deterministic-zero-depth-contours/1`, not native
+vector parity. Preserve signed sample depths and sample-coverage activation;
+never derive this layer by polygonizing the plotted depth raster. Original
+single-source terrain HDF perimeters/stitch TIN use required native numeric
+reads; the bitfield tile Mask is copied as raw uint8 bytes through h5py when
+the native reader lacks bitfield support (published fast-HDF 0.2.4). Global hydraulics remain complete across
+AOIs, and final contours use stable all-subject NonZero union and clipping.
+Keep canonical holes, explicit projected CRS, bounded tile/profile workers,
+source identities and complete geometry comparison metrics. Preserve existing
+raster arithmetic. Explicit CRS identity pins belong in persisted provenance;
+never apply an automatic CRS override or silently repair reference polygons.
+
+When a model uses multiple terrain sources, the agent must preprocess them into
+one dedicated mapping terrain before invoking this boundary mapper. Preserve
+source priority, CRS, grid, nodata and effective elevations; retain the original
+project terrain unchanged. Generate matching terrain-HDF masks, perimeters and
+stitch connectivity from the prepared single source. A flattened TIFF paired
+with the original multi-source HDF is not a valid input. Record preparation
+provenance and check the prepared surface against the original effective terrain
+before reuse. Cache this prepared terrain across reach and timestep requests;
+do not repeat preprocessing for every map. Additional terrain layouts remain
+subject to qualification; preprocessing alone does not establish native parity.

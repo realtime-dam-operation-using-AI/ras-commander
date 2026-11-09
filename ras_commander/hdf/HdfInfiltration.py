@@ -12,10 +12,11 @@ Key Features:
 - Data export and file management
 
 Methods:
-1. Geometry File Base Override Management:
-   - scale_infiltration_data(): Updates infiltration parameters with scaling factors in geometry file
-   - get_infiltration_data(): Retrieves current infiltration parameters from geometry file
-   - set_infiltration_table(): Sets infiltration parameters directly in geometry file
+1. Geometry File Override Management:
+   - create_infiltration_override_regions(): Native RASMapper region creation
+   - get/set/scale_infiltration_region_overrides(): One native region table
+   - set/scale_infiltration_base_overrides(): Geometry-wide fallback editing
+   - get_infiltration_baseoverrides(): Read-only geometry-wide extraction
 
 2. Raster and Mapping Operations (uses rasmap_df HDF files):
    - get_infiltration_map(): Reads infiltration raster map from rasmap_df HDF file
@@ -42,21 +43,36 @@ Dependencies:
 - rasterstats: Zonal statistics calculation (optional)
 
 Note:
-- Methods in section 1 work with base overrides in geometry files
+- Geometry override writers delegate HDF schema authoring to RasMapperLib
 - Methods in sections 2-4 work with HDF files from rasmap_df by default
-- All methods are static and decorated with @standardize_input and @log_call
+- Public methods are static and use centralized call logging
 - The class is designed to work with both HEC-RAS geometry files and rasmap_df HDF files
 """
 from pathlib import Path
 import h5py
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Any, List, Tuple, Union
-import logging
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+import warnings
 from .HdfBase import HdfBase
 from .HdfUtils import HdfUtils
 from ..Decorators import standardize_input, log_call
-from ..LoggingConfig import setup_logging, get_logger
+from ..LoggingConfig import get_logger
+from ..fast_hdf import read_typed, reraise_required
+from .._rasmap_schema import rasmap_dataframe_is_usable
+
+if TYPE_CHECKING:
+    import geopandas as gpd
 
 logger = get_logger(__name__)
 
@@ -73,6 +89,39 @@ class HdfInfiltration:
     SQM_TO_ACRE = 0.000247105
     SQM_TO_SQMILE = 3.861e-7
 
+    @staticmethod
+    def _format_log_samples(items: List[str], max_items: int = 5) -> str:
+        """Return a compact sample list for aggregate log messages."""
+        sample = ", ".join(str(item) for item in items[:max_items])
+        if len(items) > max_items:
+            sample = f"{sample}, ... plus {len(items) - max_items} more"
+        return sample
+
+    @staticmethod
+    def _log_raster_mesh_diagnostics(
+        raster_label: str,
+        total_meshes: int,
+        no_stats_meshes: List[str],
+        nodata_only_meshes: List[str],
+        mesh_errors: List[str],
+    ) -> None:
+        """Emit concise raster-stat diagnostic summaries after mesh loops."""
+        if no_stats_meshes:
+            logger.warning(
+                f"No {raster_label} raster stats for {len(no_stats_meshes)}/{total_meshes} "
+                f"2D flow area(s); first: {HdfInfiltration._format_log_samples(no_stats_meshes)}"
+            )
+        if nodata_only_meshes:
+            logger.warning(
+                f"Only NoData {raster_label} pixels for {len(nodata_only_meshes)}/{total_meshes} "
+                f"2D flow area(s); first: {HdfInfiltration._format_log_samples(nodata_only_meshes)}"
+            )
+        if mesh_errors:
+            logger.warning(
+                f"Failed {raster_label} raster statistics for {len(mesh_errors)}/{total_meshes} "
+                f"2D flow area(s); first: {HdfInfiltration._format_log_samples(mesh_errors)}"
+            )
+
     # Valid infiltration variables for preprocessed cell-level data
     INFILTRATION_VARIABLES = [
         'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate',
@@ -80,6 +129,70 @@ class HdfInfiltration:
         'Wetting Front Suction', 'Saturated Hydraulic Conductivity',
         'Initial Soil Water Content', 'Saturated Soil Water Content',
     ]
+
+    @staticmethod
+    def _resolve_rasmap_hdf_path(
+        explicit_path: Optional[Union[str, Path]],
+        column: str,
+        ras_object: Any = None,
+    ) -> Path:
+        """Resolve an explicit path or the first usable ``rasmap_df`` value."""
+        layer_label = {
+            "infiltration_hdf_path": "infiltration",
+            "soil_layer_path": "soil",
+            "landcover_hdf_path": "land cover",
+        }.get(column, column)
+        if explicit_path is not None:
+            return Path(explicit_path)
+
+        if ras_object is None:
+            from ..RasPrj import ras
+
+            ras_object = ras
+
+        rasmap_df = getattr(ras_object, "rasmap_df", None)
+        if rasmap_df is None or rasmap_df.empty:
+            raise ValueError(
+                f"No {column} was provided and rasmap_df has no summary row. "
+                "Pass the HDF path explicitly or initialize a project with a "
+                "usable RASMapper layer."
+            )
+
+        summary = rasmap_df.iloc[0]
+        status = summary.get("rasmap_status")
+        rasmap_path = summary.get("rasmap_path")
+        context = f"rasmap_status={status!r}"
+        if rasmap_path:
+            context += f", rasmap_path={rasmap_path!r}"
+
+        if not rasmap_dataframe_is_usable(rasmap_df):
+            detail = summary.get("rasmap_error")
+            if detail:
+                context += f", rasmap_error={detail!r}"
+            raise ValueError(
+                f"Cannot resolve {column} from rasmap_df ({context}). Pass "
+                "the HDF path explicitly or correct the RASMapper configuration."
+            )
+
+        candidates = summary.get(column)
+        if isinstance(candidates, (list, tuple, np.ndarray)) and len(candidates):
+            candidate = candidates[0]
+            if candidate not in (None, ""):
+                return Path(candidate)
+        elif isinstance(candidates, (str, Path)) and str(candidates):
+            return Path(candidates)
+
+        field_errors = summary.get("rasmap_field_errors", {})
+        if isinstance(field_errors, dict) and column in field_errors:
+            raise ValueError(
+                f"Cannot resolve {column} because that RASMapper field failed "
+                f"to parse ({context}): {field_errors[column]}"
+            )
+
+        raise ValueError(
+            f"No {layer_label} layer is configured in rasmap_df ({context}). Pass "
+            "the HDF path explicitly or add the corresponding layer in RASMapper."
+        )
 
     @staticmethod
     def _is_nodata_value(value: Any, no_data: Any) -> bool:
@@ -181,7 +294,7 @@ class HdfInfiltration:
             mesh_name: Specific 2D flow area. If None, reads all.
             variable: Infiltration variable name. Common values:
                 'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate'
-            ras_object: Optional RasPrj object for path resolution.
+            ras_object (RasPrj, optional): Optional RasPrj object for path resolution.
 
         Returns:
             DataFrame with columns: mesh_name, cell_id, value
@@ -214,7 +327,7 @@ class HdfInfiltration:
                         logger.debug(f"No '{variable}' data for mesh '{area_name}'")
                         continue
 
-                    values = area[var_path][()]
+                    values = read_typed(area[var_path])
                     n_cells = len(values)
 
                     area_df = pd.DataFrame({
@@ -225,6 +338,7 @@ class HdfInfiltration:
                     results.append(area_df)
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading preprocessed infiltration from {hdf_path}: {e}")
             return pd.DataFrame(columns=['mesh_name', 'cell_id', 'value'])
 
@@ -249,7 +363,7 @@ class HdfInfiltration:
             hdf_path: Geometry HDF path, plan number ("01"), or geometry number ("g01").
             mesh_name: Specific 2D flow area. If None, computes for all.
             variable: Infiltration variable name.
-            ras_object: Optional RasPrj object.
+            ras_object (RasPrj, optional): Optional RasPrj object.
 
         Returns:
             DataFrame with columns: mesh_name, variable, n_cells,
@@ -298,17 +412,17 @@ class HdfInfiltration:
             with h5py.File(hdf_path, 'r') as hdf_file:
                 table_path = '/Geometry/Infiltration/Base Overrides'
                 if table_path not in hdf_file:
-                    logger.warning(f"No infiltration data found in {hdf_path}")
+                    logger.debug(f"No infiltration data found in {hdf_path}")
                     return None
 
                 # Get column info
                 col_names, _, _ = HdfInfiltration._get_table_info(hdf_file, table_path)
                 if not col_names:
-                    logger.error(f"No columns found in infiltration table")
+                    logger.error("No columns found in infiltration table")
                     return None
                     
                 # Read data
-                data = hdf_file[table_path][()]
+                data = read_typed(hdf_file[table_path])
                 
                 # Convert to DataFrame
                 df_dict = {}
@@ -322,6 +436,7 @@ class HdfInfiltration:
                 return pd.DataFrame(df_dict)
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading infiltration data from {hdf_path}: {str(e)}")
             return None
         
@@ -353,14 +468,15 @@ class HdfInfiltration:
             with h5py.File(hdf_path, 'r') as hdf_file:
                 attrs_path = "Geometry/Infiltration/Attributes"
                 if attrs_path not in hdf_file:
-                    logger.warning(f"No infiltration attributes found in {hdf_path}")
+                    logger.debug(f"No infiltration attributes found in {hdf_path}")
                     return None
 
-                data = hdf_file[attrs_path][()]
+                data = read_typed(hdf_file[attrs_path])
                 names = list(np.vectorize(HdfUtils.convert_ras_string)(data['Name']))
                 return names
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading infiltration region names from {hdf_path}: {str(e)}")
             return None
 
@@ -395,18 +511,18 @@ class HdfInfiltration:
                 attrs_path = "Geometry/Infiltration/Attributes"
 
                 if variables_path not in hdf_file or attrs_path not in hdf_file:
-                    logger.warning(f"No infiltration variables or attributes found in {hdf_path}")
+                    logger.debug(f"No infiltration variables or attributes found in {hdf_path}")
                     return None
 
                 # Read region names
-                attrs_data = hdf_file[attrs_path][()]
+                attrs_data = read_typed(hdf_file[attrs_path])
                 region_names = list(np.vectorize(HdfUtils.convert_ras_string)(attrs_data['Name']))
 
                 result = {}
                 variables_group = hdf_file[variables_path]
 
                 for ds_name in variables_group:
-                    data = variables_group[ds_name][()]
+                    data = read_typed(variables_group[ds_name])
                     df_dict = {}
                     for field_name in data.dtype.names:
                         values = data[field_name]
@@ -422,6 +538,7 @@ class HdfInfiltration:
                 return result
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading infiltration calibration regions from {hdf_path}: {str(e)}")
             return None
 
@@ -440,8 +557,10 @@ class HdfInfiltration:
 
         Returns:
             A GeoDataFrame with columns ``region_id``, ``Name``, and
-            ``geometry``. Returns an empty GeoDataFrame if the required
-            datasets do not exist.
+            ``geometry``. Returns an empty GeoDataFrame when the polygon
+            layer is absent; missing siblings in a present layer raise.
+
+        Read errors and malformed present polygon layers are logged and raised.
 
         Example
         -------
@@ -459,33 +578,34 @@ class HdfInfiltration:
 
                 infil_data = hdf_file[infiltration_path]
 
-                if ("Polygon Info" not in infil_data or
-                    "Attributes" not in infil_data or
-                    "Polygon Points" not in infil_data):
+                polygon_datasets = ("Polygon Info", "Attributes", "Polygon Points")
+                if "Polygon Info" not in infil_data and "Polygon Points" not in infil_data:
                     return gpd.GeoDataFrame()
+                missing = [name for name in polygon_datasets if name not in infil_data]
+                if missing:
+                    raise ValueError(f"Missing polygon datasets: {missing}")
 
-                region_ids = range(infil_data["Attributes"][()].shape[0])
-                names = np.vectorize(HdfUtils.convert_ras_string)(infil_data["Attributes"][()]["Name"])
+                region_ids = range(read_typed(infil_data["Attributes"]).shape[0])
+                names = [HdfUtils.convert_ras_string(name) for name in read_typed(infil_data["Attributes"])["Name"]]
 
                 geoms = []
-                for pnt_start, pnt_cnt, part_start, part_cnt in infil_data["Polygon Info"][()]:
-                    points = infil_data["Polygon Points"][()][
-                        pnt_start : pnt_start + pnt_cnt
-                    ]
+                for pnt_start, pnt_cnt, part_start, part_cnt in read_typed(infil_data["Polygon Info"]):
+                    points = HdfBase.plan_vertex_ordinates(
+                        read_typed(infil_data["Polygon Points"])[
+                            pnt_start : pnt_start + pnt_cnt
+                        ]
+                    )
 
+                    if pnt_start < 0 or pnt_cnt < 3 or len(points) != pnt_cnt:
+                        raise ValueError("Invalid region polygon point range")
                     if part_cnt <= 1:
                         geoms.append(Polygon(points))
                         continue
 
                     if "Polygon Parts" not in infil_data:
-                        logger.warning(
-                            "Multi-part infiltration polygon but "
-                            "'Polygon Parts' dataset missing"
-                        )
-                        geoms.append(Polygon(points))
-                        continue
+                        raise ValueError("Multipart infiltration region is missing Polygon Parts")
 
-                    parts = infil_data["Polygon Parts"][()][
+                    parts = read_typed(infil_data["Polygon Parts"])[
                         part_start : part_start + part_cnt
                     ]
                     rings = [
@@ -507,369 +627,180 @@ class HdfInfiltration:
                 )
 
         except Exception as e:
-            logger.error(f"Error reading infiltration region polygons from {hdf_path}: {str(e)}")
-            return gpd.GeoDataFrame()
+            reraise_required(e)
+            logger.error(f"Error reading infiltration region polygons from {hdf_path} (Geometry/Infiltration): {str(e)}")
+            raise
 
     SOIL_GROUPS = ['NoData', 'D', 'C', 'B', 'A']
 
     @staticmethod
     @log_call
-    def create_infiltration_group(
-        hdf_path: Path,
-        region_names: Optional[List[str]] = None,
+    def create_infiltration_override_regions(
+        geometry_hdf_path: Union[str, Path],
+        region_names: Optional[Sequence[str]] = None,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
     ) -> pd.DataFrame:
+        """Create geometry infiltration regions through native RasMapperLib.
+
+        The polygons are copied from the geometry's native Land Cover
+        (Manning's n) regions. HEC-RAS authors the complete geometry
+        infiltration HDF schema, including the geometry-wide Base Overrides
+        fallback and separate per-region parameter tables. The result is
+        reloaded and validated.
+        Qualified runtimes are HEC-RAS 6.x and 7.0.x. The returned DataFrame
+        exposes ``geometry_hdf_path``, ``backup_path``, and
+        ``recompute_required`` in ``.attrs``.
         """
-        Create the /Geometry/Infiltration group in a geometry HDF file.
+        from .._infiltration_override_native import (
+            create_infiltration_override_regions_native,
+            resolve_hecras_version,
+        )
 
-        Reads land cover class names from the existing Land Cover (Manning's n)
-        Calibration Table, reuses the Land Cover region polygon geometry, and
-        initializes all infiltration parameters to -9999.0 (no active override).
+        version = resolve_hecras_version(hecras_version, ras_object)
+        return create_infiltration_override_regions_native(
+            geometry_hdf_path,
+            region_names,
+            hecras_version=version,
+        )
 
-        After this function completes, ``set_infiltration_baseoverrides()`` can
-        modify the Curve Number, Abstraction Ratio, and Minimum Infiltration
-        Rate values.
+    @staticmethod
+    @log_call
+    def create_infiltration_group(
+        hdf_path: Union[str, Path],
+        region_names: Optional[Sequence[str]] = None,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Deprecated wrapper for native infiltration-region creation."""
+        warnings.warn(
+            "create_infiltration_group() is deprecated; use "
+            "create_infiltration_override_regions(). The compatibility "
+            "wrapper delegates exclusively to native RasMapperLib through "
+            "v1.1.x and will not be removed before v1.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return HdfInfiltration.create_infiltration_override_regions(
+            hdf_path,
+            region_names,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
 
-        Parameters
-        ----------
-        hdf_path : Path
-            Path to the HEC-RAS geometry HDF file (.g##.hdf).
-        region_names : list of str, optional
-            Names for the infiltration calibration regions. If *None*, reuses
-            the Land Cover region names (e.g. ``["Manning's Region 1"]``).
+    @staticmethod
+    @log_call
+    def set_infiltration_base_overrides(
+        geometry_hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Set geometry-wide Base Overrides through native RasMapperLib.
 
-        Returns
-        -------
-        pd.DataFrame
-            The Base Overrides table that was written (all values -9999.0).
-
-        Raises
-        ------
-        ValueError
-            If the HDF has no Land Cover (Manning's n) group, its polygon
-            datasets are missing, or if the Infiltration group already exists.
+        HEC's internal base ParameterSet is guarded by an exact ABI
+        fingerprint, serialized with InterpretationOverrideLayer.Save(), and
+        validated through a fresh native geometry reload. Qualified runtimes
+        are HEC-RAS 6.x and 7.0.x. The returned DataFrame exposes
+        ``geometry_hdf_path``, ``backup_path``, and ``recompute_required`` in
+        ``.attrs``. Named region polygons do not constrain this table; use
+        :meth:`set_infiltration_region_overrides` for spatially bounded values.
         """
-        hdf_path = Path(hdf_path)
-
-        lc_group_path = "Geometry/Land Cover (Manning's n)"
-        lc_cal_path = f"{lc_group_path}/Calibration Table"
-        infil_group_path = "Geometry/Infiltration"
-
-        soil_groups = HdfInfiltration.SOIL_GROUPS
-
-        # ── Phase 1: Read Land Cover structure ──────────────────────────
-        with h5py.File(hdf_path, 'r') as hf:
-            if lc_group_path not in hf:
-                raise ValueError(
-                    f"No Land Cover (Manning's n) group in {hdf_path}. "
-                    "Associate a land cover layer in HEC-RAS before creating "
-                    "infiltration overrides."
-                )
-            if lc_cal_path not in hf:
-                raise ValueError(
-                    f"Land Cover group exists but Calibration Table is missing "
-                    f"in {hdf_path}. Re-run the geometry preprocessor."
-                )
-            if infil_group_path in hf:
-                raise ValueError(
-                    f"Infiltration group already exists in {hdf_path}. "
-                    "Use set_infiltration_baseoverrides() to modify values."
-                )
-
-            lc_group = hf[lc_group_path]
-            for req in ("Polygon Info", "Polygon Parts", "Polygon Points", "Attributes"):
-                if req not in lc_group:
-                    raise ValueError(
-                        f"Land Cover group missing '{req}' dataset in {hdf_path}. "
-                        "Re-run the geometry preprocessor."
-                    )
-
-            lc_class_names = [
-                v.decode('utf-8').strip()
-                for v in hf[lc_cal_path]['Land Cover Name']
-            ]
-
-            lc_attrs_data = lc_group["Attributes"][()]
-            lc_region_names = [
-                v.decode('utf-8').strip()
-                for v in lc_attrs_data['Name']
-            ]
-            n_lc_regions = len(lc_region_names)
-
-            lc_poly_info = lc_group["Polygon Info"][()]
-            lc_poly_parts = lc_group["Polygon Parts"][()]
-            lc_poly_points = lc_group["Polygon Points"][()]
-
-        if region_names is None:
-            region_names = lc_region_names
-
-        n_regions = len(region_names)
-
-        # ── Phase 2: Build Base Override names ──────────────────────────
-        override_names = []
-        for i, lc_name in enumerate(lc_class_names):
-            for j, sg in enumerate(soil_groups):
-                if i == 0 and j == 0:
-                    override_names.append(lc_name)
-                else:
-                    override_names.append(f"{lc_name} : {sg}")
-        n_overrides = len(override_names)
-
-        max_name_len = max(len(n) for n in override_names) + 2
-        name_dtype_width = max(max_name_len, 37)
-
-        # ── Phase 3: Build structured arrays ────────────────────────────
-        # Attributes
-        attr_name_width = max(max(len(n) for n in region_names) + 2, 30)
-        attrs_dtype = np.dtype([('Name', f'S{attr_name_width}')])
-        attrs_array = np.array(
-            [(n.encode('utf-8'),) for n in region_names],
-            dtype=attrs_dtype,
+        from .._infiltration_override_native import (
+            resolve_hecras_version,
+            set_infiltration_base_overrides_native,
         )
 
-        # Base Overrides
-        bo_dtype = np.dtype([
-            ('Land Cover Name', f'S{name_dtype_width}'),
-            ('Curve Number', '<f4'),
-            ('Abstraction Ratio', '<f4'),
-            ('Minimum Infiltration Rate', '<f4'),
-        ])
-        bo_array = np.zeros(n_overrides, dtype=bo_dtype)
-        bo_array['Land Cover Name'] = np.array(
-            [n.encode('utf-8') for n in override_names],
-            dtype=f'|S{name_dtype_width}',
+        version = resolve_hecras_version(hecras_version, ras_object)
+        return set_infiltration_base_overrides_native(
+            geometry_hdf_path,
+            infiltration_df,
+            hecras_version=version,
         )
-        bo_array['Curve Number'] = -9999.0
-        bo_array['Abstraction Ratio'] = -9999.0
-        bo_array['Minimum Infiltration Rate'] = -9999.0
 
-        # Variables compound dtype (field per override name, all float32)
-        var_fields = [(n, '<f4') for n in override_names]
-        var_dtype = np.dtype(var_fields)
-        var_sentinel = np.full(n_regions, -9999.0, dtype=np.float32)
+    @staticmethod
+    @log_call
+    def get_infiltration_region_overrides(
+        geometry_hdf_path: Union[str, Path],
+        *,
+        region_name: Optional[str] = None,
+        region_id: Optional[int] = None,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Read one native infiltration-region parameter table.
 
-        # ── Phase 4: Polygon geometry (reuse Land Cover) ───────────────
-        if n_regions == n_lc_regions:
-            poly_info = lc_poly_info.copy()
-            poly_parts = lc_poly_parts.copy()
-            poly_points = lc_poly_points.copy()
-        else:
-            total_pts = lc_poly_points.shape[0]
-            poly_info = np.zeros((n_regions, 4), dtype=np.int32)
-            poly_parts = np.zeros((n_regions, 2), dtype=np.int32)
-            poly_info[0] = [0, total_pts, 0, 1]
-            poly_parts[0] = [0, total_pts]
-            for k in range(1, n_regions):
-                poly_info[k] = [0, total_pts, k, 1]
-                poly_parts[k] = [0, total_pts]
-            poly_points = lc_poly_points.copy()
-
-        # ── Phase 5: Write to HDF ──────────────────────────────────────
-        with h5py.File(hdf_path, 'a') as hf:
-            infil = hf.create_group(infil_group_path)
-
-            infil.create_dataset("Attributes", data=attrs_array)
-
-            ds_info = infil.create_dataset("Polygon Info", data=poly_info)
-            ds_info.attrs['Column'] = np.array(
-                [b'Point Starting Index', b'Point Count',
-                 b'Part Starting Index', b'Part Count'],
-                dtype='|S20',
-            )
-            ds_info.attrs['Feature Type'] = np.bytes_(b'Polygon')
-            ds_info.attrs['Row'] = np.bytes_(b'Feature')
-
-            ds_parts = infil.create_dataset("Polygon Parts", data=poly_parts)
-            ds_parts.attrs['Column'] = np.array(
-                [b'Point Starting Index', b'Point Count'],
-                dtype='|S20',
-            )
-            ds_parts.attrs['Row'] = np.bytes_(b'Part')
-
-            ds_pts = infil.create_dataset("Polygon Points", data=poly_points)
-            ds_pts.attrs['Column'] = np.array([b'X', b'Y'], dtype='|S1')
-            ds_pts.attrs['Row'] = np.bytes_(b'Points')
-
-            infil.create_dataset(
-                "Base Overrides",
-                data=bo_array,
-                dtype=bo_dtype,
-                compression='gzip',
-                compression_opts=1,
-                chunks=(min(100, n_overrides),),
-                maxshape=(None,),
-            )
-
-            var_grp = infil.create_group("Variables")
-            for param_name in ['Abstraction Ratio', 'Curve Number',
-                               'Minimum Infiltration Rate']:
-                var_data = np.zeros(n_regions, dtype=var_dtype)
-                for field in var_dtype.names:
-                    var_data[field] = var_sentinel
-                var_grp.create_dataset(param_name, data=var_data)
-
-        # ── Phase 6: Return the Base Overrides as DataFrame ─────────────
-        result_df = pd.DataFrame({
-            'Land Cover Name': override_names,
-            'Curve Number': np.full(n_overrides, -9999.0),
-            'Abstraction Ratio': np.full(n_overrides, -9999.0),
-            'Minimum Infiltration Rate': np.full(n_overrides, -9999.0),
-        })
-
-        logger.info(
-            f"Created Infiltration group in {hdf_path}: "
-            f"{n_regions} region(s), {n_overrides} override rows "
-            f"({len(lc_class_names)} land cover classes x {len(soil_groups)} soil groups)"
+        Exactly one selector is required. ``region_id`` is zero-based.
+        Returned rows follow the associated native classification order.
+        """
+        from .._infiltration_override_native import (
+            get_infiltration_region_overrides_native,
+            resolve_hecras_version,
         )
-        return result_df
+
+        version = resolve_hecras_version(hecras_version, ras_object)
+        return get_infiltration_region_overrides_native(
+            geometry_hdf_path,
+            region_name=region_name,
+            region_id=region_id,
+            hecras_version=version,
+        )
+
+    @staticmethod
+    @log_call
+    def set_infiltration_region_overrides(
+        geometry_hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        *,
+        region_name: Optional[str] = None,
+        region_id: Optional[int] = None,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Set one native infiltration-region parameter table.
+
+        Exactly one selector is required. ``region_id`` is zero-based.
+        HEC-RAS serializes the selected public ``ParameterSet``; fresh native
+        reload validation proves that global Base Overrides, region geometry,
+        names, and unrelated region tables were not changed.
+        """
+        from .._infiltration_override_native import (
+            resolve_hecras_version,
+            set_infiltration_region_overrides_native,
+        )
+
+        version = resolve_hecras_version(hecras_version, ras_object)
+        return set_infiltration_region_overrides_native(
+            geometry_hdf_path,
+            infiltration_df,
+            region_name=region_name,
+            region_id=region_id,
+            hecras_version=version,
+        )
 
     @staticmethod
     @log_call
     def set_infiltration_baseoverrides(
-        hdf_path: Path,
-        infiltration_df: pd.DataFrame
-    ) -> Optional[pd.DataFrame]:
-        """
-        Set base overrides for infiltration parameters in the HDF file.
-
-        Writes values to the existing /Geometry/Infiltration/Base Overrides
-        dataset using in-place modification when row count is unchanged, or
-        delete-and-recreate when the row count differs.
-
-        The infiltration group (Attributes, Polygon Info/Parts/Points) MUST
-        already exist in the HDF file. Call ``create_infiltration_group()``
-        first if the group does not exist.
-
-        Parameters
-        ----------
-        hdf_path : Path
-            Path to the HEC-RAS geometry HDF file.
-        infiltration_df : pd.DataFrame
-            DataFrame with columns matching HDF structure. Must include
-            'Land Cover Name' (or 'Name' which will be renamed). Numeric
-            columns should be 'Curve Number', 'Abstraction Ratio', and/or
-            'Minimum Infiltration Rate'. Use -9999.0 for no override.
-
-        Returns
-        -------
-        Optional[pd.DataFrame]
-            The written DataFrame if successful, None if operation fails.
-
-        Raises
-        ------
-        ValueError
-            If the infiltration group or required polygon datasets are missing.
-        """
-        hdf_path = Path(hdf_path)
-        infiltration_df = infiltration_df.copy()
-
-        if "Name" in infiltration_df.columns and "Land Cover Name" not in infiltration_df.columns:
-            infiltration_df = infiltration_df.rename(columns={"Name": "Land Cover Name"})
-
-        table_path = '/Geometry/Infiltration/Base Overrides'
-        group_path = '/Geometry/Infiltration'
-
-        try:
-            with h5py.File(hdf_path, 'r') as hdf_file:
-                if group_path not in hdf_file:
-                    raise ValueError(
-                        f"Infiltration group not found in {hdf_path}. "
-                        "Call create_infiltration_group() first."
-                    )
-
-                infil_group = hdf_file[group_path]
-                required = ["Attributes", "Polygon Info", "Polygon Points"]
-                missing = [r for r in required if r not in infil_group]
-                if missing:
-                    raise ValueError(
-                        f"Infiltration group missing required datasets: {missing}. "
-                        "Call create_infiltration_group() to build the full structure."
-                    )
-
-                if table_path not in hdf_file:
-                    existing_dtype = None
-                    existing_shape = None
-                else:
-                    existing_dtype = hdf_file[table_path].dtype
-                    existing_shape = hdf_file[table_path].shape
-
-            if existing_dtype is not None:
-                target_dtype = existing_dtype
-            else:
-                str_len = max(len(str(n)) for n in infiltration_df['Land Cover Name']) + 1
-                target_dtype = np.dtype([
-                    ('Land Cover Name', f'S{str_len}'),
-                    ('Curve Number', '<f4'),
-                    ('Abstraction Ratio', '<f4'),
-                    ('Minimum Infiltration Rate', '<f4'),
-                ])
-
-            structured_array = np.zeros(len(infiltration_df), dtype=target_dtype)
-
-            for col in target_dtype.names:
-                if col not in infiltration_df.columns:
-                    if target_dtype[col].kind == 'S':
-                        structured_array[col] = b''
-                    else:
-                        structured_array[col] = -9999.0
-                    continue
-
-                if target_dtype[col].kind == 'S':
-                    max_len = target_dtype[col].itemsize
-                    encoded = np.array(
-                        [str(s).encode('utf-8')[:max_len] for s in infiltration_df[col]],
-                        dtype=f'|S{max_len}',
-                    )
-                    structured_array[col] = encoded
-                else:
-                    structured_array[col] = (
-                        infiltration_df[col].values.astype(target_dtype[col])
-                    )
-
-            with h5py.File(hdf_path, 'a') as hdf_file:
-                if table_path in hdf_file:
-                    ds = hdf_file[table_path]
-                    if ds.shape[0] == len(structured_array):
-                        for col in target_dtype.names:
-                            if target_dtype[col].kind != 'S':
-                                ds[col] = structured_array[col]
-                    else:
-                        del hdf_file[table_path]
-                        hdf_file.create_dataset(
-                            table_path,
-                            data=structured_array,
-                            dtype=target_dtype,
-                            compression='gzip',
-                            compression_opts=1,
-                            chunks=(100,),
-                            maxshape=(None,),
-                        )
-                else:
-                    hdf_file.create_dataset(
-                        table_path,
-                        data=structured_array,
-                        dtype=target_dtype,
-                        compression='gzip',
-                        compression_opts=1,
-                        chunks=(100,),
-                        maxshape=(None,),
-                    )
-
-            result_df = pd.DataFrame()
-            for col in target_dtype.names:
-                if target_dtype[col].kind == 'S':
-                    result_df[col] = [v.decode('utf-8').strip() for v in structured_array[col]]
-                else:
-                    result_df[col] = structured_array[col]
-
-            logger.info(f"Successfully wrote {len(result_df)} infiltration base override rows to {hdf_path}")
-            return result_df
-
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.error(f"Error setting infiltration data in {hdf_path}: {str(e)}")
-            return None
-
+        hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+    ) -> pd.DataFrame:
+        """Deprecated spelling wrapper for the native Base Overrides setter."""
+        warnings.warn(
+            "set_infiltration_baseoverrides() is deprecated; use "
+            "set_infiltration_base_overrides(). The compatibility wrapper "
+            "delegates exclusively to native RasMapperLib through v1.1.x and "
+            "will not be removed before v1.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return HdfInfiltration.set_infiltration_base_overrides(
+            hdf_path,
+            infiltration_df,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
     # Since the infiltration base overrides are in the geometry file, the above functions work on the geometry files
     # The below functions work on the infiltration layer HDF files.  Changes only take effect if no base overrides are present. 
            
@@ -898,7 +829,7 @@ class HdfInfiltration:
                     return None
                 
                 # Read data from Variables dataset
-                data = hdf_file[variables_path][()]
+                data = read_typed(hdf_file[variables_path])
                 
                 # Convert to DataFrame
                 df_dict = {}
@@ -912,6 +843,7 @@ class HdfInfiltration:
                 return pd.DataFrame(df_dict)
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading infiltration layer data from {hdf_path}: {str(e)}")
             return None
 
@@ -926,7 +858,7 @@ class HdfInfiltration:
 
         Args:
             hdf_path: Path to an infiltration HDF file.
-            ras_object: Optional RasPrj object for API consistency.
+            ras_object (RasPrj, optional): Optional RasPrj object for API consistency.
 
         Returns:
             GeoDataFrame with ``polygon_index``, ``class_name``, and geometry.
@@ -934,26 +866,101 @@ class HdfInfiltration:
         from .. import _land_classification_helper as _lch
 
         return _lch.list_land_classification_polygons(hdf_path)
-        
+
+    @staticmethod
+    def _native_infiltration_layer_type(hdf_path: Union[str, Path]) -> str:
+        """Return the ras-commander native layer-type token for a sidecar."""
+        hdf_path = Path(hdf_path)
+        with h5py.File(hdf_path, "r") as hdf_file:
+            raw_value = hdf_file.attrs.get("LC Type")
+        if isinstance(raw_value, (bytes, np.bytes_)):
+            value = raw_value.decode("utf-8", errors="replace")
+        else:
+            value = str(raw_value or "")
+        lookup = {
+            "InfiltrationSCSCurveNumber": "infiltration_scs",
+            "InfiltrationDeficitConstantLoss": "infiltration_deficit_constant",
+            "InfiltrationGreenAmpt": "infiltration_green_ampt",
+        }
+        if value not in lookup:
+            raise ValueError(
+                f"{hdf_path} is not a recognized HEC-RAS infiltration sidecar "
+                f"(LC Type={value!r})."
+            )
+        return lookup[value]
+
+    @staticmethod
+    @log_call
+    def set_infiltration_sidecar_parameters(
+        infiltration_hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        geometry_hdf_path: Union[str, Path, None] = None,
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
+        """Set infiltration sidecar parameters through native RasMapperLib.
+
+        This method preserves the native ``Variables`` schema, unknown
+        metadata, classification IDs, and RASMapper save semantics. The
+        returned DataFrame exposes ``classification_hdf_path``,
+        ``backup_path``, and ``recompute_required`` in ``.attrs``.
+        """
+        if ras_object is None:
+            from ..RasPrj import ras as ras_object
+        version = hecras_version or getattr(ras_object, "ras_version", None)
+        if not version:
+            raise ValueError(
+                "hecras_version is required for native infiltration sidecar "
+                "editing."
+            )
+        infiltration_hdf_path = Path(infiltration_hdf_path)
+        if geometry_hdf_path is not None:
+            geometry_hdf_path = Path(geometry_hdf_path)
+            if geometry_hdf_path.exists():
+                try:
+                    with h5py.File(str(geometry_hdf_path), "r") as geom_hdf:
+                        if "Geometry/Infiltration/Base Overrides" in geom_hdf:
+                            logger.warning(
+                                "Base Overrides exist in %s and take precedence "
+                                "over sidecar values.",
+                                geometry_hdf_path.name,
+                            )
+                except OSError:
+                    logger.warning(
+                        "Could not inspect geometry HDF for infiltration Base "
+                        "Overrides: %s",
+                        geometry_hdf_path,
+                    )
+
+        from .._landcover_native import set_classification_parameters
+
+        return set_classification_parameters(
+            layer_hdf_path=infiltration_hdf_path,
+            parameter_table=infiltration_df,
+            layer_type=HdfInfiltration._native_infiltration_layer_type(
+                infiltration_hdf_path
+            ),
+            hecras_version=str(version),
+        )
 
     @staticmethod
     @log_call
     def set_infiltration_layer_data(
-        hdf_path: Path,
+        hdf_path: Union[str, Path],
         infiltration_df: pd.DataFrame,
         geom_hdf_path: Union[str, Path, None] = None,
-    ) -> Optional[pd.DataFrame]:
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
         """
-        Set infiltration layer data in the infiltration layer HDF file.
-
-        Writes to the ``//Variables`` dataset in the infiltration sidecar HDF.
+        Compatibility alias for :meth:`set_infiltration_sidecar_parameters`.
 
         .. warning::
 
             If the associated geometry HDF contains a
             ``/Geometry/Infiltration/Base Overrides`` dataset, values written
             here are **ignored** by HEC-RAS during preprocessing.  Use
-            ``HdfInfiltration.set_infiltration_baseoverrides()`` instead when
+            ``HdfInfiltration.set_infiltration_base_overrides()`` instead when
             Base Overrides are present.
 
         Parameters
@@ -973,118 +980,179 @@ class HdfInfiltration:
 
         Returns
         -------
-        Optional[pd.DataFrame]
-            The infiltration DataFrame if successful, None if operation fails.
+        pd.DataFrame
+            The native table reloaded after RASMapper saves it.
         """
-        if geom_hdf_path is not None:
-            geom_hdf_path = Path(geom_hdf_path)
-            if geom_hdf_path.exists():
-                try:
-                    with h5py.File(str(geom_hdf_path), 'r') as gf:
-                        if 'Geometry/Infiltration/Base Overrides' in gf:
-                            logger.warning(
-                                "Base Overrides exist in %s and will take "
-                                "precedence over sidecar values.  Edit with "
-                                "HdfInfiltration.set_infiltration_baseoverrides() "
-                                "instead.", geom_hdf_path.name
-                            )
-                except Exception:
-                    pass
-
-        try:
-            variables_path = '//Variables'
-            
-            # Validate required columns
-            required_columns = ['Name', 'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate']
-            missing_columns = [col for col in required_columns if col not in infiltration_df.columns]
-            if missing_columns:
-                raise ValueError(f"Missing required columns: {missing_columns}")
-            
-            with h5py.File(hdf_path, 'a') as hdf_file:
-                # Delete existing dataset if it exists
-                if variables_path in hdf_file:
-                    del hdf_file[variables_path]
-
-                # Create dtype for structured array
-                dt = np.dtype([
-                    ('Name', f'S{infiltration_df["Name"].str.len().max()}'),
-                    ('Curve Number', 'f4'),
-                    ('Abstraction Ratio', 'f4'),
-                    ('Minimum Infiltration Rate', 'f4')
-                ])
-
-                # Create structured array
-                structured_array = np.zeros(infiltration_df.shape[0], dtype=dt)
-                
-                # Fill structured array
-                structured_array['Name'] = infiltration_df['Name'].values.astype(f'|S{dt["Name"].itemsize}')
-                structured_array['Curve Number'] = infiltration_df['Curve Number'].values
-                structured_array['Abstraction Ratio'] = infiltration_df['Abstraction Ratio'].values
-                structured_array['Minimum Infiltration Rate'] = infiltration_df['Minimum Infiltration Rate'].values
-
-                # Create new dataset
-                hdf_file.create_dataset(
-                    variables_path,
-                    data=structured_array,
-                    dtype=dt,
-                    compression='gzip',
-                    compression_opts=1,
-                    chunks=(100,),
-                    maxshape=(None,)
-                )
-
-            return infiltration_df
-
-        except Exception as e:
-            logger.error(f"Error setting infiltration layer data in {hdf_path}: {str(e)}")
-            return None
-        
-
-
+        warnings.warn(
+            "set_infiltration_layer_data() is retained for compatibility; use "
+            "set_infiltration_sidecar_parameters() for explicit native "
+            "RasMapper editing. The alias remains available through v1.1.x "
+            "and will not be removed before v1.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return HdfInfiltration.set_infiltration_sidecar_parameters(
+            infiltration_hdf_path=hdf_path,
+            infiltration_df=infiltration_df,
+            geometry_hdf_path=geom_hdf_path,
+            ras_object=ras_object,
+            hecras_version=hecras_version,
+        )
 
     @staticmethod
     @log_call
-    @standardize_input(file_type='geom_hdf')
-    def scale_infiltration_data(
-        hdf_path: Path,
+    def scale_infiltration_sidecar_parameters(
+        infiltration_hdf_path: Union[str, Path],
         infiltration_df: pd.DataFrame,
-        scale_factors: Dict[str, float]
-    ) -> Optional[pd.DataFrame]:
+        scale_factors: Mapping[str, float],
+        geometry_hdf_path: Union[str, Path, None] = None,
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
+        """Scale sidecar parameters and save through native RasMapperLib."""
+        scaled = infiltration_df.copy()
+        for column, factor in scale_factors.items():
+            if column not in scaled.columns:
+                raise ValueError(f"Column {column!r} is not present.")
+            if not pd.api.types.is_numeric_dtype(scaled[column]):
+                raise ValueError(f"Column {column!r} is not numeric.")
+            factor = float(factor)
+            if not np.isfinite(factor):
+                raise ValueError(f"Scale factor for {column!r} must be finite.")
+            scaled[column] = scaled[column].astype(float) * factor
+        return HdfInfiltration.set_infiltration_sidecar_parameters(
+            infiltration_hdf_path=infiltration_hdf_path,
+            infiltration_df=scaled,
+            geometry_hdf_path=geometry_hdf_path,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
+
+    @staticmethod
+    @log_call
+    def scale_infiltration_base_overrides(
+        geometry_hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        scale_factors: Mapping[str, float],
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
+        """Scale geometry-wide Base Overrides through native RasMapperLib."""
+        scaled = infiltration_df.copy()
+        for column, factor in scale_factors.items():
+            if column not in scaled.columns:
+                raise ValueError(f"Column {column!r} is not present.")
+            if not pd.api.types.is_numeric_dtype(scaled[column]):
+                raise ValueError(f"Column {column!r} is not numeric.")
+            factor = float(factor)
+            if not np.isfinite(factor):
+                raise ValueError(f"Scale factor for {column!r} must be finite.")
+            mask = scaled[column].astype(float) != -9999.0
+            scaled.loc[mask, column] = (
+                scaled.loc[mask, column].astype(float) * factor
+            )
+        return HdfInfiltration.set_infiltration_base_overrides(
+            geometry_hdf_path=geometry_hdf_path,
+            infiltration_df=scaled,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
+
+    @staticmethod
+    @log_call
+    def scale_infiltration_region_overrides(
+        geometry_hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        scale_factors: Mapping[str, float],
+        *,
+        region_name: Optional[str] = None,
+        region_id: Optional[int] = None,
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
+        """Scale one region table and delegate exclusively to its setter.
+
+        ``region_id`` is zero-based. Sentinel values of ``-9999`` remain
+        unchanged so that HEC-RAS continues to fall back to Base Overrides.
         """
-        Update infiltration parameters in the HDF file with scaling factors.
-        Supports any numeric columns present in the DataFrame.
+        scaled = infiltration_df.copy()
+        for column, factor in scale_factors.items():
+            if column not in scaled.columns:
+                raise ValueError(f"Column {column!r} is not present.")
+            if not pd.api.types.is_numeric_dtype(scaled[column]):
+                raise ValueError(f"Column {column!r} is not numeric.")
+            factor = float(factor)
+            if not np.isfinite(factor):
+                raise ValueError(f"Scale factor for {column!r} must be finite.")
+            mask = scaled[column].astype(float) != -9999.0
+            scaled.loc[mask, column] = (
+                scaled.loc[mask, column].astype(float) * factor
+            )
+        return HdfInfiltration.set_infiltration_region_overrides(
+            geometry_hdf_path,
+            scaled,
+            region_name=region_name,
+            region_id=region_id,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
 
-        Parameters
-        ----------
-        hdf_path : Path
-            Path to the HEC-RAS geometry HDF file
-        infiltration_df : pd.DataFrame
-            DataFrame containing infiltration parameters
-        scale_factors : Dict[str, float]
-            Dictionary mapping column names to their scaling factors
+    @staticmethod
+    @log_call
+    def scale_infiltration_baseoverrides(
+        hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        scale_factors: Dict[str, float],
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
+        """Deprecated spelling alias for ``scale_infiltration_base_overrides``."""
+        warnings.warn(
+            "Use scale_infiltration_base_overrides(); this spelling alias is "
+            "retained through v1.1.x and will not be removed before v1.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return HdfInfiltration.scale_infiltration_base_overrides(
+            hdf_path,
+            infiltration_df,
+            scale_factors,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
 
-        Returns
-        -------
-        Optional[pd.DataFrame]
-            The updated infiltration DataFrame if successful, None if operation fails
-        """
-        try:
-            # Make a copy to avoid modifying the input DataFrame
-            infiltration_df = infiltration_df.copy()
-            
-            # Apply scaling factors to specified columns
-            for col, factor in scale_factors.items():
-                if col in infiltration_df.columns and pd.api.types.is_numeric_dtype(infiltration_df[col]):
-                    infiltration_df[col] *= factor
-                else:
-                    logger.warning(f"Column {col} not found or not numeric - skipping scaling")
-
-            # Use set_infiltration_table to write the scaled data
-            return HdfInfiltration.set_infiltration_table(hdf_path, infiltration_df)
-
-        except Exception as e:
-            logger.error(f"Error scaling infiltration data in {hdf_path}: {str(e)}")
-            return None
+    @staticmethod
+    @log_call
+    def scale_infiltration_data(
+        hdf_path: Union[str, Path],
+        infiltration_df: pd.DataFrame,
+        scale_factors: Dict[str, float],
+        hecras_version: Optional[str] = None,
+        ras_object: Any = None,
+    ) -> pd.DataFrame:
+        """Fail closed because the historical path type was ambiguous."""
+        del (
+            hdf_path,
+            infiltration_df,
+            scale_factors,
+            hecras_version,
+            ras_object,
+        )
+        warnings.warn(
+            "scale_infiltration_data() is ambiguous and no longer writes. Use "
+            "scale_infiltration_sidecar_parameters() or "
+            "scale_infiltration_base_overrides() for geometry-wide values, or "
+            "scale_infiltration_region_overrides() for one calibration "
+            "region. The fail-closed "
+            "compatibility name remains through v1.1.x and will not be "
+            "removed before v1.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        raise RuntimeError(
+            "scale_infiltration_data() no longer guesses whether an HDF is a "
+            "sidecar or geometry artifact. Choose the explicit replacement."
+        )
 
 
 
@@ -1129,11 +1197,11 @@ class HdfInfiltration:
         """
         try:
             from rasterstats import zonal_stats
-            import shapely
-            import geopandas as gpd
-            import numpy as np
-            import tempfile
-            import os
+            import shapely  # noqa: F401
+            import geopandas as gpd  # noqa: F401
+            import numpy as np  # noqa: F401
+            import tempfile  # noqa: F401
+            import os  # noqa: F401
         except ImportError as e:
             logger.error(f"Failed to import required package: {e}. Please run 'pip install rasterstats shapely geopandas'")
             raise e
@@ -1141,21 +1209,21 @@ class HdfInfiltration:
         # Import here to avoid circular imports
         from .HdfMesh import HdfMesh
         
-        # Get the soil HDF path
-        if soil_hdf_path is None:
-            if ras_object is None:
-                from ..RasPrj import ras
-                ras_object = ras
-            
-            # Try to get soil_layer_path from rasmap_df
-            try:
-                soil_hdf_path = Path(ras_object.rasmap_df.loc[0, 'soil_layer_path'][0])
-                if not soil_hdf_path.exists():
-                    logger.warning(f"Soil HDF path from rasmap_df does not exist: {soil_hdf_path}")
-                    return pd.DataFrame()
-            except (KeyError, IndexError, AttributeError, TypeError) as e:
-                logger.error(f"Error retrieving soil_layer_path from rasmap_df: {str(e)}")
+        try:
+            soil_hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+                soil_hdf_path,
+                "soil_layer_path",
+                ras_object,
+            )
+            if not soil_hdf_path.exists():
+                logger.warning(
+                    "Soil HDF path does not exist: %s",
+                    soil_hdf_path,
+                )
                 return pd.DataFrame()
+        except (ValueError, KeyError, IndexError, AttributeError, TypeError) as e:
+            logger.error("Error resolving soil_layer_path: %s", e)
+            return pd.DataFrame()
         
         # Get infiltration map - pass as hdf_path to ensure standardize_input works correctly
         try:
@@ -1164,6 +1232,7 @@ class HdfInfiltration:
                 logger.error(f"No infiltration map found in {soil_hdf_path}")
                 return pd.DataFrame()
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error getting infiltration map: {str(e)}")
             return pd.DataFrame()
         
@@ -1189,6 +1258,10 @@ class HdfInfiltration:
             
             # List to store all results
             all_results = []
+            total_meshes = len(mesh_areas)
+            no_stats_meshes = []
+            nodata_only_meshes = []
+            mesh_errors = []
             
             # Calculate zonal statistics for each 2D flow area
             for _, mesh_row in mesh_areas.iterrows():
@@ -1207,7 +1280,8 @@ class HdfInfiltration:
                     
                     # Skip if no stats
                     if not stats:
-                        logger.warning(f"No soil data found for 2D flow area: {mesh_name}")
+                        no_stats_meshes.append(mesh_name)
+                        logger.debug(f"No soil data found for 2D flow area: {mesh_name}")
                         continue
 
                     area_by_value, total_area_sqm = (
@@ -1218,7 +1292,8 @@ class HdfInfiltration:
                         )
                     )
                     if not area_by_value:
-                        logger.warning(
+                        nodata_only_meshes.append(mesh_name)
+                        logger.debug(
                             f"No non-NoData soil pixels found for 2D flow area: "
                             f"{mesh_name}"
                         )
@@ -1243,8 +1318,21 @@ class HdfInfiltration:
                             'area_sqmiles': area_sqm * HdfInfiltration.SQM_TO_SQMILE
                         })
                 except Exception as e:
-                    logger.error(f"Error calculating statistics for mesh {mesh_name}: {str(e)}")
+                    reraise_required(e)
+                    mesh_errors.append(mesh_name)
+                    logger.debug(
+                        f"Error calculating soil statistics for mesh {mesh_name}: {str(e)}",
+                        exc_info=True,
+                    )
                     continue
+
+            HdfInfiltration._log_raster_mesh_diagnostics(
+                "soil",
+                total_meshes,
+                no_stats_meshes,
+                nodata_only_meshes,
+                mesh_errors,
+            )
         
         # Create DataFrame with results
         results_df = pd.DataFrame(all_results)
@@ -1306,13 +1394,13 @@ class HdfInfiltration:
         """
         try:
             from rasterstats import zonal_stats
-            import shapely
-            import geopandas as gpd
-            import numpy as np
-            import tempfile
-            import os
+            import shapely  # noqa: F401
+            import geopandas as gpd  # noqa: F401
+            import numpy as np  # noqa: F401
+            import tempfile  # noqa: F401
+            import os  # noqa: F401
             import rasterio
-            from rasterio.merge import merge
+            from rasterio.merge import merge  # noqa: F401
         except ImportError as e:
             logger.error(f"Failed to import required package: {e}. Please run 'pip install rasterstats shapely geopandas rasterio'")
             raise e
@@ -1325,27 +1413,27 @@ class HdfInfiltration:
             from ..RasPrj import ras
             ras_object = ras
         
-        # Get the landcover HDF path
-        if landcover_hdf_path is None:
-            try:
-                landcover_hdf_path = Path(ras_object.rasmap_df.loc[0, 'landcover_hdf_path'][0])
-                if not landcover_hdf_path.exists():
-                    logger.warning(f"Land cover HDF path from rasmap_df does not exist: {landcover_hdf_path}")
+        try:
+            landcover_hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+                landcover_hdf_path,
+                "landcover_hdf_path",
+                ras_object,
+            )
+            soil_hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+                soil_hdf_path,
+                "soil_layer_path",
+                ras_object,
+            )
+            for label, path in (
+                ("Land cover", landcover_hdf_path),
+                ("Soil", soil_hdf_path),
+            ):
+                if not path.exists():
+                    logger.warning("%s HDF path does not exist: %s", label, path)
                     return pd.DataFrame()
-            except (KeyError, IndexError, AttributeError, TypeError) as e:
-                logger.error(f"Error retrieving landcover_hdf_path from rasmap_df: {str(e)}")
-                return pd.DataFrame()
-        
-        # Get the soil HDF path
-        if soil_hdf_path is None:
-            try:
-                soil_hdf_path = Path(ras_object.rasmap_df.loc[0, 'soil_layer_path'][0])
-                if not soil_hdf_path.exists():
-                    logger.warning(f"Soil HDF path from rasmap_df does not exist: {soil_hdf_path}")
-                    return pd.DataFrame()
-            except (KeyError, IndexError, AttributeError, TypeError) as e:
-                logger.error(f"Error retrieving soil_layer_path from rasmap_df: {str(e)}")
-                return pd.DataFrame()
+        except (ValueError, KeyError, IndexError, AttributeError, TypeError) as e:
+            logger.error("Error resolving RASMapper classification HDF paths: %s", e)
+            return pd.DataFrame()
         
         # Get land cover map (raster to ID mapping)
         try:
@@ -1354,9 +1442,10 @@ class HdfInfiltration:
                     logger.error(f"No Raster Map found in {landcover_hdf_path}")
                     return pd.DataFrame()
                 
-                landcover_map_data = hdf['//Raster Map'][()]
+                landcover_map_data = read_typed(hdf['//Raster Map'])
                 landcover_map = {int(item[0]): item[1].decode('utf-8').strip() for item in landcover_map_data}
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading land cover data from HDF: {str(e)}")
             return pd.DataFrame()
         
@@ -1367,6 +1456,7 @@ class HdfInfiltration:
                 logger.error(f"No soil map found in {soil_hdf_path}")
                 return pd.DataFrame()
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error getting soil map: {str(e)}")
             return pd.DataFrame()
         
@@ -1377,6 +1467,7 @@ class HdfInfiltration:
                 logger.warning(f"No infiltration parameters found in {soil_hdf_path}")
                 infiltration_params = pd.DataFrame(columns=['Name', 'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate'])
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error getting infiltration parameters: {str(e)}")
             infiltration_params = pd.DataFrame(columns=['Name', 'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate'])
         
@@ -1400,6 +1491,9 @@ class HdfInfiltration:
         
         # List to store all results
         all_results = []
+        total_meshes = len(mesh_areas)
+        no_stats_meshes = []
+        mesh_errors = []
         
         # Read the raster data
         try:
@@ -1431,7 +1525,8 @@ class HdfInfiltration:
                         
                         # Skip if no stats
                         if not landcover_stats or not soil_stats:
-                            logger.warning(f"No land cover or soil data found for 2D flow area: {mesh_name}")
+                            no_stats_meshes.append(mesh_name)
+                            logger.debug(f"No land cover or soil data found for 2D flow area: {mesh_name}")
                             continue
                         
                         # Calculate total area
@@ -1452,7 +1547,7 @@ class HdfInfiltration:
                         for lc_id, lc_pct in landcover_pct.items():
                             lc_name = landcover_map.get(int(lc_id), f"Unknown-{lc_id}")
                             
-                            for soil_id, soil_pct in soil_pct.items():
+                            for soil_id, soil_fraction in soil_pct.items():
                                 try:
                                     soil_name = soil_map.get(int(soil_id), f"Unknown-{soil_id}")
                                 except (ValueError, TypeError):
@@ -1460,7 +1555,7 @@ class HdfInfiltration:
                                 
                                 # Calculate combined percentage (approximate)
                                 # This is a simplification; actual overlap would require pixel-by-pixel analysis
-                                combined_pct = lc_pct * soil_pct * 100
+                                combined_pct = lc_pct * soil_fraction * 100
                                 combined_area_sqm = mesh_area_sqm * (combined_pct / 100)
                                 
                                 # Create combined name
@@ -1493,9 +1588,22 @@ class HdfInfiltration:
                                     'min_infiltration_rate': min_infiltration_rate
                                 })
                     except Exception as e:
-                        logger.error(f"Error calculating statistics for mesh {mesh_name}: {str(e)}")
+                        reraise_required(e)
+                        mesh_errors.append(mesh_name)
+                        logger.debug(
+                            f"Error calculating land cover/soil statistics for mesh {mesh_name}: {str(e)}",
+                            exc_info=True,
+                        )
                         continue
+                HdfInfiltration._log_raster_mesh_diagnostics(
+                    "land cover/soil",
+                    total_meshes,
+                    no_stats_meshes,
+                    [],
+                    mesh_errors,
+                )
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error opening raster files: {str(e)}")
             return pd.DataFrame()
         
@@ -1559,13 +1667,13 @@ class HdfInfiltration:
         """
         try:
             from rasterstats import zonal_stats
-            import shapely
-            import geopandas as gpd
-            import numpy as np
-            import tempfile
-            import os
+            import shapely  # noqa: F401
+            import geopandas as gpd  # noqa: F401
+            import numpy as np  # noqa: F401
+            import tempfile  # noqa: F401
+            import os  # noqa: F401
             import rasterio
-            from rasterio.merge import merge
+            from rasterio.merge import merge  # noqa: F401
         except ImportError as e:
             logger.error(f"Failed to import required package: {e}. Please run 'pip install rasterstats shapely geopandas rasterio'")
             raise e
@@ -1578,27 +1686,27 @@ class HdfInfiltration:
             from ..RasPrj import ras
             ras_object = ras
         
-        # Get the landcover HDF path
-        if landcover_hdf_path is None:
-            try:
-                landcover_hdf_path = Path(ras_object.rasmap_df.loc[0, 'landcover_hdf_path'][0])
-                if not landcover_hdf_path.exists():
-                    logger.warning(f"Land cover HDF path from rasmap_df does not exist: {landcover_hdf_path}")
+        try:
+            landcover_hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+                landcover_hdf_path,
+                "landcover_hdf_path",
+                ras_object,
+            )
+            soil_hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+                soil_hdf_path,
+                "soil_layer_path",
+                ras_object,
+            )
+            for label, path in (
+                ("Land cover", landcover_hdf_path),
+                ("Soil", soil_hdf_path),
+            ):
+                if not path.exists():
+                    logger.warning("%s HDF path does not exist: %s", label, path)
                     return pd.DataFrame()
-            except (KeyError, IndexError, AttributeError, TypeError) as e:
-                logger.error(f"Error retrieving landcover_hdf_path from rasmap_df: {str(e)}")
-                return pd.DataFrame()
-        
-        # Get the soil HDF path
-        if soil_hdf_path is None:
-            try:
-                soil_hdf_path = Path(ras_object.rasmap_df.loc[0, 'soil_layer_path'][0])
-                if not soil_hdf_path.exists():
-                    logger.warning(f"Soil HDF path from rasmap_df does not exist: {soil_hdf_path}")
-                    return pd.DataFrame()
-            except (KeyError, IndexError, AttributeError, TypeError) as e:
-                logger.error(f"Error retrieving soil_layer_path from rasmap_df: {str(e)}")
-                return pd.DataFrame()
+        except (ValueError, KeyError, IndexError, AttributeError, TypeError) as e:
+            logger.error("Error resolving RASMapper classification HDF paths: %s", e)
+            return pd.DataFrame()
         
         # Get land cover map (raster to ID mapping)
         try:
@@ -1607,9 +1715,10 @@ class HdfInfiltration:
                     logger.error(f"No Raster Map found in {landcover_hdf_path}")
                     return pd.DataFrame()
                 
-                landcover_map_data = hdf['//Raster Map'][()]
+                landcover_map_data = read_typed(hdf['//Raster Map'])
                 landcover_map = {int(item[0]): item[1].decode('utf-8').strip() for item in landcover_map_data}
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading land cover data from HDF: {str(e)}")
             return pd.DataFrame()
         
@@ -1620,6 +1729,7 @@ class HdfInfiltration:
                 logger.error(f"No soil map found in {soil_hdf_path}")
                 return pd.DataFrame()
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error getting soil map: {str(e)}")
             return pd.DataFrame()
         
@@ -1630,6 +1740,7 @@ class HdfInfiltration:
                 logger.warning(f"No infiltration parameters found in {soil_hdf_path}")
                 infiltration_params = pd.DataFrame(columns=['Name', 'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate'])
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error getting infiltration parameters: {str(e)}")
             infiltration_params = pd.DataFrame(columns=['Name', 'Curve Number', 'Abstraction Ratio', 'Minimum Infiltration Rate'])
         
@@ -1653,6 +1764,9 @@ class HdfInfiltration:
         
         # List to store all results
         all_results = []
+        total_meshes = len(mesh_areas)
+        no_stats_meshes = []
+        mesh_errors = []
         
         # Read the raster data
         try:
@@ -1684,7 +1798,8 @@ class HdfInfiltration:
                         
                         # Skip if no stats
                         if not landcover_stats or not soil_stats:
-                            logger.warning(f"No land cover or soil data found for 2D flow area: {mesh_name}")
+                            no_stats_meshes.append(mesh_name)
+                            logger.debug(f"No land cover or soil data found for 2D flow area: {mesh_name}")
                             continue
                         
                         # Calculate total area
@@ -1705,7 +1820,7 @@ class HdfInfiltration:
                         for lc_id, lc_pct in landcover_pct.items():
                             lc_name = landcover_map.get(int(lc_id), f"Unknown-{lc_id}")
                             
-                            for soil_id, soil_pct in soil_pct.items():
+                            for soil_id, soil_fraction in soil_pct.items():
                                 try:
                                     soil_name = soil_map.get(int(soil_id), f"Unknown-{soil_id}")
                                 except (ValueError, TypeError):
@@ -1713,7 +1828,7 @@ class HdfInfiltration:
                                 
                                 # Calculate combined percentage (approximate)
                                 # This is a simplification; actual overlap would require pixel-by-pixel analysis
-                                combined_pct = lc_pct * soil_pct * 100
+                                combined_pct = lc_pct * soil_fraction * 100
                                 combined_area_sqm = mesh_area_sqm * (combined_pct / 100)
                                 
                                 # Create combined name
@@ -1746,9 +1861,22 @@ class HdfInfiltration:
                                     'min_infiltration_rate': min_infiltration_rate
                                 })
                     except Exception as e:
-                        logger.error(f"Error calculating statistics for mesh {mesh_name}: {str(e)}")
+                        reraise_required(e)
+                        mesh_errors.append(mesh_name)
+                        logger.debug(
+                            f"Error calculating land cover/soil statistics for mesh {mesh_name}: {str(e)}",
+                            exc_info=True,
+                        )
                         continue
+                HdfInfiltration._log_raster_mesh_diagnostics(
+                    "land cover/soil",
+                    total_meshes,
+                    no_stats_meshes,
+                    [],
+                    mesh_errors,
+                )
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error opening raster files: {str(e)}")
             return pd.DataFrame()
         
@@ -1787,19 +1915,23 @@ class HdfInfiltration:
         
         Args:
             hdf_path: Optional path to the HDF file. If not provided, uses first infiltration_hdf_path from rasmap_df
-            ras_object: Optional RAS object. If not provided, uses global ras instance
+            ras_object (RasPrj, optional): Optional RAS object. If not provided, uses global ras instance
             
         Returns:
             Dictionary mapping raster values to mukeys
+
+        Raises:
+            ValueError: If ``hdf_path`` is omitted and no usable infiltration
+                layer can be resolved from ``rasmap_df``.
         """
-        if hdf_path is None:
-            if ras_object is None:
-                from ..RasPrj import ras
-                ras_object = ras
-            hdf_path = Path(ras_object.rasmap_df.iloc[0]['infiltration_hdf_path'][0])
+        hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+            hdf_path,
+            "infiltration_hdf_path",
+            ras_object,
+        )
             
         with h5py.File(hdf_path, 'r') as hdf:
-            raster_map_data = hdf['Raster Map'][:]
+            raster_map_data = read_typed(hdf['Raster Map'], slice(None))
             return {int(item[0]): item[1].decode('utf-8') for item in raster_map_data}
 
     @staticmethod
@@ -1911,71 +2043,220 @@ class HdfInfiltration:
 
     @staticmethod
     @log_call
-    @standardize_input
+    @standardize_input(file_type='geom_hdf')
     def get_infiltration_parameters(hdf_path: Path = None, mukey: str = None, ras_object: Any = None) -> Optional[Dict[str, float]]:
-        """Get infiltration parameters for a specific mukey from HDF file
+        """Get the infiltration parameters stored for one class of an infiltration layer.
+
+        Reads the ``Variables`` table of a RASMapper infiltration layer HDF
+        (the file referenced by the project's ``.rasmap``; for example
+        ``Soils Data/Infiltration.hdf``). HEC-RAS keys that table by the class
+        ``Name`` column: one row per class with one float column per parameter.
+        The row whose ``Name`` equals ``mukey`` exactly is returned.
+
+        What ``mukey`` must be depends on how the layer was built:
+
+        * Layers that depend on a soils layer only (one column in
+          ``Dependency Classifications``) and legacy layers that carry their
+          own ``Raster Map`` key rows by the soil class name, e.g. ``"167"`` or
+          ``"329910_Docena"`` (the ``Name`` of the soils/infiltration
+          ``Raster Map``).
+        * Layers that depend on a land cover *and* a soils layer key rows by
+          the combined class, e.g. ``"Mixed Forest : B"``. Parameters then vary
+          by land cover, so a bare soil (or land cover) class does not identify
+          one row and a ``ValueError`` is raised; pass the combined name (the
+          ``Name`` values are listed by :meth:`get_infiltration_layer_data`).
+
+        The returned keys depend on the infiltration method (``LC Type`` of
+        the layer):
+
+        * Deficit and Constant: ``Maximum Deficit``, ``Initial Deficit``,
+          ``Potential Percolation Rate``.
+        * Green-Ampt: ``Wetting Front Suction``,
+          ``Saturated Hydraulic Conductivity``, ``Initial Soil Water Content``,
+          ``Saturated Soil Water Content``, ``Residual Soil Water Content``,
+          ``Pore Size Distribution Index`` (column order as stored).
+        * SCS Curve Number: ``Curve Number``, ``Abstraction Ratio``,
+          ``Minimum Infiltration Rate``.
+
+        Values are returned exactly as stored, in the project's unit system
+        (the layer does not record units), including the ``-9999.0`` that
+        HEC-RAS 7.0.1 Green-Ampt layers store in ``Residual Soil Water
+        Content`` and ``Pore Size Distribution Index``. Layer-wide
+        ``Properties`` (e.g. ``SCS Initial Loss Reset Time``) are not per-class
+        parameters and are not included.
+
+        The keys returned by earlier versions (``Initial Loss (in)``,
+        ``Constant Loss Rate (in/hr)``, ``Impervious Area (%)``) cannot be
+        filled: HEC-RAS infiltration layers do not store them (impervious
+        percentage belongs to the land cover layer's ``Percent Impervious``),
+        so they are not returned.
 
         Args:
-            hdf_path: Optional path to the HDF file. If not provided, uses first infiltration_hdf_path from rasmap_df
-            mukey: Mukey identifier
-            ras_object: Optional RAS object. If not provided, uses global ras instance
+            hdf_path: Optional path to the infiltration layer HDF. If not
+                provided, uses the first ``infiltration_hdf_path`` from
+                ``rasmap_df``.
+            mukey: Class name to look up (``Variables`` ``Name`` value).
+            ras_object (RasPrj, optional): Optional RAS object. If not provided,
+                uses global ras instance.
 
         Returns:
-            Optional[Dict[str, float]]: Dictionary of infiltration parameters, or None if mukey not found
+            Optional[Dict[str, float]]: The parameter columns of the matching
+            ``Variables`` row keyed by their HEC-RAS names (see above), or
+            ``None`` if no row has that name.
+
+        Raises:
+            KeyError: If the HDF has no ``Variables`` table.
+            ValueError: If ``hdf_path`` is omitted and no usable infiltration
+                layer can be resolved from ``rasmap_df``; if ``mukey`` matches
+                more than one row; or if ``mukey`` is a single dependency class
+                of a combined (land cover and soils) layer.
         """
-        if hdf_path is None:
-            if ras_object is None:
-                from ..RasPrj import ras
-                ras_object = ras
-            hdf_path = Path(ras_object.rasmap_df.iloc[0]['infiltration_hdf_path'][0])
-            
+        hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+            hdf_path,
+            "infiltration_hdf_path",
+            ras_object,
+        )
+
         with h5py.File(hdf_path, 'r') as hdf:
-            if 'Infiltration Parameters' not in hdf:
-                raise KeyError("No infiltration parameters found in HDF file")
-                
-            params = hdf['Infiltration Parameters'][:]
-            for row in params:
-                if row[0].decode('utf-8') == mukey:
-                    return {
-                        'Initial Loss (in)': float(row[1]),
-                        'Constant Loss Rate (in/hr)': float(row[2]),
-                        'Impervious Area (%)': float(row[3])
-                    }
+            if 'Variables' not in hdf:
+                raise KeyError(
+                    f"No Variables table found in infiltration layer {hdf_path}"
+                )
+            variables = read_typed(hdf['Variables'], slice(None))
+            dependency_classes = (
+                read_typed(hdf['Dependency Classifications'], slice(None))
+                if 'Dependency Classifications' in hdf
+                else None
+            )
+
+        fields = variables.dtype.names or ()
+        if 'Name' not in fields:
+            raise KeyError(
+                f"Variables table in {hdf_path} has no Name column"
+            )
+        names = [HdfInfiltration._decode_class_name(v) for v in variables['Name']]
+        matches = [i for i, name in enumerate(names) if name == mukey]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Class {mukey!r} occurs {len(matches)} times in the Variables "
+                f"table of {hdf_path}; the parameters are ambiguous."
+            )
+        if matches:
+            row = variables[matches[0]]
+            return {
+                field: float(row[field])
+                for field in fields
+                if field != 'Name' and variables.dtype[field].kind in 'fiu'
+            }
+
+        dependency_columns = (
+            dependency_classes.dtype.names
+            if dependency_classes is not None and dependency_classes.dtype.names
+            else ()
+        )
+        if len(dependency_columns) > 1:
+            for column in dependency_columns:
+                classes = {
+                    HdfInfiltration._decode_class_name(v)
+                    for v in dependency_classes[column]
+                }
+                if mukey in classes:
+                    raise ValueError(
+                        f"{mukey!r} is a {column!r} class, but {hdf_path} keys "
+                        f"its parameters by the combined classes of "
+                        f"{', '.join(repr(c) for c in dependency_columns)} "
+                        "(e.g. 'Land Cover : Soil'). Pass a Variables Name; "
+                        "get_infiltration_layer_data() lists them."
+                    )
         return None
+
+    @staticmethod
+    def _decode_class_name(value: Any) -> str:
+        """Decode one fixed-length class-name cell exactly as stored."""
+        if isinstance(value, (bytes, np.bytes_)):
+            return value.decode('utf-8')
+        return str(value)
 
     @staticmethod
     @log_call
     def calculate_weighted_parameters(soil_stats: pd.DataFrame, 
                                    infiltration_params: dict) -> dict:
         """Calculate weighted infiltration parameters based on soil statistics
-        
+
         Args:
             soil_stats: DataFrame with soil statistics
-            infiltration_params: Dictionary of infiltration parameters by mukey
-            
+            infiltration_params: Dictionary of infiltration parameters by mukey,
+                e.g. ``{mukey: get_infiltration_parameters(path, mukey)}``.
+
         Returns:
-            Dictionary of weighted average infiltration parameters
+            Dictionary of weighted average infiltration parameters, keyed like
+            the first entry of ``infiltration_params``. A contributing class is
+            a ``soil_stats`` mukey present in ``infiltration_params``; weights
+            are its ``Percentage`` over the total ``Percentage``. A parameter
+            is left out of the result (and a warning names it) when any
+            contributing class does not have it: the key is missing, the value
+            is NaN, or it is ``-9999.0``. HEC-RAS layers mark unset parameters
+            with ``-9999.0`` (for example ``Residual Soil Water Content`` and
+            ``Pore Size Distribution Index`` in 7.0.1 Green-Ampt layers); no
+            attribute declares it, and it is the only negative value they
+            store. When no class contributes (``infiltration_params`` is
+            empty, no mukey matches, or the total ``Percentage`` is not
+            positive) the result is an empty dict and a warning is logged:
+            no value is supplied that the layer does not hold.
         """
-        total_weight = soil_stats['Percentage'].sum()
-        
-        weighted_params = {
-            'Initial Loss (in)': 0.0,
-            'Constant Loss Rate (in/hr)': 0.0,
-            'Impervious Area (%)': 0.0
-        }
-        
-        for _, row in soil_stats.iterrows():
-            mukey = row['mukey']
-            weight = row['Percentage'] / total_weight
-            
-            if mukey in infiltration_params:
-                for param in weighted_params:
-                    weighted_params[param] += (
-                        infiltration_params[mukey][param] * weight
-                    )
-        
-        return weighted_params
-    
+        total_weight = float(soil_stats['Percentage'].sum()) if len(soil_stats) else 0.0
+        contributing = [
+            (row['mukey'], row['Percentage'])
+            for _, row in soil_stats.iterrows()
+            if row['mukey'] in infiltration_params
+        ]
+        if not infiltration_params or not contributing or not (
+            np.isfinite(total_weight) and total_weight > 0
+        ):
+            logger.warning(
+                "Weighted infiltration parameters are empty: no contributing class "
+                "(%d parameter set(s), %d soil row(s) matched, total Percentage %s)",
+                len(infiltration_params or {}), len(contributing), total_weight,
+            )
+            return {}
+
+        first = next(iter(infiltration_params.values()))
+        weighted_params = {param: 0.0 for param in first}
+        unavailable = set()
+        for mukey, percentage in contributing:
+            weight = percentage / total_weight
+            class_params = infiltration_params[mukey]
+            for param in weighted_params:
+                if param in unavailable:
+                    continue
+                value = class_params.get(param)
+                if not HdfInfiltration._is_available_parameter(value):
+                    unavailable.add(param)
+                    continue
+                weighted_params[param] += float(value) * weight
+
+        if unavailable:
+            logger.warning(
+                "Weighted infiltration parameters omit %s: not available "
+                "(missing, NaN or -9999) for at least one contributing class",
+                ", ".join(sorted(unavailable)),
+            )
+        return {k: v for k, v in weighted_params.items() if k not in unavailable}
+
+    # HEC-RAS layer tables store -9999.0 for a parameter that is not set.
+    _UNSET_PARAMETER_VALUE = -9999.0
+
+    @staticmethod
+    def _is_available_parameter(value: Any) -> bool:
+        """True for a finite value other than the HEC-RAS unset marker."""
+        if value is None:
+            return False
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(number)) and number != HdfInfiltration._UNSET_PARAMETER_VALUE
+
 
     @staticmethod
     def _get_table_info(hdf_file: h5py.File, table_path: str) -> Tuple[List[str], List[str], List[str]]:
@@ -2047,11 +2328,11 @@ class HdfInfiltration:
         """
         try:
             from rasterstats import zonal_stats
-            import shapely
-            import geopandas as gpd
-            import numpy as np
-            import tempfile
-            import os
+            import shapely  # noqa: F401
+            import geopandas as gpd  # noqa: F401
+            import numpy as np  # noqa: F401
+            import tempfile  # noqa: F401
+            import os  # noqa: F401
             import rasterio
         except ImportError as e:
             logger.error(f"Failed to import required package: {e}. Please run 'pip install rasterstats shapely geopandas rasterio'")
@@ -2060,21 +2341,21 @@ class HdfInfiltration:
         # Import here to avoid circular imports
         from .HdfMesh import HdfMesh
         
-        # Get the landcover HDF path
-        if landcover_hdf_path is None:
-            if ras_object is None:
-                from ..RasPrj import ras
-                ras_object = ras
-            
-            # Try to get landcover_hdf_path from rasmap_df
-            try:
-                landcover_hdf_path = Path(ras_object.rasmap_df.loc[0, 'landcover_hdf_path'][0])
-                if not landcover_hdf_path.exists():
-                    logger.warning(f"Land cover HDF path from rasmap_df does not exist: {landcover_hdf_path}")
-                    return pd.DataFrame()
-            except (KeyError, IndexError, AttributeError, TypeError) as e:
-                logger.error(f"Error retrieving landcover_hdf_path from rasmap_df: {str(e)}")
+        try:
+            landcover_hdf_path = HdfInfiltration._resolve_rasmap_hdf_path(
+                landcover_hdf_path,
+                "landcover_hdf_path",
+                ras_object,
+            )
+            if not landcover_hdf_path.exists():
+                logger.warning(
+                    "Land cover HDF path does not exist: %s",
+                    landcover_hdf_path,
+                )
                 return pd.DataFrame()
+        except (ValueError, KeyError, IndexError, AttributeError, TypeError) as e:
+            logger.error("Error resolving landcover_hdf_path: %s", e)
+            return pd.DataFrame()
         
         # Get land cover map (raster to ID mapping)
         try:
@@ -2083,13 +2364,13 @@ class HdfInfiltration:
                     logger.error(f"No Raster Map found in {landcover_hdf_path}")
                     return pd.DataFrame()
                 
-                raster_map_data = hdf['//Raster Map'][()]
+                raster_map_data = read_typed(hdf['//Raster Map'])
                 raster_map = {int(item[0]): item[1].decode('utf-8').strip() for item in raster_map_data}
                 
                 # Get land cover variables (mannings_n and percent_impervious)
                 variables = {}
                 if '//Variables' in hdf:
-                    var_data = hdf['//Variables'][()]
+                    var_data = read_typed(hdf['//Variables'])
                     for row in var_data:
                         name = row[0].decode('utf-8').strip()
                         mannings_n = float(row[1])
@@ -2099,6 +2380,7 @@ class HdfInfiltration:
                             'percent_impervious': percent_impervious
                         }
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading land cover data from HDF: {str(e)}")
             return pd.DataFrame()
         
@@ -2116,6 +2398,11 @@ class HdfInfiltration:
         
         # List to store all results
         all_results = []
+        total_meshes = len(mesh_areas)
+        no_stats_meshes = []
+        nodata_only_meshes = []
+        mesh_errors = []
+        value_errors = []
         
         # Read the raster data and info
         try:
@@ -2139,7 +2426,8 @@ class HdfInfiltration:
                         
                         # Skip if no stats
                         if not stats:
-                            logger.warning(f"No land cover data found for 2D flow area: {mesh_name}")
+                            no_stats_meshes.append(mesh_name)
+                            logger.debug(f"No land cover data found for 2D flow area: {mesh_name}")
                             continue
 
                         area_by_value, total_area_sqm = (
@@ -2150,7 +2438,8 @@ class HdfInfiltration:
                             )
                         )
                         if not area_by_value:
-                            logger.warning(
+                            nodata_only_meshes.append(mesh_name)
+                            logger.debug(
                                 f"No non-NoData land cover pixels found for 2D "
                                 f"flow area: {mesh_name}"
                             )
@@ -2180,14 +2469,38 @@ class HdfInfiltration:
                                     'percent_impervious': percent_impervious
                                 })
                             except Exception as e:
-                                logger.warning(f"Error processing raster value {raster_val}: {e}")
+                                reraise_required(e)
+                                value_errors.append(f"{mesh_name}/{raster_val}")
+                                logger.debug(
+                                    f"Error processing land cover raster value {raster_val} "
+                                    f"for mesh {mesh_name}: {e}",
+                                    exc_info=True,
+                                )
                                 continue
                     except Exception as e:
-                        logger.error(f"Error calculating statistics for mesh {mesh_name}: {str(e)}")
+                        reraise_required(e)
+                        mesh_errors.append(mesh_name)
+                        logger.debug(
+                            f"Error calculating land cover statistics for mesh {mesh_name}: {str(e)}",
+                            exc_info=True,
+                        )
                         continue
+                HdfInfiltration._log_raster_mesh_diagnostics(
+                    "land cover",
+                    total_meshes,
+                    no_stats_meshes,
+                    nodata_only_meshes,
+                    mesh_errors,
+                )
+                if value_errors:
+                    logger.warning(
+                        f"Skipped {len(value_errors)} land cover raster value(s) during "
+                        f"stats processing; first: {HdfInfiltration._format_log_samples(value_errors)}"
+                    )
         except ValueError:
             raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error opening raster file {tif_path}: {str(e)}")
             return pd.DataFrame()
         

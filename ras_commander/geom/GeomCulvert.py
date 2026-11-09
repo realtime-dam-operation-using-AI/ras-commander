@@ -6,15 +6,75 @@ files (.g##), including single-barrel ``Culvert=`` records and real-world
 ``Multiple Barrel Culv=`` records with fixed-width barrel station pairs.
 """
 
+import json
+from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import pandas as pd
 
+from .._ras_text import _write_ras_text
 from ..LoggingConfig import get_logger
 from ..Decorators import log_call
 from .GeomParser import GeomParser
 
 logger = get_logger(__name__)
+
+
+def _load_culvert_taxonomy() -> Dict[str, Any]:
+    """Load the packaged HEC-RAS culvert taxonomy resource."""
+    path = resources.files("ras_commander.resources").joinpath("culvert_taxonomy.json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _compact_lookup_token(value: str) -> str:
+    """Normalize names for forgiving shape/field lookup."""
+    return "".join(char for char in value.casefold() if char.isalnum())
+
+
+_CULVERT_TAXONOMY = _load_culvert_taxonomy()
+_CULVERT_TAXONOMY_SHAPES = {
+    int(shape["code"]): shape
+    for shape in _CULVERT_TAXONOMY["shapes"]
+}
+
+
+def _shape_name_lookup() -> Dict[str, int]:
+    """Build shape name aliases from taxonomy labels and enum names."""
+    lookup: Dict[str, int] = {}
+    taxonomy_name_fields = (
+        "ras_commander_shape_name",
+        "hec_ras_gui_label",
+        "rasmapper_enum",
+        "rasmapper_static_field",
+    )
+    for code, shape in _CULVERT_TAXONOMY_SHAPES.items():
+        for field in taxonomy_name_fields:
+            raw_value = shape.get(field)
+            if not raw_value:
+                continue
+            value = str(raw_value).strip()
+            lookup[value.casefold()] = code
+            lookup[value.replace("-", " ").casefold()] = code
+            lookup[_compact_lookup_token(value)] = code
+    return lookup
+
+
+def _geometry_field_labels() -> Dict[str, str]:
+    """Return HEC-RAS GUI labels for plain-text culvert record fields."""
+    labels: Dict[str, str] = {}
+    for record_spec in _CULVERT_TAXONOMY["geometry_file_records"].values():
+        for field_spec in record_spec.get("ordered_fields", []):
+            labels.setdefault(field_spec["name"], field_spec.get("gui_label", field_spec["name"]))
+    for field_name, gui_label in (
+        ("BottomN", "Manning's n for Bottom"),
+        ("BottomDepth", "Depth to use Bottom n"),
+        ("DepthBlocked", "Depth Blocked"),
+        ("BarrelStations", "Barrel Centerline Stations"),
+        ("UpstreamStations", "Barrel Centerline Stations - upstream"),
+        ("DownstreamStations", "Barrel Centerline Stations - downstream"),
+    ):
+        labels.setdefault(field_name, gui_label)
+    return labels
 
 
 class GeomCulvert:
@@ -30,26 +90,29 @@ class GeomCulvert:
     DEFAULT_SEARCH_RANGE = 200
     MAX_PARSE_LINES = 200
 
-    # Culvert shape codes
+    # Culvert taxonomy loaded from ras_commander/resources/culvert_taxonomy.json.
+    CULVERT_TAXONOMY = _CULVERT_TAXONOMY
+    CULVERT_TAXONOMY_SHAPES = _CULVERT_TAXONOMY_SHAPES
     CULVERT_SHAPES = {
-        1: 'Circular',
-        2: 'Box',
-        3: 'Pipe Arch',
-        4: 'Ellipse',
-        5: 'Arch',
-        6: 'Semi-Circle',
-        7: 'Low Profile Arch',
-        8: 'High Profile Arch',
-        9: 'Con Span'
+        code: shape["ras_commander_shape_name"]
+        for code, shape in _CULVERT_TAXONOMY_SHAPES.items()
     }
-    CULVERT_SHAPE_NAMES = {
-        shape_name.casefold(): shape_code
-        for shape_code, shape_name in CULVERT_SHAPES.items()
-    }
-    CULVERT_SHAPE_NAMES.update({
-        shape_name.replace('-', ' ').casefold(): shape_code
-        for shape_code, shape_name in CULVERT_SHAPES.items()
-    })
+    CULVERT_SHAPE_NAMES = _shape_name_lookup()
+    FIELD_GUI_LABELS = _geometry_field_labels()
+
+    GLOBAL_CONSTRAINTS = CULVERT_TAXONOMY["global_constraints"]
+    MAX_CULVERT_GROUPS_PER_CROSSING = int(
+        GLOBAL_CONSTRAINTS["culvert_groups_per_crossing"]["maximum"]
+    )
+    MIN_CULVERT_GROUPS_PER_CROSSING = int(
+        GLOBAL_CONSTRAINTS["culvert_groups_per_crossing"]["minimum"]
+    )
+    MAX_IDENTICAL_BARRELS_PER_GROUP = int(
+        GLOBAL_CONSTRAINTS["identical_barrels_per_group"]["maximum"]
+    )
+    MIN_IDENTICAL_BARRELS_PER_GROUP = int(
+        GLOBAL_CONSTRAINTS["identical_barrels_per_group"]["minimum"]
+    )
 
     CULVERT_RECORD_PREFIXES = ("Culvert=", "Multiple Barrel Culv=")
     CULVERT_DETAIL_PREFIXES = (
@@ -81,8 +144,16 @@ class GeomCulvert:
         'exitloss': 'ExitLoss',
         'inlet_type': 'InletType',
         'inlettype': 'InletType',
+        'chart_id': 'InletType',
+        'chartid': 'InletType',
+        'chart#': 'InletType',
+        'chart': 'InletType',
         'outlet_type': 'OutletType',
         'outlettype': 'OutletType',
+        'scale_id': 'OutletType',
+        'scaleid': 'OutletType',
+        'scale#': 'OutletType',
+        'scale': 'OutletType',
         'upstream_invert': 'UpstreamInvert',
         'upstreaminvert': 'UpstreamInvert',
         'upstream_station': 'UpstreamStation',
@@ -107,11 +178,15 @@ class GeomCulvert:
         'chartnumber': 'ChartNumber',
         'culvert_code': 'CulvertCode',
         'culvertcode': 'CulvertCode',
+        'usdistance': 'UsDistance',
+        'us_distance': 'UsDistance',
+        'us distance': 'UsDistance',
+        'upstreamdistance': 'UsDistance',
+        'upstream_distance': 'UsDistance',
     }
 
     REQUIRED_FIELDS = (
         'Shape',
-        'Span',
         'Length',
         'ManningsN',
         'EntranceLoss',
@@ -152,8 +227,17 @@ class GeomCulvert:
 
     @staticmethod
     def _find_structure_end(lines: List[str], bridge_idx: int) -> int:
-        """Find the first line after a bridge/culvert structure block."""
-        for i in range(bridge_idx + 1, min(bridge_idx + GeomCulvert.MAX_PARSE_LINES, len(lines))):
+        """Find the first line after a bridge/culvert structure block.
+
+        Scans to the next cross section / structure (``Type RM``), reach, or
+        ``Reach XS=`` boundary. The scan is NOT capped to a fixed window: in real
+        models a structure's interior (bridge deck, ineffective-flow blocks, GIS
+        cut lines) routinely pushes the culvert records and the following ``Type
+        RM`` header well past a few hundred lines. A premature cap made this
+        return end-of-file, so ``get_culverts`` swallowed every downstream
+        structure's culverts.
+        """
+        for i in range(bridge_idx + 1, len(lines)):
             line = lines[i]
             if (line.startswith("Type RM Length L Ch R =") or
                     line.startswith("River Reach=") or
@@ -185,6 +269,35 @@ class GeomCulvert:
             return None
 
     @staticmethod
+    def _is_station_line(line: str) -> bool:
+        """True for a fixed-width barrel-station line (whitespace + numbers only),
+        such as ``   95.02   86.98`` or ``     996     996    1004    1004``."""
+        stripped = line.strip()
+        if not stripped:
+            return False
+        tokens = stripped.split()
+        for tok in tokens:
+            try:
+                val = float(tok)
+            except ValueError:
+                return False
+            # real station values are finite; reject nan/inf so a stray
+            # non-numeric/sentinel line is not mistaken for a station line.
+            if val != val or val in (float("inf"), float("-inf")):
+                return False
+        return True
+
+    @staticmethod
+    def _coalesce_us_distance(record: Dict[str, Any]) -> Any:
+        """Pick the trailing-field value for a culvert record: ``UsDistance`` when
+        present and not NaN, otherwise the legacy ``ChartNumber`` alias. Both
+        derive from the same source token, so this keeps them from diverging."""
+        us = record.get('UsDistance')
+        if not GeomCulvert._is_missing(us):
+            return us
+        return record.get('ChartNumber')
+
+    @staticmethod
     def _parse_int(value: Any) -> Optional[int]:
         parsed = GeomCulvert._parse_float(value)
         if parsed is None:
@@ -211,8 +324,138 @@ class GeomCulvert:
                 return None
             if stripped.lstrip("-").isdigit():
                 return int(stripped)
-            return GeomCulvert.CULVERT_SHAPE_NAMES.get(stripped.casefold())
+            return (
+                GeomCulvert.CULVERT_SHAPE_NAMES.get(stripped.casefold()) or
+                GeomCulvert.CULVERT_SHAPE_NAMES.get(stripped.replace("-", " ").casefold()) or
+                GeomCulvert.CULVERT_SHAPE_NAMES.get(_compact_lookup_token(stripped))
+            )
         return GeomCulvert._parse_int(value)
+
+    @staticmethod
+    def _gui_label(field: str) -> str:
+        """Return the HEC-RAS GUI label for a normalized API field name."""
+        return GeomCulvert.FIELD_GUI_LABELS.get(field, field)
+
+    @staticmethod
+    def _taxonomy_shape(shape_code: int) -> Dict[str, Any]:
+        """Return taxonomy metadata for a shape code."""
+        return GeomCulvert.CULVERT_TAXONOMY_SHAPES[shape_code]
+
+    @staticmethod
+    def _allowed_charts(shape_code: int) -> Dict[int, Dict[str, Any]]:
+        """Return allowed chart metadata keyed by Chart # for a shape."""
+        shape = GeomCulvert._taxonomy_shape(shape_code)
+        return {
+            int(chart["chart_id"]): chart
+            for chart in shape.get("allowed_charts", [])
+        }
+
+    @staticmethod
+    def _allowed_scales(chart: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+        """Return allowed scale metadata keyed by Scale# for a chart."""
+        return {
+            int(scale["scale_id"]): scale
+            for scale in chart.get("allowed_scales", [])
+        }
+
+    @staticmethod
+    def _numeric_range_rule(field: str) -> Optional[str]:
+        """Classify a numeric field's taxonomy range as positive/nonnegative."""
+        ranges = GeomCulvert.GLOBAL_CONSTRAINTS.get("numeric_ranges", {})
+        rule_text = str(ranges.get(field, "")).casefold()
+        if "nonnegative" in rule_text:
+            return "nonnegative"
+        if "positive" in rule_text:
+            return "positive"
+        return None
+
+    @staticmethod
+    def _validate_taxonomy_dimensions(
+        normalized: Dict[str, Any],
+        shape_spec: Dict[str, Any],
+        index: int,
+    ) -> None:
+        """Validate shape-specific dimension fields from the taxonomy."""
+        dimension_model = shape_spec.get("dimension_model", {})
+        required_fields = dimension_model.get("required_geometry_fields", [])
+        for field in required_fields:
+            if GeomCulvert._is_missing(normalized.get(field)):
+                label = GeomCulvert._gui_label(field)
+                raise ValueError(
+                    f"Culvert record {index} is missing required HEC-RAS field: {label}"
+                )
+
+    @staticmethod
+    def _validate_taxonomy_numeric_ranges(
+        normalized: Dict[str, Any],
+        shape_spec: Dict[str, Any],
+        index: int,
+    ) -> None:
+        """Validate numeric field sign constraints described in the taxonomy."""
+        dimension_model = shape_spec.get("dimension_model", {})
+        dimension_fields = set(dimension_model.get("required_geometry_fields", []))
+        dimension_fields.update(dimension_model.get("optional_geometry_fields", []))
+
+        for field in GeomCulvert.GLOBAL_CONSTRAINTS.get("numeric_ranges", {}):
+            if field not in normalized:
+                continue
+            value = normalized.get(field)
+            if GeomCulvert._is_missing(value):
+                continue
+            if field in {"Span", "Rise"} and field not in dimension_fields:
+                continue
+
+            rule = GeomCulvert._numeric_range_rule(field)
+            label = GeomCulvert._gui_label(field)
+            if rule == "positive" and value <= 0:
+                raise ValueError(
+                    f"Culvert record {index} has invalid {label}: {value}. "
+                    f"HEC-RAS requires a positive value."
+                )
+            if rule == "nonnegative" and value < 0:
+                raise ValueError(
+                    f"Culvert record {index} has invalid {label}: {value}. "
+                    f"HEC-RAS requires a nonnegative value."
+                )
+
+    @staticmethod
+    def _validate_taxonomy_chart_scale(
+        normalized: Dict[str, Any],
+        shape_spec: Dict[str, Any],
+        index: int,
+    ) -> None:
+        """Validate Chart # and Scale# against the selected taxonomy shape."""
+        chart_id = normalized.get("InletType")
+        scale_id = normalized.get("OutletType")
+        shape_code = normalized["Shape"]
+        shape_name = shape_spec["ras_commander_shape_name"]
+
+        allowed_charts = GeomCulvert._allowed_charts(shape_code)
+        if chart_id not in allowed_charts:
+            allowed = ", ".join(str(chart) for chart in sorted(allowed_charts))
+            raise ValueError(
+                f"Culvert record {index} has invalid Chart # {chart_id} for "
+                f"Shape {shape_name}. Allowed Chart # values: {allowed}."
+            )
+
+        chart = allowed_charts[chart_id]
+        allowed_scales = GeomCulvert._allowed_scales(chart)
+        if scale_id not in allowed_scales:
+            allowed = ", ".join(str(scale) for scale in sorted(allowed_scales))
+            chart_label = chart.get("hec_ras_gui_label", chart_id)
+            raise ValueError(
+                f"Culvert record {index} has invalid Scale# {scale_id} for "
+                f"Chart # {chart_id} ({chart_label}). "
+                f"Allowed Scale# values for this Chart #: {allowed}."
+            )
+
+    @staticmethod
+    def _validate_taxonomy_record(normalized: Dict[str, Any], index: int) -> None:
+        """Validate a normalized authored culvert record against the taxonomy."""
+        shape_spec = GeomCulvert._taxonomy_shape(normalized["Shape"])
+        GeomCulvert._validate_taxonomy_dimensions(normalized, shape_spec, index)
+        GeomCulvert._validate_taxonomy_numeric_ranges(normalized, shape_spec, index)
+        GeomCulvert._validate_taxonomy_chart_scale(normalized, shape_spec, index)
 
     @staticmethod
     def _format_value(value: Any) -> str:
@@ -224,7 +467,14 @@ class GeomCulvert:
         if isinstance(value, int):
             return str(value)
         if isinstance(value, float):
-            return f"{value:g}"
+            # Integer-valued floats render without a trailing ".0" (8.0 -> "8");
+            # otherwise preserve full precision. Plain ``:g`` defaults to only 6
+            # significant figures and silently truncates real geometry values
+            # (e.g. an invert 310.9502 -> "310.95"), so use enough precision to
+            # round-trip the value while still stripping noise/trailing zeros.
+            if value == int(value) and abs(value) < 1e15:
+                return str(int(value))
+            return f"{value:.12g}"
         return str(value).strip()
 
     @staticmethod
@@ -299,9 +549,13 @@ class GeomCulvert:
         shape = GeomCulvert._shape_code(record.get('Shape'))
         if shape is None:
             shape = GeomCulvert._shape_code(record.get('ShapeName'))
-        if shape not in GeomCulvert.CULVERT_SHAPES:
+        if shape not in GeomCulvert.CULVERT_TAXONOMY_SHAPES:
             supported = ", ".join(f"{code}={name}" for code, name in GeomCulvert.CULVERT_SHAPES.items())
-            raise ValueError(f"Unsupported culvert shape code/name {record.get('Shape')!r}. Supported: {supported}")
+            supplied = record.get('Shape', record.get('ShapeName'))
+            raise ValueError(
+                f"Unsupported HEC-RAS Shape code/name {supplied!r}. "
+                f"Supported Shape values: {supported}"
+            )
 
         normalized = {
             'RecordType': GeomCulvert._parse_text(record.get('RecordType')),
@@ -322,19 +576,35 @@ class GeomCulvert:
             'BottomDepth': GeomCulvert._parse_float(record.get('BottomDepth')),
             'ChartNumber': GeomCulvert._parse_int(record.get('ChartNumber')),
             'CulvertCode': GeomCulvert._parse_int(record.get('CulvertCode')),
+            # US Distance is the trailing record field (legacy alias: ChartNumber).
+            # Fall back to ChartNumber when UsDistance is absent *or* NaN so the two
+            # (which always derive from the same source token) never diverge.
+            'UsDistance': GeomCulvert._parse_float(
+                GeomCulvert._coalesce_us_distance(record)),
         }
 
         for field in GeomCulvert.REQUIRED_FIELDS:
             if GeomCulvert._is_missing(normalized[field]):
-                raise ValueError(f"Culvert record {index} is missing required field: {field}")
+                label = GeomCulvert._gui_label(field)
+                raise ValueError(
+                    f"Culvert record {index} is missing required HEC-RAS field: {label}"
+                )
 
-        if shape != 1 and GeomCulvert._is_missing(normalized['Rise']):
-            raise ValueError(f"Culvert record {index} is missing required field: Rise")
+        GeomCulvert._validate_taxonomy_record(normalized, index)
 
         barrel_stations = GeomCulvert._normalize_barrel_stations(record)
         num_barrels = GeomCulvert._parse_int(record.get('NumBarrels'))
         if num_barrels is None:
             num_barrels = len(barrel_stations) if barrel_stations else 1
+
+        min_barrels = GeomCulvert.MIN_IDENTICAL_BARRELS_PER_GROUP
+        max_barrels = GeomCulvert.MAX_IDENTICAL_BARRELS_PER_GROUP
+        if num_barrels < min_barrels or num_barrels > max_barrels:
+            raise ValueError(
+                f"Culvert record {index} has invalid {GeomCulvert._gui_label('NumBarrels')}="
+                f"{num_barrels}. HEC-RAS allows {min_barrels}..{max_barrels} "
+                "identical barrels per culvert group."
+            )
 
         record_type = normalized['RecordType']
         write_multiple = (
@@ -348,14 +618,17 @@ class GeomCulvert:
                 raise ValueError("NumBarrels must be at least 1")
             if len(barrel_stations) != num_barrels:
                 raise ValueError(
-                    f"Culvert record {index} declares NumBarrels={num_barrels} "
-                    f"but provides {len(barrel_stations)} barrel station pairs"
+                    f"Culvert record {index} declares {GeomCulvert._gui_label('NumBarrels')}="
+                    f"{num_barrels} but provides {len(barrel_stations)} "
+                    f"{GeomCulvert._gui_label('BarrelStations')} pairs"
                 )
             normalized['RecordType'] = 'Multiple Barrel Culv'
         else:
             if not barrel_stations:
                 raise ValueError(
-                    f"Culvert record {index} requires UpstreamStation and DownstreamStation"
+                    f"Culvert record {index} requires "
+                    f"{GeomCulvert._gui_label('UpstreamStation')} and "
+                    f"{GeomCulvert._gui_label('DownstreamStation')}"
                 )
             normalized['RecordType'] = 'Culvert'
 
@@ -370,6 +643,10 @@ class GeomCulvert:
             normalized['CulvertCode'] = 0
         if normalized['ChartNumber'] is None:
             normalized['ChartNumber'] = 0
+        # The trailing field defaults to ChartNumber (0 when unset) so a record
+        # with no US Distance serializes byte-identically to the legacy behavior.
+        if GeomCulvert._is_missing(normalized['UsDistance']):
+            normalized['UsDistance'] = normalized['ChartNumber']
 
         return normalized
 
@@ -437,6 +714,7 @@ class GeomCulvert:
             'BarrelStations': [],
             'ChartNumber': None,
             'CulvertCode': None,
+            'UsDistance': None,
             'BottomN': None,
             'BottomDepth': None,
             'NumBarrels': 1,
@@ -462,7 +740,12 @@ class GeomCulvert:
             data['NumBarrels'] = GeomCulvert._parse_int(parts[11]) if len(parts) > 11 else 1
             data['CulvertName'] = GeomCulvert._parse_text(parts[12]) if len(parts) > 12 else None
             data['CulvertCode'] = GeomCulvert._parse_int(parts[13]) if len(parts) > 13 else None
+            # trailing field is the structure's US Distance (distance from the
+            # upstream bounding XS to the culvert), historically mislabeled
+            # ChartNumber. Expose it properly as a float; keep ChartNumber for
+            # backward compatibility.
             data['ChartNumber'] = GeomCulvert._parse_int(parts[14]) if len(parts) > 14 else None
+            data['UsDistance'] = GeomCulvert._parse_float(parts[14]) if len(parts) > 14 else None
 
             expected_values = max(data['NumBarrels'] or 0, 0) * 2
             station_values, next_idx = GeomCulvert._parse_station_values(
@@ -484,12 +767,22 @@ class GeomCulvert:
             data['DownstreamStation'] = GeomCulvert._parse_float(parts[12]) if len(parts) > 12 else None
             data['CulvertName'] = GeomCulvert._parse_text(parts[13]) if len(parts) > 13 else None
             data['CulvertCode'] = GeomCulvert._parse_int(parts[14]) if len(parts) > 14 else None
+            # trailing field is the structure's US Distance (see multi-barrel note)
             data['ChartNumber'] = GeomCulvert._parse_int(parts[15]) if len(parts) > 15 else None
+            data['UsDistance'] = GeomCulvert._parse_float(parts[15]) if len(parts) > 15 else None
             if data['UpstreamStation'] is not None and data['DownstreamStation'] is not None:
                 data['BarrelStations'] = [(data['UpstreamStation'], data['DownstreamStation'])]
                 data['UpstreamStations'] = [data['UpstreamStation']]
                 data['DownstreamStations'] = [data['DownstreamStation']]
+            # HEC-RAS writes a fixed-width station line after a single-barrel
+            # record too (stations are also inline, so this line is redundant).
+            # Consume it so the detail loop below still finds Culvert Bottom n=,
+            # Culvert Bottom Depth=, and BC Culvert Barrel= lines.
+            if (next_idx < section_end_idx
+                    and GeomCulvert._is_station_line(lines[next_idx])):
+                next_idx += 1
 
+        bc_barrel_count = 0
         while next_idx < section_end_idx:
             next_line = lines[next_idx]
             if next_line.startswith("Culvert Bottom n="):
@@ -501,13 +794,29 @@ class GeomCulvert:
                 data['BottomDepth'] = GeomCulvert._parse_float(bottom_depth)
                 next_idx += 1
             elif next_line.startswith("BC Culvert Barrel="):
-                barrel_val = GeomParser.extract_keyword_value(next_line, "BC Culvert Barrel")
-                barrel_parts = [p.strip() for p in barrel_val.split(',')]
-                if barrel_parts:
-                    data['NumBarrels'] = GeomCulvert._parse_int(barrel_parts[0]) or data['NumBarrels']
+                # "BC Culvert Barrel=<barrel_index>,<name>,<flag>" is a per-barrel
+                # BC reference. The first field is the barrel INDEX (1, 2, ...),
+                # NOT the barrel count -- counting the lines gives the count.
+                bc_barrel_count += 1
                 next_idx += 1
             else:
                 break
+
+        # NumBarrels precedence: the station-line pair count is ground truth;
+        # fall back to the count of per-barrel BC references. This keeps a real
+        # multi-barrel record (e.g. "...,N,Name,..." + an N-pair station line)
+        # from being collapsed to 1 by a trailing "BC Culvert Barrel=1" line.
+        if data['BarrelStations']:
+            declared = data['NumBarrels']
+            actual = len(data['BarrelStations'])
+            if declared and declared != actual:
+                logger.warning(
+                    "Culvert %r declares %s barrel(s) but its station line has "
+                    "%s pair(s); using the station-pair count.",
+                    (data.get('CulvertName') or '').strip(), declared, actual)
+            data['NumBarrels'] = actual
+        elif bc_barrel_count and not data['NumBarrels']:
+            data['NumBarrels'] = bc_barrel_count
 
         return data, next_idx
 
@@ -540,6 +849,14 @@ class GeomCulvert:
             elif lines[i].startswith(GeomCulvert.CULVERT_DETAIL_PREFIXES):
                 i += 1
                 last_idx = i
+            elif GeomCulvert._is_station_line(lines[i]):
+                # HEC-RAS writes a fixed-width station line after EVERY culvert
+                # record (single-barrel included). The single-barrel parser reads
+                # stations inline and does not consume it, so skip it here -- else
+                # the range stops short and later culvert groups at the same
+                # structure are left orphaned when records are replaced.
+                i += 1
+                last_idx = i
             elif lines[i].strip() == "":
                 i += 1
                 last_idx = i
@@ -569,7 +886,7 @@ class GeomCulvert:
                 record['NumBarrels'],
                 record['CulvertName'],
                 record['CulvertCode'],
-                record['ChartNumber'],
+                record.get('UsDistance', record.get('ChartNumber')),
             ]
             output = [f"Multiple Barrel Culv={','.join(GeomCulvert._format_value(v) for v in fields)}\n"]
             station_values = []
@@ -598,9 +915,22 @@ class GeomCulvert:
                 record['DownstreamStation'],
                 record['CulvertName'],
                 record['CulvertCode'],
-                record['ChartNumber'],
+                record.get('UsDistance', record.get('ChartNumber')),
             ]
             output = [f"Culvert={','.join(GeomCulvert._format_value(v) for v in fields)}\n"]
+            # HEC-RAS writes a fixed-width US/DS station line after a single-barrel
+            # Culvert= record too. Re-emit it (when stations are known) for format
+            # fidelity and to keep consecutive culvert groups at one structure
+            # unambiguously separated.
+            us_sta = record.get('UpstreamStation')
+            ds_sta = record.get('DownstreamStation')
+            if us_sta is not None and ds_sta is not None:
+                output.extend(GeomParser.format_fixed_width(
+                    [us_sta, ds_sta],
+                    column_width=GeomCulvert.FIXED_WIDTH_COLUMN,
+                    values_per_line=GeomCulvert.VALUES_PER_LINE,
+                    precision=2,
+                ))
 
         if record['BottomN'] is not None:
             output.append(f"Culvert Bottom n={GeomCulvert._format_value(record['BottomN'])}\n")
@@ -641,7 +971,12 @@ class GeomCulvert:
             - UpstreamStation: Upstream station location
             - DownstreamInvert: Downstream invert elevation
             - DownstreamStation: Downstream station location
-            - ChartNumber: Inlet control chart number
+            - ChartNumber: Inlet control chart number (legacy alias of the
+                trailing record field; kept as an int for backward compatibility)
+            - UsDistance: Structure US Distance (float) -- the offset of the
+                culvert's upstream face downstream of the upstream bounding cross
+                section. This is the trailing field of the plain-text record;
+                ``set_culverts`` preserves it. Do not treat it as the chart number.
             - BottomN: Bottom Manning's n (if different)
             - NumBarrels: Number of barrels
 
@@ -803,11 +1138,22 @@ class GeomCulvert:
             reach: Reach name (case-sensitive)
             rs: River station for the bridge/culvert structure
             culverts: DataFrame, list of dicts, or single dict with culvert fields.
-                Supported shape inputs are numeric ``Shape`` codes or ``ShapeName``.
+                Supported shape inputs are numeric ``Shape`` codes or ``ShapeName``
+                values from ``culvert_taxonomy.json``. Legacy ``InletType`` and
+                ``OutletType`` fields map to HEC-RAS ``Chart #`` and ``Scale#``;
+                ``ChartID`` and ``ScaleID`` aliases are also accepted.
                 Multi-barrel culverts require ``NumBarrels`` and ``BarrelStations``.
 
         Returns:
             dict with replacement counts and backup path
+
+        Note:
+            The hydraulic culvert data (shape, dimensions, inverts, stations,
+            losses, US Distance, bottom n/depth) round-trips faithfully. The
+            optional per-barrel ``BC Culvert Barrel=<index>,<name>,<flag>``
+            boundary-condition reference lines are NOT preserved on rewrite --
+            HEC-RAS regenerates them when the geometry is opened/recomputed. If a
+            workflow depends on specific BC barrel names/flags, re-author them.
 
         Raises:
             FileNotFoundError: If geometry file doesn't exist
@@ -821,6 +1167,12 @@ class GeomCulvert:
         raw_records = GeomCulvert._coerce_records(culverts)
         if not raw_records:
             raise ValueError("At least one culvert record is required")
+        if len(raw_records) > GeomCulvert.MAX_CULVERT_GROUPS_PER_CROSSING:
+            raise ValueError(
+                f"HEC-RAS allows at most {GeomCulvert.MAX_CULVERT_GROUPS_PER_CROSSING} "
+                f"{GeomCulvert._gui_label('CulvertName')} records per crossing; "
+                f"received {len(raw_records)}."
+            )
 
         normalized_records = [
             GeomCulvert._normalize_record(record, index=i)
@@ -848,8 +1200,7 @@ class GeomCulvert:
 
             modified_lines = lines[:replace_start] + new_lines + lines[replace_end:]
 
-            with open(geom_file, 'w', encoding='utf-8') as f:
-                f.writelines(modified_lines)
+            _write_ras_text(geom_file, "".join(modified_lines), encoding="utf-8")
 
             result = {
                 'culverts_written': len(normalized_records),

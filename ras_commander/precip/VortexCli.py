@@ -98,7 +98,8 @@ class VortexCli:
     Static class for converting gridded meteorological data to HEC-DSS via HEC-Vortex CLI.
 
     Generates temporary Jython scripts using Vortex's BatchImporter Java API
-    and executes them via ``vortex.bat -s script.py``. All methods are static
+    and runs them with Java and a Jython standalone jar (``java -cp
+    jython;vortex/lib/* org.python.util.jython script.py``). All methods are static
     and follow the ras-commander coding pattern (no instantiation).
 
     Primary Methods:
@@ -130,16 +131,16 @@ class VortexCli:
         Discover HEC-Vortex installation on the system.
 
         Searches standard installation locations for HEC-Vortex and verifies
-        that vortex.bat exists. If vortex_path is provided, validates that
-        path instead.
+        that it holds a launcher (``vortex.bat`` or ``importer.bat``) or
+        ``lib/vortex-*.jar``. If vortex_path is provided, validates that path
+        instead.
 
         Args:
             vortex_path: Optional explicit path to HEC-Vortex installation
                 directory. If None, searches standard locations.
 
         Returns:
-            Path: Path to HEC-Vortex installation directory containing
-                vortex.bat.
+            Path: Path to the HEC-Vortex installation directory.
 
         Raises:
             FileNotFoundError: If HEC-Vortex installation cannot be found.
@@ -148,7 +149,7 @@ class VortexCli:
         if vortex_path is not None:
             vortex_path = Path(vortex_path)
             if VortexCli._has_vortex_runtime(vortex_path):
-                logger.info(f"Found HEC-Vortex at: {vortex_path}")
+                logger.debug(f"Found HEC-Vortex at: {vortex_path}")
                 return vortex_path
             raise FileNotFoundError(
                 f"HEC-Vortex not found at specified path: {vortex_path}. "
@@ -167,14 +168,14 @@ class VortexCli:
                 )
                 for subdir in subdirs:
                     if VortexCli._has_vortex_runtime(subdir):
-                        logger.info(f"Found HEC-Vortex {subdir.name} at: {subdir}")
+                        logger.debug(f"Found HEC-Vortex {subdir.name} at: {subdir}")
                         return subdir
             except PermissionError:
                 continue
 
             # Check if the base path itself is a Vortex distribution
             if VortexCli._has_vortex_runtime(base_path):
-                logger.info(f"Found HEC-Vortex at: {base_path}")
+                logger.debug(f"Found HEC-Vortex at: {base_path}")
                 return base_path
 
         # Check PATH environment variable
@@ -182,7 +183,7 @@ class VortexCli:
         vortex_on_path = shutil.which("vortex")
         if vortex_on_path:
             vortex_dir = Path(vortex_on_path).parent.parent
-            logger.info(f"Found HEC-Vortex on PATH at: {vortex_dir}")
+            logger.debug(f"Found HEC-Vortex on PATH at: {vortex_dir}")
             return vortex_dir
 
         raise FileNotFoundError(
@@ -313,7 +314,7 @@ class VortexCli:
             clip_shp: Optional shapefile for spatial clipping.
             target_wkt: Target projection WKT. "SHG" for Standard Hydrologic Grid.
             target_cell_size: Target grid cell size in meters.
-            resampling_method: Resampling method (Bilinear, NearestNeighbor, etc.)
+            resampling_method: Resampling method (Bilinear, "Nearest Neighbor", Average)
             dss_parts: Optional DSS pathname parts {A, B, C, D, E, F}.
 
         Returns:
@@ -422,7 +423,7 @@ print("VORTEX_IMPORT_COMPLETE")
         Convert gridded meteorological files to HEC-DSS using HEC-Vortex.
 
         Generates a temporary Jython script using Vortex's BatchImporter API,
-        executes it via ``vortex.bat -s script.py``, validates the output,
+        runs it with Java and a Jython standalone jar, validates the output,
         and cleans up the temporary script.
 
         Args:
@@ -440,7 +441,7 @@ print("VORTEX_IMPORT_COMPLETE")
                 (required by HEC-HMS/RAS). Default: "SHG".
             target_cell_size: Target grid cell size in meters. Default: 2000.
             resampling_method: Spatial resampling method. Options:
-                "Bilinear" (default), "NearestNeighbor", "Average".
+                "Bilinear" (default), "Nearest Neighbor", "Average".
             dss_parts: Optional DSS pathname parts as dict. Keys are
                 single letters A-F. Example: {"A": "SHG", "B": "BASIN", "F": "HRRR"}.
             vortex_path: Optional explicit path to HEC-Vortex installation.
@@ -756,6 +757,7 @@ print("VORTEX_IMPORT_COMPLETE")
         grib_file: Union[str, Path],
         vortex_path: Optional[Union[str, Path]] = None,
         timeout: int = 120,
+        jython_jar: Optional[Union[str, Path]] = None,
     ) -> List[str]:
         """
         List available variables in a GRIB2 file using HEC-Vortex.
@@ -768,6 +770,7 @@ print("VORTEX_IMPORT_COMPLETE")
             grib_file: Path to GRIB2 file to inspect.
             vortex_path: Optional HEC-Vortex installation path.
             timeout: Maximum execution time in seconds.
+            jython_jar: Optional Jython standalone jar.
 
         Returns:
             List[str]: Available variable names in the GRIB2 file.
@@ -816,6 +819,7 @@ print("VORTEX_IMPORT_COMPLETE")
             cmd = VortexCli._build_jython_command(
                 vortex_path=vortex_dir,
                 script_file=script_file,
+                jython_jar=jython_jar,
                 include_add_opens=True,
             )
             result = subprocess.run(
@@ -833,6 +837,7 @@ print("VORTEX_IMPORT_COMPLETE")
                 cmd = VortexCli._build_jython_command(
                     vortex_path=vortex_dir,
                     script_file=script_file,
+                    jython_jar=jython_jar,
                     include_add_opens=False,
                 )
                 result = subprocess.run(

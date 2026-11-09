@@ -21,6 +21,7 @@ import pandas as pd
 from scipy.optimize import minimize
 
 from .Decorators import log_call
+from .fast_hdf import reraise_required
 from .LoggingConfig import get_logger
 from .RasCmdr import RasCmdr
 from .RasPermutation import RasPermutation
@@ -452,7 +453,8 @@ def _normalize_steady_wse_frame(
                 profile_names = HdfResultsPlan.get_steady_profile_names(plan_hdf)
                 if len(profile_names) == 1:
                     resolved_profile = profile_names[0]
-            except Exception:
+            except Exception as exc:
+                reraise_required(exc)
                 resolved_profile = None
         result["Profile"] = resolved_profile or "Profile_1"
 
@@ -738,6 +740,7 @@ def _get_reference_dataset(
         if len(dataset.data_vars) > 0:
             return dataset
     except Exception as exc:
+        reraise_required(exc)
         logger.debug(
             "Reference %s getter failed for %s; falling back to internal "
             "helper: %s",
@@ -869,6 +872,7 @@ def _evaluate_points(
 ) -> Tuple[List[dict], float]:
     point_results: List[dict] = []
     objectives: List[float] = []
+    failed_points: List[str] = []
 
     for point in calibration_points:
         result = {
@@ -899,14 +903,25 @@ def _evaluate_points(
                 objectives.append(float(objective))
         except Exception as exc:
             result["error"] = str(exc)
-            logger.warning(
-                "Calibration point '%s' failed for %s: %s",
+            failed_points.append(point.name)
+            logger.debug(
+                "Calibration point '%s' failed while scoring %s: %s",
                 point.name,
                 plan_hdf,
                 exc,
+                exc_info=True,
             )
 
         point_results.append(result)
+
+    if failed_points:
+        logger.warning(
+            "Calibration scoring failed for %d of %d point(s) in %s; "
+            "see point_results errors or enable DEBUG logging for details.",
+            len(failed_points),
+            len(calibration_points),
+            Path(plan_hdf).name,
+        )
 
     overall_objective = _aggregate_objectives(objectives, metric)
     return point_results, overall_objective
@@ -1600,7 +1615,7 @@ def make_mannings_apply_fn(
             class_name: float(param_row[param_column])
             for param_column, class_name in zone_column_map.items()
         }
-        HdfLandCover.set_landcover_raster_map(
+        HdfLandCover.set_landcover_mannings_n(
             sidecar_path,
             class_mapping,
             ras_object=ras_object,
@@ -1616,11 +1631,15 @@ def make_infiltration_apply_fn(
         Union[Tuple[str, str], List[str], Dict[str, str]],
     ],
     name_column: Optional[str] = None,
+    hecras_version: Optional[str] = None,
 ) -> ApplyFn:
     """
     Factory returning an apply_fn for infiltration base overrides.
 
     parameter_mapping maps permutation column names to target row/field pairs.
+    Native geometry writes resolve the HEC-RAS runtime from
+    ``hecras_version``, then the apply function's ``ras_object``, then the
+    initialized global project.
 
     Example:
         {
@@ -1635,17 +1654,6 @@ def make_infiltration_apply_fn(
         param_row: pd.Series,
         ras_object: Any = None,
     ) -> None:
-        setter = getattr(
-            HdfInfiltration,
-            "set_infiltration_baseoverrides",
-            None,
-        )
-        if setter is None:
-            raise NotImplementedError(
-                "HdfInfiltration.set_infiltration_baseoverrides() is not "
-                "currently implemented in this repository."
-            )
-
         geom_hdf_path = _resolve_geom_hdf_path_from_plan(Path(plan_path))
         infiltration_df = HdfInfiltration.get_infiltration_baseoverrides(
             geom_hdf_path
@@ -1696,7 +1704,12 @@ def make_infiltration_apply_fn(
 
             updated_df.loc[mask, field_name] = float(param_row[param_column])
 
-        setter(geom_hdf_path, updated_df)
+        HdfInfiltration.set_infiltration_base_overrides(
+            geom_hdf_path,
+            updated_df,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
 
     return apply_fn
 
@@ -1745,19 +1758,29 @@ class RasCalibrate:
         num_cores: int = 2,
         force_geompre: bool = False,
         ras_object: Any = None,
+        *,
+        max_plans_per_batch: int = 99,
+        clone_geom: bool = False,
+        clear_geompre: bool = False,
+        timeout_sec: Optional[int] = None,
+        workers: Optional[List[Any]] = None,
     ) -> pd.DataFrame:
         """
         Run a calibration grid search on top of RasPermutation.
+
+        When ``workers`` is provided, generated calibration plans are
+        distributed with ``compute_parallel_remote()`` through
+        ``RasPermutation.execute_and_summarize()``. When ``workers`` is not
+        provided, execution uses local ``RasCmdr.compute_parallel()`` with
+        ``max_workers``.
+
+        Use ``clone_geom=True`` for geometry-mutating apply functions, such as
+        Manning's n or infiltration calibration. Use ``clear_geompre=True`` or
+        ``force_geompre=True`` when edited geometry inputs require HEC-RAS to
+        rebuild cached geometry/preprocessor artifacts.
         """
         metric_name = _normalize_metric(metric)
         points = _coerce_calibration_points(calibration_points)
-
-        if force_geompre:
-            logger.warning(
-                "grid_search(force_geompre=True) was requested, but "
-                "RasPermutation.execute_and_summarize() does not currently "
-                "expose force_geompre to RasCmdr.compute_parallel()."
-            )
 
         params_df = RasPermutation.define_parameters(parameters)
         plan_matrix = RasPermutation.generate_plans(
@@ -1765,6 +1788,8 @@ class RasCalibrate:
             params_df,
             apply_fn,
             suffix=suffix,
+            max_plans_per_batch=max_plans_per_batch,
+            clone_geom=clone_geom,
             ras_object=ras_object,
         )
         results_df = RasPermutation.execute_and_summarize(
@@ -1772,6 +1797,10 @@ class RasCalibrate:
             max_workers=max_workers,
             num_cores=num_cores,
             ras_object=ras_object,
+            timeout_sec=timeout_sec,
+            clear_geompre=clear_geompre,
+            force_geompre=force_geompre,
+            workers=workers,
         )
 
         augmented_rows: List[dict] = []
@@ -2058,10 +2087,13 @@ class RasCalibrate:
         )
 
         if method_name == "Nelder-Mead":
-            logger.warning(
+            logger.debug(
                 "SciPy's Nelder-Mead bound handling varies by version; "
                 "midpoint initialization stays inside the requested bounds, "
-                "but strict bound enforcement depends on SciPy."
+                "but strict bound enforcement depends on SciPy. Use "
+                "method='l-bfgs-b' or method='slsqp' when strict bound "
+                "handling is required, and inspect iteration_history for "
+                "evaluated candidate values."
             )
 
         iteration_history: List[dict] = []
@@ -2097,9 +2129,15 @@ class RasCalibrate:
                 optimization_value = penalty
                 success = False
                 logger.warning(
+                    "Optimization iteration failed; penalty applied. "
+                    "Enable DEBUG logging for parameter values and "
+                    "exception details."
+                )
+                logger.debug(
                     "Optimization iteration failed for parameters %s: %s",
                     parameter_values,
                     exc,
+                    exc_info=True,
                 )
 
             history_row = {

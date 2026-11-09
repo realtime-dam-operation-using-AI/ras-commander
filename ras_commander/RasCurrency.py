@@ -7,21 +7,25 @@ smart execution skip - avoiding unnecessary re-runs when results already
 exist and input files haven't changed.
 
 Currency Logic:
-- Results are CURRENT if plan HDF exists AND is newer than all input files
+- The actual configured execution engine selects HDF or legacy .O results
+- Coexisting result families are never considered current; rerunning normalizes them
 - Input files checked: plan file (.p##), geometry file (.g##), flow file (.u##/.f##)
-- For older HEC-RAS versions (no HDF): uses .O output file instead
 
 All methods are static and designed to be used without instantiation.
 """
 
-import os
-import logging
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Union
 from numbers import Number
 
 from .LoggingConfig import get_logger
 from .Decorators import log_call
+from .ExecutionArtifacts import (
+    ResultArtifactAmbiguityError,
+    ResultFormat,
+    get_plan_result_artifact_paths,
+    resolve_plan_result_artifact,
+)
 
 logger = get_logger(__name__)
 
@@ -48,12 +52,16 @@ class RasCurrency:
     """
 
     @staticmethod
-    def get_file_mtime(file_path: Union[str, Path]) -> Optional[float]:
+    def get_file_mtime(
+        file_path: Union[str, Path],
+        warn_on_error: bool = True
+    ) -> Optional[float]:
         """
         Get file modification time as Unix timestamp.
 
         Args:
             file_path: Path to the file
+            warn_on_error: Whether to emit a warning if the mtime cannot be read
 
         Returns:
             Unix timestamp (float) or None if file doesn't exist or error
@@ -64,7 +72,10 @@ class RasCurrency:
                 return path.stat().st_mtime
             return None
         except (PermissionError, OSError) as e:
-            logger.warning(f"Error getting mtime for {file_path}: {e}")
+            if warn_on_error:
+                logger.warning(f"Error getting mtime for {file_path}: {e}")
+            else:
+                logger.debug(f"Error getting mtime for {file_path}: {e}")
             return None
 
     @staticmethod
@@ -215,6 +226,43 @@ class RasCurrency:
         return None
 
     @staticmethod
+    def _get_plan_hdf_incomplete_reason(hdf_path: Path) -> Optional[str]:
+        """Return None when the plan HDF is complete, otherwise a concise reason."""
+        hdf_path = Path(hdf_path)
+
+        if not hdf_path.exists():
+            logger.debug(f"Plan HDF does not exist: {hdf_path}")
+            return "HDF file does not exist"
+
+        try:
+            import h5py
+            from .hdf.HdfResultsPlan import HdfResultsPlan
+            from .results.ResultsParser import ResultsParser
+
+            compute_msgs = HdfResultsPlan.get_compute_messages(hdf_path)
+            if not compute_msgs:
+                logger.debug(f"Plan HDF has no available compute messages: {hdf_path}")
+                return "compute messages unavailable"
+
+            if not ResultsParser._has_complete_process_record(compute_msgs):
+                logger.debug(
+                    f"Plan HDF missing 'Complete Process' in compute messages: {hdf_path}"
+                )
+                return "missing 'Complete Process' in compute messages"
+
+            with h5py.File(str(hdf_path), 'r') as hdf:
+                if hdf.get('Plan Data/Plan Information') is None:
+                    logger.debug(
+                        f"Plan HDF missing '/Plan Data/Plan Information': {hdf_path}"
+                    )
+                    return "missing '/Plan Data/Plan Information'"
+
+            return None
+        except Exception as e:
+            logger.warning(f"Error checking completion for {hdf_path}: {e}")
+            return f"completion check failed: {e}"
+
+    @staticmethod
     def check_plan_hdf_complete(hdf_path: Path) -> bool:
         """
         Check if plan HDF represents a successful computation.
@@ -229,26 +277,7 @@ class RasCurrency:
         Returns:
             True if HDF is structurally complete with 'Complete Process'
         """
-        if not hdf_path.exists():
-            return False
-
-        try:
-            import h5py
-            from .hdf.HdfResultsPlan import HdfResultsPlan
-
-            compute_msgs = HdfResultsPlan.get_compute_messages(hdf_path)
-            if not compute_msgs or 'Complete Process' not in compute_msgs:
-                return False
-
-            with h5py.File(str(hdf_path), 'r') as hdf:
-                if hdf.get('Plan Data/Plan Information') is None:
-                    logger.debug(f"HDF missing '/Plan Data/Plan Information': {hdf_path.name}")
-                    return False
-
-            return True
-        except Exception as e:
-            logger.warning(f"Error checking completion for {hdf_path}: {e}")
-            return False
+        return RasCurrency._get_plan_hdf_incomplete_reason(hdf_path) is None
 
     @staticmethod
     @log_call
@@ -261,11 +290,11 @@ class RasCurrency:
         Check if plan results are current (no re-run needed).
 
         Results are CURRENT if ALL conditions are met:
-        1. Plan HDF exists (or .O file for older versions)
-        2. HDF contains 'Complete Process' (if check_complete=True)
-        3. HDF mtime > Plan file (.p##) mtime
-        4. HDF mtime > Geometry file (.g##) mtime
-        5. HDF mtime > Flow file (.u##/.f##) mtime
+        1. The version-aware evidence resolver selects an existing result
+        2. A selected HDF contains 'Complete Process' (if check_complete=True)
+        3. Result mtime > Plan file (.p##) mtime
+        4. Result mtime > Geometry file (.g##) mtime
+        5. Result mtime > Flow file (.u##/.f##) mtime
 
         Args:
             plan_number: Plan number (e.g., "01", 1)
@@ -279,26 +308,103 @@ class RasCurrency:
         """
         plan_num = RasCurrency._normalize_plan_number(plan_number)
 
-        # Check for HDF file first
-        hdf_path = RasCurrency.get_plan_hdf_path(plan_number, ras_object)
-        output_path = None
-        result_mtime = None
+        try:
+            resolution = resolve_plan_result_artifact(
+                plan_number,
+                ras_object=ras_object,
+            )
+        except ResultArtifactAmbiguityError as exc:
+            return (
+                False,
+                f"Plan {plan_num} result artifacts are ambiguous "
+                f"({exc.reason_code}); execution is required",
+            )
+        except FileNotFoundError:
+            return (
+                False,
+                f"Plan {plan_num} plan file was not found; execution is required",
+            )
+        if not resolution.selected_exists:
+            if resolution.selected_format is None:
+                return (
+                    False,
+                    f"Plan {plan_num} has no results and its Program Version "
+                    "does not select a result format",
+                )
+            return (
+                False,
+                f"Plan {plan_num} has no {resolution.selected_format} results "
+                "selected by its Program Version declaration",
+            )
 
-        if hdf_path.exists():
-            result_mtime = RasCurrency.get_file_mtime(hdf_path)
-            result_file = hdf_path
+        return RasCurrency._evaluate_result_currency(
+            plan_number,
+            ras_object,
+            result_file=resolution.selected_path,
+            result_format=resolution.selected_format,
+            check_complete=check_complete,
+        )
 
-            # Check for Complete Process
-            if check_complete and not RasCurrency.check_plan_hdf_complete(hdf_path):
-                return (False, f"Plan {plan_num} HDF exists but incomplete (no 'Complete Process')")
-        else:
-            # Try .O file for older versions
-            output_path = RasCurrency.get_output_file_path(plan_number, ras_object)
-            if output_path and output_path.exists():
-                result_mtime = RasCurrency.get_file_mtime(output_path)
-                result_file = output_path
-            else:
-                return (False, f"Plan {plan_num} has no results (HDF or .O file not found)")
+    @staticmethod
+    def _are_plan_results_current_for_execution(
+        plan_number: Union[str, Number, Path],
+        ras_object,
+        *,
+        output_format: ResultFormat,
+        check_complete: bool = True,
+    ) -> Tuple[bool, str]:
+        """Check currency against the explicitly selected execution engine.
+
+        Unlike public evidence inspection, an execution skip must never retain
+        two result families. Mixed artifacts therefore force a rerun so the
+        compute path can normalize the project.
+        """
+        plan_num = RasCurrency._normalize_plan_number(plan_number)
+        paths = get_plan_result_artifact_paths(plan_number, ras_object=ras_object)
+        if paths.hdf.is_file() and paths.legacy_output.is_file():
+            return (
+                False,
+                f"Plan {plan_num} has multiple result formats; rerun with the "
+                "selected HEC-RAS version to normalize artifacts",
+            )
+        result_file = paths.hdf if output_format == "hdf" else paths.legacy_output
+        if not result_file.is_file():
+            return (
+                False,
+                f"Plan {plan_num} has no {output_format} results for the "
+                "selected HEC-RAS execution version",
+            )
+        return RasCurrency._evaluate_result_currency(
+            plan_number,
+            ras_object,
+            result_file=result_file,
+            result_format=output_format,
+            check_complete=check_complete,
+        )
+
+    @staticmethod
+    def _evaluate_result_currency(
+        plan_number: Union[str, Number, Path],
+        ras_object,
+        *,
+        result_file: Path,
+        result_format: ResultFormat,
+        check_complete: bool,
+    ) -> Tuple[bool, str]:
+        """Compare one already-selected result artifact with plan inputs."""
+        plan_num = RasCurrency._normalize_plan_number(plan_number)
+
+        result_mtime = RasCurrency.get_file_mtime(result_file)
+        if check_complete and result_format == "hdf":
+            incomplete_reason = RasCurrency._get_plan_hdf_incomplete_reason(
+                result_file
+            )
+            if incomplete_reason:
+                return (
+                    False,
+                    f"Plan {plan_num} HDF exists but incomplete "
+                    f"({incomplete_reason})",
+                )
 
         if result_mtime is None:
             return (False, f"Plan {plan_num} cannot determine results file modification time")
@@ -307,6 +413,8 @@ class RasCurrency:
         input_files = RasCurrency.get_plan_input_files(plan_number, ras_object)
 
         # Check each input file modification time
+        missing_files = []
+        unreadable_files = []
         stale_files = []
 
         for file_type, file_path in input_files.items():
@@ -314,21 +422,37 @@ class RasCurrency:
                 continue
 
             if not file_path.exists():
-                logger.debug(f"Input file not found: {file_path}")
+                logger.warning(
+                    f"Plan {plan_num} expected {file_type} input file not found: {file_path}"
+                )
+                missing_files.append(f"{file_type}: {file_path.name}")
                 continue
 
-            input_mtime = RasCurrency.get_file_mtime(file_path)
+            input_mtime = RasCurrency.get_file_mtime(file_path, warn_on_error=False)
             if input_mtime is None:
-                logger.warning(f"Cannot get mtime for {file_path}, assuming stale")
-                stale_files.append(file_path.name)
+                logger.warning(
+                    f"Plan {plan_num} cannot get mtime for {file_type} input file "
+                    f"{file_path}; assuming stale"
+                )
+                unreadable_files.append(f"{file_type}: {file_path.name}")
             elif input_mtime > result_mtime:
                 stale_files.append(file_path.name)
                 logger.debug(f"{file_path.name} is newer than results: input={input_mtime}, result={result_mtime}")
 
+        if missing_files:
+            return (False, f"Plan {plan_num} stale: missing input files: {', '.join(missing_files)}")
+
+        if unreadable_files:
+            return (False, f"Plan {plan_num} stale: unreadable input mtimes: {', '.join(unreadable_files)}")
+
         if stale_files:
             return (False, f"Plan {plan_num} stale: {', '.join(stale_files)} modified after results")
 
-        return (True, f"Plan {plan_num} results are current (newer than all inputs)")
+        return (
+            True,
+            f"Plan {plan_num} {result_format} results are current "
+            "(newer than all inputs)",
+        )
 
     @staticmethod
     @log_call

@@ -2,6 +2,9 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Xml;
+using System.Linq.Expressions;
+using System.Threading;
+using System.Runtime.ExceptionServices;
 
 /// <summary>
 /// Headless stored map generator that respects rendering mode.
@@ -22,6 +25,46 @@ class RasStoreMapHelper
 {
     static string _hecrasDir;
     static Assembly _asm;
+    static bool _diagnosticsEnabled;
+    static int _diagnosticCount;
+    [ThreadStatic] static bool _writingDiagnostic;
+    [ThreadStatic] static bool _handlingDiagnosticException;
+    const int DiagnosticLimit = 64;
+    const int DiagnosticLengthLimit = 16384;
+
+    static void WriteDiagnostic(string label, string text)
+    {
+        if (!_diagnosticsEnabled || _writingDiagnostic) return;
+        _writingDiagnostic = true;
+        try
+        {
+            int count = Interlocked.Increment(ref _diagnosticCount);
+            if (count > DiagnosticLimit) return;
+            if (text.Length > DiagnosticLengthLimit)
+                text = text.Substring(0, DiagnosticLengthLimit) + " [truncated]";
+            Console.Error.WriteLine("NATIVE_DIAGNOSTIC_" + label + ": " + text);
+            if (count == DiagnosticLimit)
+                Console.Error.WriteLine("NATIVE_DIAGNOSTIC_LIMIT: further diagnostics suppressed");
+        }
+        catch { /* Diagnostics must not change command success or failure. */ }
+        finally { _writingDiagnostic = false; }
+    }
+
+    static void OnFirstChanceException(object sender, FirstChanceExceptionEventArgs args)
+    {
+        if (_writingDiagnostic || _handlingDiagnosticException ||
+            Interlocked.CompareExchange(ref _diagnosticCount, 0, 0) >= DiagnosticLimit) return;
+        Exception error = args.Exception;
+        AggregateException aggregate = error as AggregateException;
+        if (aggregate == null && error.InnerException == null) return;
+        _handlingDiagnosticException = true;
+        try
+        {
+            WriteDiagnostic("EXCEPTION", (aggregate != null ? aggregate.Flatten() : error).ToString());
+        }
+        catch { /* A diagnostic formatting failure must not escape the handler. */ }
+        finally { _handlingDiagnosticException = false; }
+    }
 
     static Assembly ResolveAssembly(object sender, ResolveEventArgs e)
     {
@@ -32,7 +75,61 @@ class RasStoreMapHelper
         return null;
     }
 
+    // Applied inside the child before loading any vendor mapping assembly.
+    // The parent's affinity and unrelated helpers are never modified.
+    static bool ConfigureNativeCpuLimit()
+    {
+        string setting = Environment.GetEnvironmentVariable("RAS_COMMANDER_STORE_MAP_CPU_LIMIT");
+        if (String.IsNullOrEmpty(setting)) return true;
+        try
+        {
+            int requested;
+            if (!Int32.TryParse(setting, out requested) || requested < 1 || requested > 64)
+                throw new ArgumentException("native_cpu_limit must be between 1 and 64");
+            using (System.Diagnostics.Process process = System.Diagnostics.Process.GetCurrentProcess())
+            {
+                ulong inherited = unchecked((ulong)process.ProcessorAffinity.ToInt64());
+                ulong selected = 0;
+                int count = 0;
+                for (int bit = 0; bit < 64 && count < requested; bit++)
+                {
+                    ulong mask = 1UL << bit;
+                    if ((inherited & mask) != 0) { selected |= mask; count++; }
+                }
+                if (count != requested)
+                    throw new ArgumentException("native_cpu_limit exceeds inherited allowed CPUs");
+                process.ProcessorAffinity = new IntPtr(unchecked((long)selected));
+                if (unchecked((ulong)process.ProcessorAffinity.ToInt64()) != selected)
+                    throw new InvalidOperationException("Native helper CPU affinity verification failed");
+                int workerMinimum, ioMinimum;
+                ThreadPool.GetMinThreads(out workerMinimum, out ioMinimum);
+                Console.WriteLine("Native CPU affinity: inherited=0x{0:X}; selected=0x{1:X}; limit={2}; thread_pool_min={3}/{4}", inherited, selected, requested, workerMinimum, ioMinimum);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("ERROR applying native CPU limit: " + ex.Message);
+            return false;
+        }
+    }
+
     static int Main(string[] args)
+    {
+        string diagnosticSetting = Environment.GetEnvironmentVariable("RAS_COMMANDER_STORE_MAP_DIAGNOSTICS");
+        _diagnosticsEnabled = diagnosticSetting == "1" ||
+            String.Equals(diagnosticSetting, "true", StringComparison.OrdinalIgnoreCase);
+        if (_diagnosticsEnabled)
+            AppDomain.CurrentDomain.FirstChanceException += OnFirstChanceException;
+        try { return Run(args); }
+        finally
+        {
+            if (_diagnosticsEnabled)
+                AppDomain.CurrentDomain.FirstChanceException -= OnFirstChanceException;
+        }
+    }
+
+    static int Run(string[] args)
     {
         if (args.Length < 3)
         {
@@ -42,6 +139,8 @@ class RasStoreMapHelper
             Console.Error.WriteLine("  RasStoreMapHelper.exe <hecrasDir> <renderMode> StoreMap <mapType> <resultHdf> <profileName> [outputBasePath]");
             return 1;
         }
+
+        if (!ConfigureNativeCpuLimit()) return 2;
 
         _hecrasDir = args[0];
         string renderMode = args[1].ToLowerInvariant();
@@ -787,8 +886,49 @@ class RasStoreMapHelper
             object[] execArgs = new object[parameters.Length];
             for (int i = 0; i < parameters.Length; i++)
                 execArgs[i] = parameters[i].DefaultValue;
-            executeMethod.Invoke(cmd, execArgs);
+
+            // Native commands can report fatal errors and return normally. Passing
+            // null installs a silent reporter, so a successful Invoke is not enough.
+            Type reporterType = parameters[0].ParameterType;
+            EventInfo messageEvent = reporterType.GetEvent("MessageReported");
+            if (messageEvent == null)
+                throw new NotSupportedException("Native command progress reporter has no MessageReported event");
+            object reporter = Activator.CreateInstance(reporterType);
+            ParameterInfo[] messageParameters = messageEvent.EventHandlerType.GetMethod("Invoke").GetParameters();
+            ParameterExpression message = Expression.Parameter(messageParameters[0].ParameterType, "message");
+            ParameterExpression kind = Expression.Parameter(messageParameters[1].ParameterType, "kind");
+            MethodInfo callback = typeof(RasStoreMapHelper).GetMethod("OnNativeMessage", BindingFlags.Static | BindingFlags.NonPublic);
+            Delegate handler = Expression.Lambda(messageEvent.EventHandlerType,
+                Expression.Call(callback, message, Expression.Convert(kind, typeof(object))), message, kind).Compile();
+            Interlocked.Exchange(ref _reportedErrors, 0);
+            messageEvent.AddEventHandler(reporter, handler);
+            execArgs[0] = reporter;
+            try
+            {
+                executeMethod.Invoke(cmd, execArgs);
+            }
+            finally
+            {
+                messageEvent.RemoveEventHandler(reporter, handler);
+            }
+            if (_reportedErrors != 0)
+                throw new Exception("Native stored-map command reported " + _reportedErrors + " error(s)");
         }
+    }
+
+    static int _reportedErrors;
+
+    static void OnNativeMessage(string message, object kind)
+    {
+        string label = kind.ToString();
+        if (label == "Debug") WriteDiagnostic("DEBUG", message);
+        if (label.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            Interlocked.Increment(ref _reportedErrors);
+            Console.Error.WriteLine("NATIVE_" + label + ": " + message);
+        }
+        else if (label != "ProgressUpdate" && label != "Debug")
+            Console.WriteLine("NATIVE_" + label + ": " + message);
     }
 
     static int HandleException(Exception ex)

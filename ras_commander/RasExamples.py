@@ -32,6 +32,12 @@ List of Functions in RasExamples:
 - get_example_projects()
 - list_categories()
 - list_projects()
+- list_sciencebase_models()
+- get_sciencebase_model_info()
+- inspect_sciencebase_model()
+- validate_sciencebase_model()
+- download_sciencebase_model()
+- organize_ebfe_model()
 - extract_project()
 - is_project_extracted()
 - clean_projects_directory()
@@ -39,8 +45,18 @@ List of Functions in RasExamples:
 """
 import os
 import sys
-import requests
 import zipfile
+
+# Download dependencies are optional; the core install has only h5py, numpy,
+# and pandas. Extracting from an already-downloaded archive needs neither.
+try:
+    import requests
+except ImportError:
+    requests = None
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 import pandas as pd
 from pathlib import Path
 import shutil
@@ -49,12 +65,69 @@ import csv
 from datetime import datetime
 import logging
 import re
-from tqdm import tqdm
 from ras_commander import get_logger
 from ras_commander.LoggingConfig import log_call
+from ras_commander.fast_hdf import release_native_sessions
 from ras_commander.RasUtils import RasUtils
 
 logger = get_logger(__name__)
+
+
+_DOWNLOAD_EXTRA_HINT = 'pip install "ras-commander[full]"'
+
+
+def _require_requests():
+    """Return ``requests`` for downloads, or raise an actionable ImportError.
+
+    The core ``ras-commander`` install includes only h5py, numpy, and pandas.
+    Extracting a project from an already-downloaded example archive needs no
+    extra package; downloading one needs ``requests``.
+    """
+    if requests is None:
+        raise ImportError(
+            "Downloading HEC-RAS example projects requires the 'requests' "
+            "package, which the core ras-commander install does not include. "
+            f"Install it with: {_DOWNLOAD_EXTRA_HINT} (or: pip install requests)"
+        )
+    return requests
+
+
+class _NoProgress:
+    """Stand-in for a tqdm progress bar when tqdm is not installed."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def update(self, n=1):
+        return None
+
+
+def _progress_bar(**kwargs):
+    """Return a tqdm progress bar, or a no-op stand-in without tqdm."""
+    if tqdm is None:
+        return _NoProgress()
+    return tqdm(**kwargs)
+
+
+def _format_log_path(path: Union[str, Path]) -> str:
+    """Return a compact path for INFO logs; keep absolute paths for DEBUG."""
+    path = Path(path)
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except (OSError, RuntimeError, ValueError):
+        return path.name
+
+
+def _should_show_progress() -> bool:
+    """Show progress bars only for interactive DEBUG sessions."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return False
+
+    isatty = getattr(sys.stderr, "isatty", None)
+    return bool(isatty and isatty())
 
 
 def _get_user_data_dir() -> Path:
@@ -110,11 +183,19 @@ class RasExamples:
             "4.1", "4.0", "3.1.3", "3.1.2", "3.1.1", "3.0", "2.2"
         ]
 
-    # GitHub release tags per version (HEC publishes under different tags)
-    _version_release_tags = {
-        "7.0": "1.0.45",
+    # Example-project assets HEC publishes on GitHub: version -> (release tag,
+    # asset name). Earlier releases ship their examples only inside the
+    # installer (Example Projects/Example_Projects.exe).
+    _example_assets = {
+        "6.1": ("1.0.21", "Example_Projects.zip"),
+        "6.2": ("1.0.23", "HEC-RAS_62_Example_Projects.zip"),
+        "6.3": ("1.0.25", "HEC-RAS_63_Example_Projects.zip"),
+        "6.3.1": ("1.0.25", "HEC-RAS_63_Example_Projects.zip"),
+        "6.4.1": ("1.0.28", "HEC-RAS_64_Example_Projects.zip"),
+        "6.5": ("1.0.31", "Example_Projects_6_5.zip"),
+        "6.6": ("1.0.33", "Example_Projects_6_6.zip"),
+        "7.0": ("1.0.45", "Example_Projects_7_0.zip"),
     }
-    _default_release_tag = "1.0.33"
 
     # User data directory for ZIP files and CSV cache (writable without admin)
     _user_data_dir = _get_user_data_dir() / 'examples'
@@ -135,7 +216,12 @@ class RasExamples:
     # Special projects that are not in the main zip file
     SPECIAL_PROJECTS = {
         'NewOrleansMetro': 'https://www.hec.usace.army.mil/confluence/rasdocs/hgt/files/latest/299502039/299502111/1/1747692522764/NewOrleansMetroPipesExample.zip',
-        'BeaverLake': 'https://www.hec.usace.army.mil/confluence/rasdocs/hgt/files/latest/299501780/299502090/1/1747692179014/BeaverLake-SWMM-Import-Solution.zip'
+        'BeaverLake': 'https://www.hec.usace.army.mil/confluence/rasdocs/hgt/files/latest/299501780/299502090/1/1747692179014/BeaverLake-SWMM-Import-Solution.zip',
+        'Klawitter': 'https://www.hec.usace.army.mil/confluence/download/attachments/276988362/Klawitter_2D_Tutorial.zip?version=1&modificationDate=1740180410184&api=v2',
+        'AustinBayouSH35Firehose': (
+            'https://drive.usercontent.google.com/download?'
+            'id=1xwmNVm_TyW1AWxznf6QzQPMtRHMz3qWv&export=download&confirm=t'
+        ),
     }
 
     _folder_df = None
@@ -190,6 +276,7 @@ class RasExamples:
         self._save_to_csv()
 
     @classmethod
+    @log_call(logger)
     def extract_project(cls, project_names: Union[str, List[str]], output_path: Union[str, Path] = None, suffix: Optional[str] = None) -> Union[Path, List[Path]]:
         """Extract one or more specific HEC-RAS projects from the zip file.
 
@@ -247,7 +334,11 @@ class RasExamples:
                     extracted_paths.append(special_path)
                     continue
                 except Exception as e:
-                    logger.error(f"Failed to extract special project '{project_name}': {e}")
+                    logger.debug(
+                        "Special project '%s' extraction failed after detailed error logging: %s",
+                        project_name,
+                        e,
+                    )
                     continue
 
             # Regular project extraction logic
@@ -295,10 +386,20 @@ class RasExamples:
                                 with zip_ref.open(file) as source, open(extract_path, "wb") as target:
                                     shutil.copyfileobj(source, target)
 
-                logger.info(f"Successfully extracted project '{project_name}' to {final_folder_path}")
+                logger.info(
+                    "Successfully extracted project '%s' to %s",
+                    project_name,
+                    _format_log_path(final_folder_path),
+                )
+                logger.debug("Full extracted project path: %s", final_folder_path)
                 extracted_paths.append(final_folder_path)
             except Exception as e:
-                logger.error(f"An error occurred while extracting project '{project_name}': {str(e)}")
+                logger.error(
+                    "An error occurred while extracting project '%s' to %s: %s",
+                    project_name,
+                    final_folder_path,
+                    e,
+                )
 
         # Return single path if only one project was extracted, otherwise return list
         if not extracted_paths:
@@ -338,9 +439,10 @@ class RasExamples:
                         logger.debug(f"Found zip file: {cls._zip_file_path}")
                     return
 
-        logger.warning("No existing example projects zip file found.")
+        logger.debug("No existing example projects zip file found.")
 
     @classmethod
+    @log_call(logger)
     def get_example_projects(cls, version_number='7.0'):
         """
         Download and extract HEC-RAS example projects for a specified version.
@@ -352,7 +454,7 @@ class RasExamples:
         - Linux: ~/.local/share/ras-commander/examples
 
         Args:
-            version_number: HEC-RAS version (default: '7.0')
+            version_number (str): HEC-RAS version (default: '7.0')
 
         Returns:
             Path: Directory where projects will be extracted
@@ -363,8 +465,15 @@ class RasExamples:
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        release_tag = cls._version_release_tags.get(version_number, cls._default_release_tag)
-        zip_url = f"{cls.base_url}{release_tag}/Example_Projects_{version_number.replace('.', '_')}.zip"
+        if version_number not in cls._example_assets:
+            raise ValueError(
+                f"HEC does not publish a separate example-project download for HEC-RAS "
+                f"{version_number}; its examples ship inside the installer "
+                f"(Example Projects/Example_Projects.exe). Hosted versions: "
+                f"{', '.join(cls._example_assets)}"
+            )
+        release_tag, asset = cls._example_assets[version_number]
+        zip_url = f"{cls.base_url}{release_tag}/{asset}"
 
         # Create user data directory for ZIP storage (writable without admin)
         try:
@@ -379,17 +488,29 @@ class RasExamples:
         cls._zip_file_path = cls._user_data_dir / f"Example_Projects_{version_number.replace('.', '_')}.zip"
 
         if not cls._zip_file_path.exists():
-            logger.info(f"Downloading HEC-RAS Example Projects from {zip_url}.")
-            logger.info(f"Saving to: {cls._zip_file_path}")
-            logger.info("The file is over 400 MB, so it may take a few minutes to download....")
+            logger.info(
+                "Downloading HEC-RAS example projects for version %s (over 400 MB; may take a few minutes).",
+                version_number,
+            )
+            logger.debug("Example projects download URL: %s", zip_url)
+            logger.debug("Saving example projects zip to: %s", cls._zip_file_path)
+            _require_requests()
             try:
                 response = requests.get(zip_url, stream=True)
                 response.raise_for_status()
                 with open(cls._zip_file_path, 'wb') as file:
                     shutil.copyfileobj(response.raw, file)
-                logger.info(f"Downloaded to {cls._zip_file_path}")
+                logger.info("Downloaded HEC-RAS example projects for version %s", version_number)
+                logger.debug("Downloaded example projects zip to: %s", cls._zip_file_path)
             except requests.exceptions.RequestException as e:
-                logger.error(f"Failed to download the zip file: {e}")
+                logger.error(
+                    "Failed to download HEC-RAS example projects version %s "
+                    "from %s to %s: %s",
+                    version_number,
+                    zip_url,
+                    cls._zip_file_path,
+                    e,
+                )
                 raise
         else:
             logger.debug("HEC-RAS Example Projects zip file already exists. Skipping download.")
@@ -399,31 +520,27 @@ class RasExamples:
 
     @classmethod
     def _load_project_data(cls):
-        """Load project data from CSV if up-to-date, otherwise extract from zip."""
-        logger.debug("Loading project data")
-        
-        try:
-            zip_modified_time = os.path.getmtime(cls._zip_file_path)
-        except FileNotFoundError:
-            logger.error(f"Zip file not found at {cls._zip_file_path}.")
-            return
-        
-        if cls.csv_file_path.exists():
-            csv_modified_time = os.path.getmtime(cls.csv_file_path)
-            
-            if csv_modified_time >= zip_modified_time:
-                logger.debug("Loading project data from CSV...")
-                try:
-                    cls._folder_df = pd.read_csv(cls.csv_file_path)
-                    logger.debug(f"Loaded {len(cls._folder_df)} projects from CSV.")
-                    return
-                except Exception as e:
-                    logger.error(f"Failed to read CSV file: {e}")
-                    cls._folder_df = None
+        """Validate the CSV against the selected ZIP's central-directory index.
 
-        logger.debug("Extracting folder structure from zip file...")
+        A newer CSV may belong to a different archive or an obsolete index. ZIP
+        timestamps alone cannot establish cache identity. Listing the directory
+        does not extract model files or read their payloads.
+        """
+        if cls._zip_file_path is None or not Path(cls._zip_file_path).is_file():
+            logger.error("Example project ZIP not found: %s", cls._zip_file_path)
+            return
+        cached = None
+        if cls.csv_file_path.exists():
+            try:
+                cached = pd.read_csv(cls.csv_file_path, dtype=str, keep_default_na=False)
+            except Exception as exc:
+                logger.debug("Refreshing unreadable example index: %s", exc)
         cls._extract_folder_structure()
-        cls._save_to_csv()
+        if cls._folder_df is not None and (
+            cached is None
+            or cls._folder_df.to_dict('records') != cached.to_dict('records')
+        ):
+            cls._save_to_csv()
 
     @classmethod
     def _extract_folder_structure(cls):
@@ -450,7 +567,11 @@ class RasExamples:
             logger.error(f"The file {cls._zip_file_path} is not a valid zip file.")
             cls._folder_df = pd.DataFrame(columns=['Category', 'Project'])
         except Exception as e:
-            logger.error(f"An error occurred while extracting the folder structure: {str(e)}")
+            logger.error(
+                "An error occurred while extracting the folder structure from %s: %s",
+                cls._zip_file_path,
+                e,
+            )
             cls._folder_df = pd.DataFrame(columns=['Category', 'Project'])
 
     @classmethod
@@ -463,11 +584,12 @@ class RasExamples:
                 cls._folder_df.to_csv(cls.csv_file_path, index=False)
                 logger.debug(f"Saved project data to {cls.csv_file_path}")
             except Exception as e:
-                logger.error(f"Failed to save project data to CSV: {e}")
+                logger.error("Failed to save project data to CSV %s: %s", cls.csv_file_path, e)
         else:
             logger.warning("No folder data to save to CSV.")
 
     @classmethod
+    @log_call(logger)
     def list_categories(cls):
         """
         List all categories of example projects.
@@ -480,12 +602,13 @@ class RasExamples:
         return categories.tolist()
 
     @classmethod
+    @log_call(logger)
     def list_projects(cls, category=None):
         """
         List all projects or projects in a specific category.
         
-        Note: Special projects (NewOrleansMetro, BeaverLake) are also available but not listed
-        in categories as they are downloaded separately.
+        Note: Special projects are also available but not listed in categories as they
+        are downloaded separately.
         """
         if cls._folder_df is None:
             logger.warning("No projects available. Make sure the zip file is properly loaded.")
@@ -502,6 +625,171 @@ class RasExamples:
         return projects.tolist()
 
     @classmethod
+    @log_call(logger)
+    def list_sciencebase_models(cls):
+        """List validated HEC-RAS archives in the ScienceBase catalog.
+
+        This catalog is intentionally separate from :meth:`list_projects`.
+        It returns archives explicitly promoted as runnable after portable-path
+        inspection. Promotion normally follows a fresh verified compute; any
+        curator-accepted exception retains its incomplete-compute evidence in
+        the returned metadata. Candidate and rejected releases remain available
+        only through the lower-level curator API.
+
+        Returns:
+            list[ModelMetadata]: Records from the reviewed ScienceBase
+                registry. No network request or large download is performed.
+        """
+        from ras_commander.sources.federal.usgs_sciencebase import UsgsScienceBase
+
+        return UsgsScienceBase.list_catalog_models(validated_only=True)
+
+    @classmethod
+    @log_call(logger)
+    def get_sciencebase_model_info(cls, model_key: str) -> dict:
+        """Return registry metadata for a ScienceBase model slug or alias."""
+        from ras_commander.sources.federal.usgs_sciencebase import UsgsScienceBase
+
+        return UsgsScienceBase.get_model_info(model_key)
+
+    @classmethod
+    @log_call(logger)
+    def inspect_sciencebase_model(
+        cls,
+        model_key: str,
+        base_dir: Union[str, Path],
+        *,
+        project_file: Union[str, Path, None] = None,
+        ras_version: Optional[str] = None,
+    ) -> dict:
+        """Inspect a local ScienceBase candidate before promotion."""
+        from ras_commander.sources.federal.usgs_sciencebase import UsgsScienceBase
+
+        return UsgsScienceBase.inspect_local_model(
+            model_key,
+            Path(base_dir),
+            project_file=Path(project_file) if project_file is not None else None,
+            ras_version=ras_version,
+        )
+
+    @classmethod
+    @log_call(logger)
+    def validate_sciencebase_model(
+        cls,
+        model_key: str,
+        base_dir: Union[str, Path],
+        plan_number: str,
+        output_dir: Union[str, Path],
+        *,
+        project_file: Union[str, Path, None] = None,
+        ras_version: Optional[str] = None,
+        num_cores: int = 4,
+    ) -> dict:
+        """Run a fresh verified plan and return its promotion report."""
+        from ras_commander.sources.federal.usgs_sciencebase import UsgsScienceBase
+
+        return UsgsScienceBase.run_validation_plan(
+            model_key,
+            Path(base_dir),
+            plan_number,
+            Path(output_dir),
+            project_file=Path(project_file) if project_file is not None else None,
+            ras_version=ras_version,
+            num_cores=num_cores,
+        )
+
+    @classmethod
+    @log_call(logger)
+    def download_sciencebase_model(
+        cls,
+        model_key: str,
+        output_path: Union[str, Path] = None,
+        required_only: bool = False,
+        extract: bool = True,
+        show_progress: bool = False,
+        signed_download_urls: Optional[dict[str, str]] = None,
+    ) -> Path:
+        """Download a reviewed ScienceBase archive through ``RasExamples``.
+
+        Archives are stored below ``output_path/<model-slug>``. If
+        ``output_path`` is omitted, :attr:`projects_dir` is used. ScienceBase
+        routes some large S3-backed archives through a public browser CAPTCHA;
+        no ScienceBase account is required. For those entries this method
+        raises an ``ScienceBaseInteractiveDownloadRequired`` message containing
+        the official CAPTCHA page and exact placement path unless a temporary
+        URL is supplied through ``signed_download_urls``.
+
+        Args:
+            model_key: Registry slug, common alias, or DOI suffix.
+            output_path: Parent directory for the downloaded model folder.
+            required_only: Skip optional metadata and result products.
+            extract: Extract ZIP archives after download.
+            show_progress: Display download progress when true.
+            signed_download_urls: Optional mapping of attachment filename to a
+                temporary URL issued by ScienceBase after its public CAPTCHA.
+
+        Returns:
+            Path to the ScienceBase model directory.
+        """
+        from ras_commander.sources.federal.usgs_sciencebase import UsgsScienceBase
+
+        base_output_path = cls.projects_dir if output_path is None else Path(output_path)
+        if not base_output_path.is_absolute():
+            base_output_path = Path.cwd() / base_output_path
+        base_output_path.mkdir(parents=True, exist_ok=True)
+
+        info = UsgsScienceBase.get_model_info(model_key)
+        if not info.get("runnable", False):
+            raise RuntimeError(
+                f"ScienceBase archive '{model_key}' has not been promoted to "
+                "RasExamples. It must pass portable-path inspection and receive "
+                "explicit promotion after a verified compute or documented "
+                "curator acceptance. Use UsgsScienceBase directly for curator "
+                "download and validation."
+            )
+
+        return UsgsScienceBase.download_model(
+            model_key,
+            base_output_path,
+            required_only=required_only,
+            extract=extract,
+            show_progress=show_progress,
+            signed_download_urls=signed_download_urls,
+        )
+
+    @classmethod
+    @log_call(logger)
+    def organize_ebfe_model(
+        cls,
+        model_key: str,
+        output_path: Union[str, Path, None] = None,
+        *,
+        downloaded_folder: Union[str, Path, None] = None,
+        **kwargs,
+    ) -> Path:
+        """Organize a public FEMA eBFE/BLE delivery through its source adapter.
+
+        This convenience method is deliberately separate from
+        :meth:`extract_project`: ``extract_project`` remains limited to the
+        official HEC example release archive. ``output_path`` is the parent
+        directory; the eBFE registry selects the model-specific output name.
+        """
+        from ras_commander.sources.federal.ebfe_models import RasEbfeModels
+
+        output_root = cls.projects_dir if output_path is None else Path(output_path)
+        if not output_root.is_absolute():
+            output_root = Path.cwd() / output_root
+        return RasEbfeModels.organize_model(
+            model_key,
+            output_root=output_root,
+            downloaded_folder=(
+                Path(downloaded_folder) if downloaded_folder is not None else None
+            ),
+            **kwargs,
+        )
+
+    @classmethod
+    @log_call(logger)
     def is_project_extracted(cls, project_name):
         """
         Check if a specific project is already extracted.
@@ -512,17 +800,19 @@ class RasExamples:
         return is_extracted
 
     @classmethod
+    @log_call(logger)
     def clean_projects_directory(cls):
         """Remove all extracted projects from the example_projects directory."""
         logger.debug(f"Cleaning projects directory: {cls.projects_dir}")
         if cls.projects_dir.exists():
             try:
+                release_native_sessions(cls.projects_dir)
                 shutil.rmtree(cls.projects_dir)
                 logger.debug("All projects have been removed.")
             except Exception as e:
-                logger.error(f"Failed to remove projects directory: {e}")
+                logger.error("Failed to remove projects directory %s: %s", cls.projects_dir, e)
         else:
-            logger.warning("Projects directory does not exist.")
+            logger.debug("Projects directory does not exist.")
         cls.projects_dir.mkdir(parents=True, exist_ok=True)
         logger.debug("Projects directory cleaned and recreated.")
 
@@ -577,20 +867,24 @@ class RasExamples:
         Download a file from a URL to a specified destination folder with progress bar.
         """
         local_filename = dest_folder / url.split('/')[-1]
+        _require_requests()
         try:
             with requests.get(url, stream=True) as r:
                 r.raise_for_status()
-                with open(local_filename, 'wb') as f, tqdm(
+                with open(local_filename, 'wb') as f, _progress_bar(
                     desc=local_filename.name,
                     total=file_size,
                     unit='iB',
                     unit_scale=True,
                     unit_divisor=1024,
+                    leave=False,
+                    disable=not _should_show_progress(),
                 ) as progress_bar:
                     for chunk in r.iter_content(chunk_size=8192):
                         size = f.write(chunk)
                         progress_bar.update(size)
-            logger.info(f"Successfully downloaded {url} to {local_filename}")
+            logger.debug("Successfully downloaded %s", local_filename.name)
+            logger.debug("Downloaded %s to %s", url, local_filename)
             return local_filename
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for {url}: {e}")
@@ -618,7 +912,7 @@ class RasExamples:
         Download and extract special projects that are not in the main zip file.
 
         Args:
-            project_name: Name of the special project ('NewOrleansMetro' or 'BeaverLake')
+            project_name: Name of a registered special project.
             output_path: Base output directory path. If None, uses cls.projects_dir
             suffix: Optional suffix to append to folder name using format "{project_name}_{suffix}".
 
@@ -647,10 +941,16 @@ class RasExamples:
         if project_path.exists():
             logger.debug(f"Folder '{folder_name}' already exists. Deleting existing folder...")
             try:
+                release_native_sessions(project_path)
                 shutil.rmtree(project_path)
                 logger.debug(f"Existing folder '{folder_name}' has been deleted.")
             except Exception as e:
-                logger.error(f"Failed to delete existing folder '{folder_name}': {e}")
+                logger.error(
+                    "Failed to delete existing special project folder '%s' at %s: %s",
+                    folder_name,
+                    project_path,
+                    e,
+                )
                 raise
 
         # Create the project directory
@@ -660,9 +960,10 @@ class RasExamples:
         url = cls.SPECIAL_PROJECTS[project_name]
         zip_file_path = base_path / f"{folder_name}_temp.zip"
         
-        logger.info(f"Downloading special project from: {url}")
-        logger.info("This may take a few moments...")
+        logger.info("Downloading special project '%s'...", project_name)
+        logger.debug("Special project download URL: %s", url)
         
+        _require_requests()
         try:
             response = requests.get(url, stream=True, timeout=300)
             response.raise_for_status()
@@ -673,12 +974,14 @@ class RasExamples:
             # Download with progress bar
             with open(zip_file_path, 'wb') as file:
                 if total_size > 0:
-                    with tqdm(
+                    with _progress_bar(
                         desc=f"Downloading {project_name}",
                         total=total_size,
                         unit='iB',
                         unit_scale=True,
                         unit_divisor=1024,
+                        leave=False,
+                        disable=not _should_show_progress(),
                     ) as progress_bar:
                         for chunk in response.iter_content(chunk_size=8192):
                             size = file.write(chunk)
@@ -688,10 +991,16 @@ class RasExamples:
                     for chunk in response.iter_content(chunk_size=8192):
                         file.write(chunk)
             
-            logger.info(f"Downloaded special project zip file to {zip_file_path}")
+            logger.debug("Downloaded special project zip file to %s", zip_file_path)
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to download special project '{project_name}': {e}")
+            logger.error(
+                "Failed to download special project '%s' from %s to %s: %s",
+                project_name,
+                url,
+                zip_file_path,
+                e,
+            )
             if zip_file_path.exists():
                 zip_file_path.unlink()
             raise
@@ -701,11 +1010,23 @@ class RasExamples:
             with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
                 # Extract directly to the project directory (no internal folder structure)
                 zip_ref.extractall(project_path)
-            logger.info(f"Successfully extracted special project '{project_name}' to {project_path}")
+            logger.info(
+                "Successfully extracted special project '%s' to %s",
+                project_name,
+                _format_log_path(project_path),
+            )
+            logger.debug("Full extracted special project path: %s", project_path)
             
         except Exception as e:
-            logger.error(f"Failed to extract special project '{project_name}': {e}")
+            logger.error(
+                "Failed to extract special project '%s' from %s to %s: %s",
+                project_name,
+                zip_file_path,
+                project_path,
+                e,
+            )
             if project_path.exists():
+                release_native_sessions(project_path)
                 shutil.rmtree(project_path)
             raise
         finally:

@@ -54,15 +54,27 @@ See Also:
     - feature_dev_notes/HEC-RAS_Terrain_CLI/test_rasprocess_createterrain.py
 """
 
-import logging
+import hashlib
+import json
 import math
+import os
 import subprocess
+import time
+import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Import decorator from parent package
+from .._ras_text import _write_ras_text
 from ..Decorators import log_call
+from ..ComputeResults import TerrainExportResult
 from ..LoggingConfig import get_logger
+from ..RasUtils import RasUtils
+from ..RasterPerformance import (
+    GeoTiffWriteOptions,
+    ProcessTreeProfiler,
+    RasterOperationProfileResult,
+)
 
 logger = get_logger(__name__)
 
@@ -102,6 +114,95 @@ class RasTerrain:
         Path("C:/Program Files (x86)/HEC/HEC-RAS"),
         Path("C:/Program Files/HEC/HEC-RAS"),
     ]
+
+    @staticmethod
+    @log_call
+    def export_rasmapper_terrain(
+        ras_project_path: Union[str, Path],
+        output_tif: Union[str, Path],
+        terrain_name: Optional[str] = None,
+        extent: Optional[Sequence[float]] = None,
+        downsample_factor: int = 1,
+        rasterize_modifications: bool = True,
+        overwrite: bool = False,
+        timeout_seconds: float = 1800.0,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+        receipt_path: Optional[Union[str, Path]] = None,
+    ) -> TerrainExportResult:
+        """Export one registered RAS Mapper terrain to a validated GeoTIFF.
+
+        This is a supervised wrapper around HEC-RAS's own terrain
+        consolidation operation. It loads the selected terrain from the
+        project's ``.rasmap`` so registered source order, stitches, masks, and
+        vector modifications remain native RAS Mapper behavior.
+
+        Args:
+            ras_project_path: Project folder, ``.prj``, or ``.rasmap`` path.
+            output_tif: Destination single-band Float32 GeoTIFF.
+            terrain_name: Exact registered terrain name. May be omitted only
+                when the project registers exactly one terrain.
+            extent: Optional ``(xmin, ymin, xmax, ymax)`` export bounds.
+            downsample_factor: Exact source-derived factor: 1, 2, 4, or 8.
+            rasterize_modifications: Apply native RAS Mapper vector terrain
+                modifications through ``resampleVecMods``.
+            overwrite: Replace existing output and receipt when true.
+            timeout_seconds: Total bounded runtime, including validation.
+            hecras_version: Accepted HEC-RAS runtime: 6.4.1, 6.5, 6.6, 7.0.1, 7.0.2,
+                or forward-open 7.1. The existing ``6.4`` installation alias resolves to
+                6.4.1. When omitted, use the exact runtime recorded by
+                ``ras_object``.
+            ras_object (RasPrj, optional): Optional initialized project object for multi-project
+                and runtime-version context. Its ``ras_version`` is checked
+                before filesystem or native work; an unsupported version or a
+                conflict with ``hecras_version`` raises ``ValueError``.
+            receipt_path: Machine-readable JSON receipt path. Defaults to
+                ``<output_tif>.receipt.json``.
+
+        Returns:
+            TerrainExportResult: Bool-compatible typed result. Operational
+            failures and timeouts return a failed result and failure receipt;
+            invalid inputs raise before native execution.
+
+        Notes:
+            Qualified releases are HEC-RAS 6.4.1, 6.5, 6.6, and 7.0.1.
+            HEC-RAS 6.3 lacks the required bounded contract, 6.4 has an
+            official terrain-elevation defect, 6.7 is beta-only, and 7.0.0
+            has an official terrain-modification export defect. HEC-RAS 7.0.1
+            fixes that defect. HEC-RAS 6.4.1, 6.5, 6.6, and 7.0.1 are qualified
+            on native Windows and under Wine. HEC-RAS 7.1
+            is forward-open for its future official binary, with the helper's
+            exact managed-contract check retained as the runtime safety gate.
+            HEC-RAS 7.0.2 is qualified on Windows for bounded two-source export;
+            its changed spatial-index overload is selected at runtime. Vector
+            modifications and Wine have not been qualified on 7.0.2.
+            Windows-drive and UNC project/input paths are supported, but direct
+            output to a UNC share is not qualified because the task-local GDAL
+            junction may not be staged on a remote volume; use a local output
+            and copy the committed TIFF and receipt afterward. Fully qualified
+            helper response paths beyond the legacy .NET 260-character limit
+            are also unqualified; select a shorter local output path.
+            The base export is always nearest-neighbor. The derivative is not
+            registered in or otherwise written back to the source project.
+            ``RasTerrainMod.compute_modified_terrain_raster()`` is a deprecated
+            row-sampled compatibility method scheduled for removal in 1.1; it
+            is not used as a production fallback.
+        """
+        from ..native.terrain_export_host import export_rasmapper_terrain
+
+        return export_rasmapper_terrain(
+            ras_project_path=ras_project_path,
+            output_tif=output_tif,
+            terrain_name=terrain_name,
+            extent=extent,
+            downsample_factor=downsample_factor,
+            rasterize_modifications=rasterize_modifications,
+            overwrite=overwrite,
+            timeout_seconds=timeout_seconds,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+            receipt_path=receipt_path,
+        )
 
     @staticmethod
     def _empty_bank_lines_gdf(crs=None):
@@ -263,19 +364,20 @@ class RasTerrain:
                 )
                 continue
 
-            line = LineString([
-                point_record["geometry"].coords[0]
-                for point_record in points
-            ])
-            records.append({
-                "river": river,
-                "reach": reach,
-                "bank_side": bank_side,
-                "xs_count": len(points),
-                "rs_values": [point_record["rs"] for point_record in points],
-                "geometry": line,
-                "length": line.length,
-            })
+            line = LineString(
+                [point_record["geometry"].coords[0] for point_record in points]
+            )
+            records.append(
+                {
+                    "river": river,
+                    "reach": reach,
+                    "bank_side": bank_side,
+                    "xs_count": len(points),
+                    "rs_values": [point_record["rs"] for point_record in points],
+                    "geometry": line,
+                    "length": line.length,
+                }
+            )
 
         if not records:
             return RasTerrain._empty_bank_lines_gdf(crs=crs)
@@ -345,13 +447,15 @@ class RasTerrain:
                 point = RasTerrain._bank_point_from_stationed_xy(coords, bank_station)
                 if point is None:
                     continue
-                bank_points.append({
-                    "river": river,
-                    "reach": reach,
-                    "bank_side": bank_side,
-                    "rs": rs,
-                    "geometry": point,
-                })
+                bank_points.append(
+                    {
+                        "river": river,
+                        "reach": reach,
+                        "bank_side": bank_side,
+                        "rs": rs,
+                        "geometry": point,
+                    }
+                )
 
         return RasTerrain._build_bank_lines_gdf(bank_points, crs=crs)
 
@@ -386,13 +490,15 @@ class RasTerrain:
                 )
                 if point is None:
                     continue
-                bank_points.append({
-                    "river": river,
-                    "reach": reach,
-                    "bank_side": bank_side,
-                    "rs": rs,
-                    "geometry": point,
-                })
+                bank_points.append(
+                    {
+                        "river": river,
+                        "reach": reach,
+                        "bank_side": bank_side,
+                        "rs": rs,
+                        "geometry": point,
+                    }
+                )
 
         return RasTerrain._build_bank_lines_gdf(bank_points, crs=result_crs)
 
@@ -416,9 +522,9 @@ class RasTerrain:
         Parameters:
             geom_path (Union[str, Path]): Path to a plain-text `.g##` geometry
                 file or compiled `.g##.hdf` geometry HDF file.
-            crs: Optional CRS to assign to the returned GeoDataFrame. If omitted
+            crs (pyproj.CRS or str, optional): Optional CRS to assign to the returned GeoDataFrame. If omitted
                 and an HDF input exposes a CRS, that CRS is preserved.
-            ras_object: Optional RasPrj instance for multi-project workflows.
+            ras_object (RasPrj, optional): Optional RasPrj instance for multi-project workflows.
 
         Returns:
             geopandas.GeoDataFrame: Bank lines with columns:
@@ -487,7 +593,8 @@ class RasTerrain:
                 return longest if len(longest.coords) >= 2 else None
         if hasattr(geometry, "geoms"):
             line_parts = [
-                part for part in geometry.geoms
+                part
+                for part in geometry.geoms
                 if isinstance(part, LineString) and len(part.coords) >= 2
             ]
             if line_parts:
@@ -579,9 +686,7 @@ class RasTerrain:
         min_station = float(values[:, 0].min())
         max_station = float(values[:, 0].max())
         valid_banks = (
-            left_bank is not None
-            and right_bank is not None
-            and left_bank < right_bank
+            left_bank is not None and right_bank is not None and left_bank < right_bank
         )
 
         records: List[Dict[str, Any]] = []
@@ -670,7 +775,11 @@ class RasTerrain:
         if crs is not None:
             return crs
 
-        hdf_path = geom_path if geom_path.suffix.lower() == ".hdf" else Path(f"{geom_path}.hdf")
+        hdf_path = (
+            geom_path
+            if geom_path.suffix.lower() == ".hdf"
+            else Path(f"{geom_path}.hdf")
+        )
         if hdf_path.exists():
             try:
                 from ..hdf import HdfBase
@@ -708,7 +817,9 @@ class RasTerrain:
         for river, reach in key_order:
             group = sorted(grouped[(river, reach)], key=lambda item: item["xs_order"])
             for side, point_key in (("Left", "left_point"), ("Right", "right_point")):
-                points = [item[point_key] for item in group if item.get(point_key) is not None]
+                points = [
+                    item[point_key] for item in group if item.get(point_key) is not None
+                ]
                 coords = [(pt.x, pt.y) for pt in points]
                 unique_coords = []
                 for coord in coords:
@@ -775,9 +886,13 @@ class RasTerrain:
 
         polygons = []
         if {"River", "Reach", "bank_side"}.issubset(bank_lines_gdf.columns):
-            for (river, reach), group in bank_lines_gdf.groupby(["River", "Reach"], dropna=False):
+            for (river, reach), group in bank_lines_gdf.groupby(
+                ["River", "Reach"], dropna=False
+            ):
                 left_lines = group[group["bank_side"].astype(str).str.lower() == "left"]
-                right_lines = group[group["bank_side"].astype(str).str.lower() == "right"]
+                right_lines = group[
+                    group["bank_side"].astype(str).str.lower() == "right"
+                ]
                 for idx in range(min(len(left_lines), len(right_lines))):
                     polygon = RasTerrain._polygon_from_two_lines(
                         left_lines.iloc[idx].geometry,
@@ -833,14 +948,21 @@ class RasTerrain:
 
         for river, reach in key_order:
             group = sorted(grouped[(river, reach)], key=lambda item: item["xs_order"])
-            left_points = [item["left_point"] for item in group if item.get("left_point") is not None]
-            right_points = [item["right_point"] for item in group if item.get("right_point") is not None]
+            left_points = [
+                item["left_point"]
+                for item in group
+                if item.get("left_point") is not None
+            ]
+            right_points = [
+                item["right_point"]
+                for item in group
+                if item.get("right_point") is not None
+            ]
             if len(left_points) < 2 or len(right_points) < 2:
                 continue
-            coords = (
-                [(pt.x, pt.y) for pt in left_points]
-                + [(pt.x, pt.y) for pt in reversed(right_points)]
-            )
+            coords = [(pt.x, pt.y) for pt in left_points] + [
+                (pt.x, pt.y) for pt in reversed(right_points)
+            ]
             if len(coords) < 4:
                 continue
             polygon = Polygon(coords)
@@ -927,7 +1049,9 @@ class RasTerrain:
                 )
 
         if not rows:
-            raise ValueError("TIN triangles did not overlap the interpolation footprint")
+            raise ValueError(
+                "TIN triangles did not overlap the interpolation footprint"
+            )
 
         return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
 
@@ -988,7 +1112,9 @@ class RasTerrain:
         from scipy.interpolate import LinearNDInterpolator
 
         if raster_cell_size is None or raster_cell_size <= 0:
-            raise ValueError("raster_cell_size must be positive when raster output is requested")
+            raise ValueError(
+                "raster_cell_size must be positive when raster output is requested"
+            )
 
         coords, elevations = RasTerrain._unique_interpolation_points(points_gdf)
         if len(coords) < 3:
@@ -1068,18 +1194,22 @@ class RasTerrain:
                 continue
             if safe[column].dtype == object:
                 safe[column] = safe[column].map(
-                    lambda value: value.decode("utf-8", errors="ignore")
-                    if isinstance(value, (bytes, bytearray))
-                    else (
-                        str(value)
-                        if isinstance(value, (dict, list, tuple, np.ndarray))
-                        else value
+                    lambda value: (
+                        value.decode("utf-8", errors="ignore")
+                        if isinstance(value, (bytes, bytearray))
+                        else (
+                            str(value)
+                            if isinstance(value, (dict, list, tuple, np.ndarray))
+                            else value
+                        )
                     )
                 )
         return safe
 
     @staticmethod
-    def _write_xs_surface_gpkg(output_gpkg: Union[str, Path], layers: Dict[str, Any]) -> Path:
+    def _write_xs_surface_gpkg(
+        output_gpkg: Union[str, Path], layers: Dict[str, Any]
+    ) -> Path:
         output_gpkg = Path(output_gpkg)
         output_gpkg.parent.mkdir(parents=True, exist_ok=True)
         if output_gpkg.exists():
@@ -1097,12 +1227,16 @@ class RasTerrain:
             wrote_layer = True
 
         if not wrote_layer:
-            raise ValueError("No non-empty XS interpolation layers were available to write")
+            raise ValueError(
+                "No non-empty XS interpolation layers were available to write"
+            )
 
         return output_gpkg
 
     @staticmethod
-    def _load_hdf_xs_surface_inputs(geom_path: Path, crs, channel_only: bool, ras_object=None):
+    def _load_hdf_xs_surface_inputs(
+        geom_path: Path, crs, channel_only: bool, ras_object=None
+    ):
         import geopandas as gpd
 
         from ..hdf import HdfXsec
@@ -1126,6 +1260,9 @@ class RasTerrain:
                 bank_lines_gdf = bank_lines_gdf.copy()
                 bank_lines_gdf["source"] = "hdf_bank_lines"
         except Exception as e:
+            from ..fast_hdf import reraise_required
+
+            reraise_required(e)
             logger.warning(f"Could not read river bank lines from {geom_path}: {e}")
             bank_lines_gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
 
@@ -1152,7 +1289,9 @@ class RasTerrain:
                     channel_only=channel_only,
                 )
             except Exception as e:
-                logger.warning(f"Skipping HDF cross section {row.get('RS', xs_order)}: {e}")
+                logger.warning(
+                    f"Skipping HDF cross section {row.get('RS', xs_order)}: {e}"
+                )
                 continue
             point_records.extend(records)
             if bank_info:
@@ -1160,7 +1299,14 @@ class RasTerrain:
             if edge_info:
                 edge_infos.append(edge_info)
 
-        return xs_gdf, centerlines_gdf, bank_lines_gdf, point_records, bank_infos, edge_infos
+        return (
+            xs_gdf,
+            centerlines_gdf,
+            bank_lines_gdf,
+            point_records,
+            bank_infos,
+            edge_infos,
+        )
 
     @staticmethod
     def _load_plain_xs_surface_inputs(geom_path: Path, crs, channel_only: bool):
@@ -1175,7 +1321,9 @@ class RasTerrain:
         if "Type" in xs_df.columns:
             xs_df = xs_df[xs_df["Type"] == 1].reset_index(drop=True)
         if xs_df.empty:
-            raise ValueError(f"No Type 1 cross sections found in geometry file: {geom_path}")
+            raise ValueError(
+                f"No Type 1 cross sections found in geometry file: {geom_path}"
+            )
 
         cut_lines_gdf = GeomParser.get_xs_cut_lines(geom_path)
         cut_lines_gdf = RasTerrain._set_gdf_crs(cut_lines_gdf, crs)
@@ -1224,7 +1372,9 @@ class RasTerrain:
             banks = GeomCrossSection.get_bank_stations(geom_path, river, reach, rs)
             left_bank = RasTerrain._safe_float(banks[0]) if banks else None
             right_bank = RasTerrain._safe_float(banks[1]) if banks else None
-            station_elevation = sta_elev_df[["Station", "Elevation"]].to_numpy(dtype=float)
+            station_elevation = sta_elev_df[["Station", "Elevation"]].to_numpy(
+                dtype=float
+            )
 
             records, bank_info, edge_info = RasTerrain._build_xs_point_records(
                 line=line,
@@ -1257,7 +1407,14 @@ class RasTerrain:
 
         cross_sections_gdf = gpd.GeoDataFrame(xs_records, geometry="geometry", crs=crs)
         bank_lines_gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
-        return cross_sections_gdf, centerlines_gdf, bank_lines_gdf, point_records, bank_infos, edge_infos
+        return (
+            cross_sections_gdf,
+            centerlines_gdf,
+            bank_lines_gdf,
+            point_records,
+            bank_infos,
+            edge_infos,
+        )
 
     # ------------------------------------------------------------------
     # XS Interpolation Surface public API
@@ -1293,12 +1450,12 @@ class RasTerrain:
             raster_cell_size: Cell size in project units. Required when
                 ``output_raster`` is provided. If provided without
                 ``output_raster``, an in-memory raster array is returned.
-            crs: Optional CRS override. Plain geometry files otherwise try to
+            crs (pyproj.CRS or str, optional): Optional CRS override. Plain geometry files otherwise try to
                 resolve CRS from the sibling geometry HDF/RASMapper projection.
             channel_only: If True, clip/interpolate between left and right
                 bank stations or RAS bank lines. If False, use full XS extents.
             nodata: NoData value for raster output.
-            ras_object: Optional RasPrj instance for project context.
+            ras_object (RasPrj, optional): Optional RasPrj instance for project context.
 
         Returns:
             dict: Contains ``points``, ``triangles``, ``channel_polygon``,
@@ -1311,9 +1468,13 @@ class RasTerrain:
         if not geom_path.exists():
             raise FileNotFoundError(f"Geometry file not found: {geom_path}")
         if output_raster is not None and raster_cell_size is None:
-            raise ValueError("raster_cell_size is required when output_raster is provided")
+            raise ValueError(
+                "raster_cell_size is required when output_raster is provided"
+            )
         if raster_cell_size is not None and raster_cell_size <= 0:
-            raise ValueError(f"raster_cell_size must be positive, got: {raster_cell_size}")
+            raise ValueError(
+                f"raster_cell_size must be positive, got: {raster_cell_size}"
+            )
 
         resolved_crs = RasTerrain._resolve_xs_surface_crs(geom_path, crs)
         is_hdf = geom_path.suffix.lower() == ".hdf"
@@ -1351,7 +1512,9 @@ class RasTerrain:
         if not point_records:
             raise ValueError(f"No interpolation points could be built from {geom_path}")
 
-        points_gdf = gpd.GeoDataFrame(point_records, geometry="geometry", crs=resolved_crs)
+        points_gdf = gpd.GeoDataFrame(
+            point_records, geometry="geometry", crs=resolved_crs
+        )
         if points_gdf.empty:
             raise ValueError(f"No interpolation points could be built from {geom_path}")
 
@@ -1373,7 +1536,9 @@ class RasTerrain:
                     bank_lines_gdf,
                     crs=resolved_crs,
                 )
-                bank_line_source = "xs_bank_stations" if not footprint_gdf.empty else "none"
+                bank_line_source = (
+                    "xs_bank_stations" if not footprint_gdf.empty else "none"
+                )
             else:
                 bank_line_source = "hdf_bank_lines"
 
@@ -1391,10 +1556,16 @@ class RasTerrain:
                 else derived_bank_lines_gdf
             )
             if bank_lines_gdf is not None and not bank_lines_gdf.empty:
-                bank_line_source = str(bank_lines_gdf.iloc[0].get("source", "bank_lines"))
-            footprint_gdf = RasTerrain._footprint_from_xs_edges(edge_infos, crs=resolved_crs)
+                bank_line_source = str(
+                    bank_lines_gdf.iloc[0].get("source", "bank_lines")
+                )
+            footprint_gdf = RasTerrain._footprint_from_xs_edges(
+                edge_infos, crs=resolved_crs
+            )
             if footprint_gdf.empty:
-                raise ValueError("Could not build a full-cross-section interpolation footprint")
+                raise ValueError(
+                    "Could not build a full-cross-section interpolation footprint"
+                )
             footprint_source = "xs_extents"
 
         triangles_gdf = RasTerrain._compute_tin_triangles(
@@ -1422,7 +1593,9 @@ class RasTerrain:
             "cross_section_count": int(len(cross_sections_gdf)),
             "interpolation_point_count": int(len(points_gdf)),
             "triangle_count": int(len(triangles_gdf)),
-            "bank_line_count": int(len(bank_lines_gdf)) if bank_lines_gdf is not None else 0,
+            "bank_line_count": (
+                int(len(bank_lines_gdf)) if bank_lines_gdf is not None else 0
+            ),
             "bank_line_source": bank_line_source,
             "footprint_source": footprint_source,
             "output_gpkg": str(output_gpkg) if output_gpkg is not None else None,
@@ -1431,7 +1604,9 @@ class RasTerrain:
         if raster is not None:
             metadata.update(
                 {
-                    "raster_shape": tuple(int(value) for value in raster["array"].shape),
+                    "raster_shape": tuple(
+                        int(value) for value in raster["array"].shape
+                    ),
                     "raster_cell_size": float(raster_cell_size),
                     "raster_valid_cell_count": int(raster["valid_cell_count"]),
                 }
@@ -1517,7 +1692,9 @@ class RasTerrain:
                 parent = base_path
                 if parent.exists():
                     for subdir in parent.iterdir():
-                        if subdir.is_dir() and subdir.name.startswith(f"{major}.{minor}"):
+                        if subdir.is_dir() and subdir.name.startswith(
+                            f"{major}.{minor}"
+                        ):
                             rasprocess = subdir / "RasProcess.exe"
                             if rasprocess.exists():
                                 logger.debug(f"Found HEC-RAS at {subdir}")
@@ -1577,10 +1754,208 @@ class RasTerrain:
         )
 
     @staticmethod
+    def _get_hecras_gdal_path_from_install(hecras_path: Path) -> Path:
+        """Return the bundled GDAL executable folder for a HEC-RAS install."""
+        gdal_paths = [
+            hecras_path / "GDAL" / "bin64",
+            hecras_path / "GDAL" / "bin",
+            hecras_path / "gdal" / "bin64",
+            hecras_path / "gdal" / "bin",
+        ]
+
+        for gdal_path in gdal_paths:
+            if (gdal_path / "gdal_translate.exe").exists():
+                return gdal_path
+
+        raise FileNotFoundError(
+            f"HEC-RAS GDAL tools not found in {hecras_path}. "
+            f"Expected GDAL\\bin64\\gdal_translate.exe to exist."
+        )
+
+    @staticmethod
+    def _is_conflicting_gdal_path(path_value: str, hecras_path: Path) -> bool:
+        """Identify PATH entries likely to inject non-HEC GDAL/PROJ DLLs."""
+        if not path_value:
+            return False
+
+        try:
+            candidate = Path(path_value).resolve()
+            hecras_resolved = hecras_path.resolve()
+            if candidate == hecras_resolved or hecras_resolved in candidate.parents:
+                return False
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+        normalized = path_value.replace("/", "\\").lower()
+        conflict_tokens = (
+            "rasterio",
+            "rasterio.libs",
+            "pyproj",
+            "pyproj.libs",
+            "fiona",
+            "fiona.libs",
+            "pyogrio",
+            "pyogrio.libs",
+            "\\osgeo4w",
+            "\\qgis",
+            "\\gdal\\",
+            "program files\\gdal",
+        )
+        return any(token in normalized for token in conflict_tokens)
+
+    @staticmethod
+    def _normalize_gdal_num_threads(
+        gdal_num_threads: Optional[Union[int, str]],
+    ) -> Optional[str]:
+        """Normalize GDAL's thread-count configuration option."""
+        if gdal_num_threads is None:
+            return None
+
+        value = str(gdal_num_threads).strip().upper()
+        if value == "ALL_CPUS":
+            return value
+        if value.isdigit() and int(value) >= 1:
+            return str(int(value))
+        raise ValueError(
+            "gdal_num_threads must be a positive integer, 'ALL_CPUS', or None"
+        )
+
+    @staticmethod
+    def _build_hecras_terrain_env(
+        hecras_path: Path,
+        gdal_num_threads: Optional[Union[int, str]] = None,
+        gdal_cachemax_mb: Optional[int] = None,
+    ) -> Dict[str, str]:
+        """
+        Build a subprocess environment isolated to HEC-RAS's bundled GDAL.
+
+        Python GIS packages and system GDAL installs commonly set GDAL/PROJ
+        variables or PATH entries that can be inherited by RasProcess.exe.
+        CreateTerrain is sensitive to that mismatch, so terrain creation gets
+        a child-only environment with HEC-RAS paths first and external GDAL/PROJ
+        configuration removed.
+        """
+        env = os.environ.copy()
+
+        for key in (
+            "GDAL_DATA",
+            "GDAL_DRIVER_PATH",
+            "GDAL_SKIP",
+            "PROJ_DATA",
+            "PROJ_LIB",
+            "PROJ_NETWORK",
+        ):
+            env.pop(key, None)
+
+        gdal_path = RasTerrain._get_hecras_gdal_path_from_install(hecras_path)
+        preferred_paths = [str(hecras_path), str(gdal_path)]
+        gdal_data = hecras_path / "GDAL" / "common" / "data"
+        if gdal_data.is_dir():
+            env["GDAL_DATA"] = str(gdal_data)
+            env["PROJ_DATA"] = str(gdal_data)
+            env["PROJ_LIB"] = str(gdal_data)
+
+        raw_path = env.get("PATH", "")
+        inherited_paths = [
+            path_entry
+            for path_entry in raw_path.split(os.pathsep)
+            if path_entry
+            and path_entry not in preferred_paths
+            and not RasTerrain._is_conflicting_gdal_path(path_entry, hecras_path)
+        ]
+        env["PATH"] = os.pathsep.join(preferred_paths + inherited_paths)
+
+        normalized_threads = RasTerrain._normalize_gdal_num_threads(gdal_num_threads)
+        if normalized_threads is None:
+            env.pop("GDAL_NUM_THREADS", None)
+        else:
+            env["GDAL_NUM_THREADS"] = normalized_threads
+
+        if gdal_cachemax_mb is None:
+            env.pop("GDAL_CACHEMAX", None)
+        elif isinstance(gdal_cachemax_mb, bool) or int(gdal_cachemax_mb) < 1:
+            raise ValueError("gdal_cachemax_mb must be a positive integer or None")
+        else:
+            env["GDAL_CACHEMAX"] = str(int(gdal_cachemax_mb))
+
+        return env
+
+    @staticmethod
+    def _format_rasprocess_failure(
+        result: subprocess.CompletedProcess,
+        output_hdf: Path,
+    ) -> str:
+        """Create a concise diagnostic string for RasProcess failures."""
+        details = [
+            f"Terrain creation failed for {output_hdf}.",
+            f"Return code: {result.returncode}.",
+        ]
+        if result.stderr:
+            details.append(f"STDERR: {result.stderr.strip()}")
+        if result.stdout:
+            details.append(f"STDOUT: {result.stdout.strip()}")
+        return " ".join(details)
+
+    @staticmethod
+    def _validate_terrain_hdf(output_hdf: Path) -> Dict[str, Any]:
+        """
+        Validate that CreateTerrain produced a usable, non-stub terrain HDF.
+
+        A failed CreateTerrain run can leave a tiny HDF5 file with only an empty
+        /Terrain group. That file is syntactically valid HDF5 but unusable by
+        the geometry preprocessor, so existence alone is not enough.
+        """
+        try:
+            import h5py
+        except ImportError as exc:
+            raise RuntimeError(
+                "h5py is required to validate HEC-RAS terrain HDF output."
+            ) from exc
+
+        try:
+            with h5py.File(output_hdf, "r") as hdf:
+                if "Terrain" not in hdf:
+                    raise RuntimeError(
+                        f"Terrain HDF is missing the required /Terrain group: "
+                        f"{output_hdf}"
+                    )
+
+                groups: List[str] = []
+                datasets: List[str] = []
+
+                def collect(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        datasets.append(name)
+                    elif isinstance(obj, h5py.Group):
+                        groups.append(name)
+
+                hdf["Terrain"].visititems(collect)
+
+        except OSError as exc:
+            raise RuntimeError(
+                f"Terrain creation produced an unreadable HDF file: {output_hdf}"
+            ) from exc
+
+        if not datasets:
+            file_size = output_hdf.stat().st_size
+            group_summary = ", ".join(groups[:10]) if groups else "<none>"
+            raise RuntimeError(
+                f"Terrain creation produced a stub HDF with no datasets under "
+                f"/Terrain: {output_hdf} ({file_size:,} bytes). "
+                f"Terrain groups found: {group_summary}. This usually indicates "
+                "RasProcess.exe failed during final terrain HDF assembly."
+            )
+
+        return {
+            "groups": len(groups),
+            "datasets": len(datasets),
+            "sample_datasets": datasets[:5],
+        }
+
+    @staticmethod
     @log_call
     def _generate_prj_from_raster(
-        raster_path: Union[str, Path],
-        output_prj: Union[str, Path]
+        raster_path: Union[str, Path], output_prj: Union[str, Path]
     ) -> Path:
         """
         Generate ESRI PRJ file from raster's coordinate reference system.
@@ -1632,6 +2007,7 @@ class RasTerrain:
             try:
                 # pyproj 3.x approach
                 from pyproj import CRS
+
                 crs = CRS.from_wkt(src.crs.to_wkt())
                 prj_wkt = crs.to_wkt("WKT1_ESRI")
             except (ImportError, AttributeError):
@@ -1646,8 +2022,9 @@ class RasTerrain:
         output_prj.parent.mkdir(parents=True, exist_ok=True)
 
         # Write PRJ file
-        output_prj.write_text(prj_wkt, encoding='utf-8')
-        logger.info(f"Created projection file: {output_prj}")
+        _write_ras_text(output_prj, prj_wkt, encoding="utf-8")
+        logger.info(f"Projection file created: {output_prj.name}")
+        logger.debug(f"Projection file path: {output_prj}")
 
         return output_prj
 
@@ -1661,6 +2038,7 @@ class RasTerrain:
         stitch: bool = True,
         hecras_version: str = "7.0",
         timeout_seconds: int = 600,
+        gdal_num_threads: Optional[Union[int, str]] = None,
     ) -> Path:
         """
         Create HEC-RAS terrain HDF from input rasters using RasProcess.exe.
@@ -1687,8 +2065,12 @@ class RasTerrain:
             hecras_version: HEC-RAS version to use for RasProcess.exe.
                            Defaults to "7.0".
             timeout_seconds: Maximum time to wait for RasProcess.exe to
-                            finish terrain creation. Defaults to 600
-                            seconds (10 minutes).
+                             finish terrain creation. Defaults to 600
+                             seconds (10 minutes).
+            gdal_num_threads: Threads made available to GDAL operations inside
+                CreateTerrain. Defaults to the HEC-RAS runtime setting. Set a positive
+                integer to cap threaded compression/warping, or ``None`` to
+                remove the setting from the child process.
 
         Returns:
             Path: Path to created terrain HDF file.
@@ -1714,27 +2096,34 @@ class RasTerrain:
 
         Notes:
             - The RasProcess.exe command requires all paths to be quoted
-              due to spaces in "Program Files".
+                due to spaces in "Program Files".
             - Input rasters are processed in order - first raster has
-              priority in overlapping areas.
+                priority in overlapping areas.
             - The output folder will be created automatically if it doesn't
-              exist.
+                exist.
             - Verified working with HEC-RAS 6.6 (tested 2025-12-25).
+            - Threading applies only to GDAL operations that support
+                ``GDAL_NUM_THREADS``; serial HEC-RAS terrain-HDF stages remain
+                serial.
         """
-        # Convert to Path objects
-        output_hdf = Path(output_hdf)
-        projection_prj = Path(projection_prj)
-        input_rasters = [Path(r) for r in input_rasters]
+        # Convert to Path objects. Resolve to ABSOLUTE paths: RasProcess.exe runs with
+        # cwd=hecras_path (so HEC's bundled GDAL/PROJ resolve correctly), which means any
+        # relative prj/out/input paths would be looked up under the HEC-RAS install dir and
+        # fail ("PRJ File ... does not exist"). Absolutizing here keeps cwd harmless.
+        output_hdf = RasUtils.safe_resolve(Path(output_hdf))
+        projection_prj = RasUtils.safe_resolve(Path(projection_prj))
+        input_rasters = [RasUtils.safe_resolve(Path(r)) for r in input_rasters]
 
         # Validate units
         if units not in ("Feet", "Meters"):
-            raise ValueError(
-                f"Units must be 'Feet' or 'Meters', got: '{units}'"
-            )
+            raise ValueError(f"Units must be 'Feet' or 'Meters', got: '{units}'")
         if timeout_seconds <= 0:
             raise ValueError(
                 f"timeout_seconds must be positive, got: {timeout_seconds}"
             )
+        normalized_gdal_threads = RasTerrain._normalize_gdal_num_threads(
+            gdal_num_threads
+        )
 
         # Validate input files exist
         for raster in input_rasters:
@@ -1758,34 +2147,37 @@ class RasTerrain:
         # Remove existing output if present
         if output_hdf.exists():
             output_hdf.unlink()
-            logger.info(f"Removed existing terrain HDF: {output_hdf}")
+            logger.debug(f"Removed existing terrain HDF before creation: {output_hdf}")
 
-        # Build command string with proper quoting
-        # Note: Must use shell=True due to spaces in "Program Files"
+        # Build command arguments. Passing a list handles spaces in paths
+        # without involving the shell.
         stitch_str = "true" if stitch else "false"
 
-        cmd_str = (
-            f'"{rasprocess}" CreateTerrain '
-            f'units={units} stitch={stitch_str} '
-            f'prj="{projection_prj}" '
-            f'out="{output_hdf}"'
+        cmd = [
+            str(rasprocess),
+            "CreateTerrain",
+            f"units={units}",
+            f"stitch={stitch_str}",
+            f"prj={projection_prj}",
+            f"out={output_hdf}",
+        ] + [str(raster) for raster in input_rasters]
+        env = RasTerrain._build_hecras_terrain_env(
+            hecras_path,
+            gdal_num_threads=normalized_gdal_threads,
         )
 
-        # Add input files (all in double quotes)
-        for raster in input_rasters:
-            cmd_str += f' "{raster}"'
-
-        logger.info(f"Executing terrain creation command...")
-        logger.debug(f"Command: {cmd_str}")
+        logger.debug("Running RasProcess.exe CreateTerrain")
+        logger.debug(f"Command: {subprocess.list2cmdline(cmd)}")
 
         # Execute command
         try:
             result = subprocess.run(
-                cmd_str,
-                shell=True,
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                cwd=str(hecras_path),
+                env=env,
             )
 
             logger.debug(f"Return code: {result.returncode}")
@@ -1794,7 +2186,14 @@ class RasTerrain:
                 logger.debug(f"STDOUT: {result.stdout}")
 
             if result.stderr:
-                logger.warning(f"STDERR: {result.stderr}")
+                if result.returncode == 0:
+                    logger.warning(
+                        "RasProcess.exe CreateTerrain completed with stderr; "
+                        "enable DEBUG logging for details."
+                    )
+                    logger.debug(f"STDERR: {result.stderr}")
+                else:
+                    logger.debug(f"STDERR: {result.stderr}")
 
         except subprocess.TimeoutExpired:
             raise RuntimeError(
@@ -1804,27 +2203,107 @@ class RasTerrain:
         except Exception as e:
             raise RuntimeError(f"Failed to execute RasProcess.exe: {e}")
 
+        if result.returncode != 0:
+            raise RuntimeError(
+                RasTerrain._format_rasprocess_failure(result, output_hdf)
+            )
+
         # Verify output was created
         if not output_hdf.exists():
-            error_details = ""
-            if result.stderr:
-                error_details = f" STDERR: {result.stderr}"
-            if result.stdout:
-                error_details += f" STDOUT: {result.stdout}"
-
             raise RuntimeError(
                 f"Terrain creation failed - output HDF not created: {output_hdf}."
-                f" Return code: {result.returncode}.{error_details}"
+                f" {RasTerrain._format_rasprocess_failure(result, output_hdf)}"
             )
+
+        validation = RasTerrain._validate_terrain_hdf(output_hdf)
 
         # Log success
         file_size = output_hdf.stat().st_size
         logger.info(
-            f"Terrain HDF created successfully: {output_hdf} "
-            f"({file_size:,} bytes, {file_size/1024/1024:.2f} MB)"
+            f"Terrain HDF created: {output_hdf.name} "
+            f"({file_size/1024/1024:.2f} MB, "
+            f"{validation['datasets']} datasets)"
         )
+        logger.debug(f"Terrain HDF output path: {output_hdf} " f"({file_size:,} bytes)")
 
         return output_hdf
+
+    @staticmethod
+    @log_call
+    def create_terrain_hdf_lossless(
+        input_raster: Union[str, Path],
+        output_hdf: Union[str, Path],
+        projection_prj: Union[str, Path],
+        units: str = "Feet",
+        hecras_version: str = "6.6",
+        timeout_seconds: float = 1800,
+        gdal_num_threads: int = 1,
+    ) -> Path:
+        """Register one Float32 foot DEM without rounding or reprojection.
+
+        Uses HEC-RAS 6.6's native ``TerrainComputable`` with ``RoundTo.None``
+        in an isolated Windows/Wine Python process. Regenerates the TIFF,
+        overviews and native HDF caches together; never replaces a TIFF after
+        compilation. Input must be square, north-up, nodata=-9999 with no explicit
+        validity mask and in the
+        same projected foot CRS as the PRJ. Values must already be in feet;
+        no vertical datum or unit conversion is performed.
+
+        Creates a new HDF/TIFF/VRT prefix, ``.creation.json`` validation receipt
+        and ``.creation.log``. Existing output prefixes are rejected and the
+        input is read-only. Validates exact stored pixel bits and native HDF
+        structure. Native centre, mesh and hydraulic qualification are separate
+        checks. Requires rasterio, NumPy, h5py, pythonnet and installed HEC-RAS 6.6.
+        The ordinary ``create_terrain_hdf`` defaults remain unchanged.
+
+        Args:
+            input_raster: Read-only Float32 GeoTIFF with elevations in feet.
+            output_hdf: New .hdf path; creates its parent directory and siblings.
+            projection_prj: PRJ defining the same projected foot CRS as the raster.
+            units: Elevation units. Only "Feet" is supported (default).
+            hecras_version: Installed native runtime. Only "6.6" is supported (default).
+            timeout_seconds: Positive native subprocess deadline, default 1800 seconds.
+                Excludes input inspection and output validation. An expired deadline
+                terminates only the launched process tree and retains a failed receipt.
+            gdal_num_threads: Positive GDAL thread cap, default 1.
+
+        Returns:
+            Path to the new native terrain HDF after registration and stored-bit checks.
+
+        Raises:
+            ValueError: Unsupported inputs, options, or an existing output prefix.
+            FileNotFoundError: Input, projection, or native runtime is unavailable.
+            RuntimeError: Native creation or output validation fails.
+            subprocess.TimeoutExpired: The native subprocess exceeds its deadline.
+        """
+        import math
+
+        from ._lossless_create import create_lossless
+
+        if units != "Feet" or hecras_version != "6.6":
+            raise ValueError(
+                "Lossless native creation supports only Feet and HEC-RAS 6.6"
+            )
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        if (
+            isinstance(gdal_num_threads, bool)
+            or not isinstance(gdal_num_threads, int)
+            or gdal_num_threads < 1
+        ):
+            raise ValueError("gdal_num_threads must be a positive integer")
+        source, output, projection = (
+            RasUtils.safe_resolve(Path(path))
+            for path in (input_raster, output_hdf, projection_prj)
+        )
+        for path in (source, projection):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        install = RasTerrain._get_hecras_path(hecras_version)
+        env = RasTerrain._build_hecras_terrain_env(install, gdal_num_threads)
+        return create_lossless(
+            source, output, projection, install, env, timeout_seconds
+        )
 
     @staticmethod
     @log_call
@@ -1835,7 +2314,10 @@ class RasTerrain:
         create_overviews: bool = True,
         overview_levels: Optional[List[int]] = None,
         nodata_value: Optional[float] = None,
-        hecras_version: str = "7.0"
+        hecras_version: str = "7.0",
+        gdal_num_threads: Optional[Union[int, str]] = None,
+        *,
+        write_options: Optional[GeoTiffWriteOptions] = None,
     ) -> Path:
         """
         Convert VRT (Virtual Raster) to single optimized TIFF.
@@ -1858,6 +2340,12 @@ class RasTerrain:
                          source NoData value.
             hecras_version: HEC-RAS version for GDAL tools path.
                            Defaults to "7.0".
+            gdal_num_threads: Threads used for supported GeoTIFF compression
+                operations. Defaults to the GDAL runtime setting; use a positive integer
+                to cap usage or ``None`` to disable the setting.
+            write_options: Typed creation, tiling, cache, compression, and
+                overview settings. Do not combine with non-default legacy
+                compression/overview/thread arguments.
 
         Returns:
             Path: Path to created TIFF file.
@@ -1874,20 +2362,52 @@ class RasTerrain:
             ...     create_overviews=True
             ... )
         """
-        vrt_path = Path(vrt_path)
-        output_path = Path(output_path)
+        # GDAL subprocesses run from the HEC-RAS installation directory, so
+        # relative caller paths must be anchored before changing ``cwd``.
+        vrt_path = Path(os.path.abspath(vrt_path))
+        output_path = Path(os.path.abspath(output_path))
 
         if not vrt_path.exists():
             raise FileNotFoundError(f"VRT file not found: {vrt_path}")
 
-        # Set default overview levels
-        if overview_levels is None:
-            overview_levels = [2, 4, 8, 16, 32]
+        if write_options is not None:
+            if not isinstance(write_options, GeoTiffWriteOptions):
+                raise TypeError("write_options must be a GeoTiffWriteOptions")
+            legacy_non_default = (
+                compression != "LZW"
+                or create_overviews is not True
+                or overview_levels is not None
+                or gdal_num_threads is not None
+            )
+            if legacy_non_default:
+                raise ValueError(
+                    "write_options cannot be combined with non-default "
+                    "compression, overview, or gdal_num_threads arguments"
+                )
+            options = write_options
+            strict_overview_failures = True
+        else:
+            options = GeoTiffWriteOptions(
+                compression=compression,
+                create_overviews=create_overviews,
+                overview_levels=tuple(overview_levels or (2, 4, 8, 16, 32)),
+                gdal_num_threads=gdal_num_threads,
+            )
+            strict_overview_failures = False
 
         # Get GDAL tools path
         gdal_path = RasTerrain._get_hecras_gdal_path(hecras_version)
+        hecras_path = gdal_path.parents[1]
         gdal_translate = gdal_path / "gdal_translate.exe"
         gdaladdo = gdal_path / "gdaladdo.exe"
+        normalized_gdal_threads = RasTerrain._normalize_gdal_num_threads(
+            options.gdal_num_threads
+        )
+        env = RasTerrain._build_hecras_terrain_env(
+            hecras_path,
+            gdal_num_threads=normalized_gdal_threads,
+            gdal_cachemax_mb=options.gdal_cachemax_mb,
+        )
 
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1895,18 +2415,34 @@ class RasTerrain:
         # Build gdal_translate command
         cmd = [
             str(gdal_translate),
-            "-of", "GTiff",
-            "-co", f"COMPRESS={compression}",
-            "-co", "TILED=YES",
-            "-co", "BIGTIFF=IF_SAFER",
+            "-of",
+            "GTiff",
+            "-co",
+            f"COMPRESS={options.compression}",
+            "-co",
+            "TILED=YES",
+            "-co",
+            f"BIGTIFF={options.bigtiff}",
         ]
+        if options.tile_size is not None:
+            cmd.extend(["-co", f"BLOCKXSIZE={options.tile_size}"])
+            cmd.extend(["-co", f"BLOCKYSIZE={options.tile_size}"])
+        if options.predictor is not None:
+            cmd.extend(["-co", f"PREDICTOR={options.predictor}"])
+        if options.compression_level is not None:
+            level_key = "ZSTD_LEVEL" if options.compression == "ZSTD" else "ZLEVEL"
+            cmd.extend(["-co", f"{level_key}={options.compression_level}"])
+        if normalized_gdal_threads is not None:
+            cmd.extend(["-co", f"NUM_THREADS={normalized_gdal_threads}"])
 
         if nodata_value is not None:
             cmd.extend(["-a_nodata", str(nodata_value)])
 
         cmd.extend([str(vrt_path), str(output_path)])
 
-        logger.info(f"Converting VRT to TIFF: {vrt_path} -> {output_path}")
+        logger.info(f"Converting VRT to TIFF: {vrt_path.name} -> {output_path.name}")
+        logger.debug(f"VRT to TIFF input path: {vrt_path}")
+        logger.debug(f"VRT to TIFF output path: {output_path}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         # Execute gdal_translate
@@ -1915,7 +2451,9 @@ class RasTerrain:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=1800  # 30 minute timeout for large files
+                timeout=1800,  # 30 minute timeout for large files
+                cwd=str(hecras_path),
+                env=env,
             )
 
             if result.returncode != 0:
@@ -1940,17 +2478,24 @@ class RasTerrain:
                 f"TIFF creation failed - output file not created: {output_path}"
             )
 
-        logger.info(f"TIFF created: {output_path}")
+        logger.debug(f"TIFF created: {output_path}")
 
         # Add overviews if requested
-        if create_overviews:
-            logger.info(f"Adding pyramid overviews: {overview_levels}")
+        if options.create_overviews:
+            logger.info(f"Adding pyramid overviews: {list(options.overview_levels)}")
 
             cmd = [
                 str(gdaladdo),
-                "-r", "average",
-                str(output_path)
-            ] + [str(level) for level in overview_levels]
+                "-r",
+                options.overview_resampling,
+                str(output_path),
+            ] + [str(level) for level in options.overview_levels]
+            if options.overview_compression is not None:
+                cmd[1:1] = [
+                    "--config",
+                    "COMPRESS_OVERVIEW",
+                    options.overview_compression,
+                ]
 
             logger.debug(f"Command: {' '.join(cmd)}")
 
@@ -1959,32 +2504,194 @@ class RasTerrain:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=600  # 10 minute timeout for overviews
+                    timeout=600,  # 10 minute timeout for overviews
+                    cwd=str(hecras_path),
+                    env=env,
                 )
 
-                if result.returncode != 0:
-                    logger.warning(
-                        f"gdaladdo failed with code {result.returncode}. "
-                        f"STDERR: {result.stderr}. Continuing without overviews."
-                    )
-                else:
-                    logger.info("Pyramid overviews added successfully")
-
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                if strict_overview_failures:
+                    raise RuntimeError(
+                        "gdaladdo timed out while applying explicit write_options"
+                    ) from exc
                 logger.warning(
                     "Overview creation timed out. Continuing without overviews."
                 )
-            except Exception as e:
-                logger.warning(f"Failed to add overviews: {e}")
+            except Exception as exc:
+                if strict_overview_failures:
+                    raise RuntimeError(
+                        "Failed to execute gdaladdo for explicit write_options: "
+                        f"{exc}"
+                    ) from exc
+                logger.warning(f"Failed to add overviews: {exc}")
+            else:
+                if result.returncode != 0:
+                    if strict_overview_failures:
+                        raise RuntimeError(
+                            f"gdaladdo failed with code {result.returncode} for "
+                            f"explicit write_options. STDERR: {result.stderr}"
+                        )
+                    logger.warning(
+                        f"gdaladdo failed with code {result.returncode}; "
+                        "continuing without overviews. Enable DEBUG logging for details."
+                    )
+                    if result.stderr:
+                        logger.debug(f"gdaladdo STDERR: {result.stderr}")
+                else:
+                    logger.info("Pyramid overviews added successfully")
 
         # Log final file info
         file_size = output_path.stat().st_size
         logger.info(
-            f"VRT to TIFF conversion complete: {output_path} "
-            f"({file_size:,} bytes, {file_size/1024/1024:.2f} MB)"
+            f"VRT to TIFF conversion complete: {output_path.name} "
+            f"({file_size/1024/1024:.2f} MB)"
+        )
+        logger.debug(
+            f"VRT to TIFF output path: {output_path} " f"({file_size:,} bytes)"
         )
 
         return output_path
+
+    @staticmethod
+    @log_call
+    def profile_vrt_to_tiff(
+        vrt_path: Union[str, Path],
+        output_path: Union[str, Path],
+        report_path: Optional[Union[str, Path]] = None,
+        *,
+        write_options: Optional[GeoTiffWriteOptions] = None,
+        nodata_value: Optional[float] = None,
+        hecras_version: str = "7.0",
+        sample_interval_seconds: float = 0.2,
+    ) -> RasterOperationProfileResult:
+        """Profile one VRT consolidation setting and persist its metrics."""
+        options = write_options or GeoTiffWriteOptions()
+        if not isinstance(options, GeoTiffWriteOptions):
+            raise TypeError("write_options must be a GeoTiffWriteOptions")
+        output = Path(os.path.abspath(output_path))
+        report = (
+            Path(os.path.abspath(report_path))
+            if report_path is not None
+            else output.with_suffix(output.suffix + ".profile.json")
+        )
+        profile_settings = {
+            "write_options": options.to_dict(),
+            "vrt_path": str(Path(os.path.abspath(vrt_path))),
+            "output_path": str(output),
+            "nodata_value": nodata_value,
+            "hecras_version": hecras_version,
+            "sample_interval_seconds": sample_interval_seconds,
+        }
+
+        profiler = ProcessTreeProfiler(
+            sample_interval_seconds,
+            watch_paths=(output.parent,),
+        )
+        profiler.start()
+        started = time.perf_counter()
+        try:
+            result_path = RasTerrain.vrt_to_tiff(
+                vrt_path=vrt_path,
+                output_path=output,
+                nodata_value=nodata_value,
+                hecras_version=hecras_version,
+                write_options=options,
+            )
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            profiler.stop()
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema": "ras-commander.raster-operation-profile/1",
+                        "status": "failed",
+                        "operation": "vrt_to_tiff",
+                        "settings": profile_settings,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "elapsed_seconds": elapsed,
+                        "samples": [sample.to_dict() for sample in profiler.samples],
+                        "performance_summary": profiler.performance_summary(),
+                        "phase_summary": profiler.phase_summary(),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            raise
+        elapsed = time.perf_counter() - started
+        profiler.stop()
+
+        result = RasterOperationProfileResult(
+            operation="vrt_to_tiff",
+            settings=profile_settings,
+            output_path=result_path,
+            elapsed_seconds=round(elapsed, 3),
+            peak_tree_rss_mb=round(profiler.peak_tree_rss_mb, 3),
+            peak_tree_private_mb=(
+                round(profiler.peak_tree_private_mb, 3)
+                if profiler.peak_tree_private_mb is not None
+                else None
+            ),
+            minimum_available_memory_mb=profiler.minimum_available_memory_mb,
+            minimum_commit_headroom_mb=profiler.minimum_commit_headroom_mb,
+            process_counters=profiler.grouped_counters(),
+            samples=tuple(profiler.samples),
+            performance_summary=profiler.performance_summary(),
+            phase_summary=profiler.phase_summary(),
+            output_signature=RasTerrain._raster_signature(result_path),
+            report_path=report,
+        )
+        result.write_report()
+        return result
+
+    @staticmethod
+    def _raster_signature(raster_path: Union[str, Path]) -> Dict[str, Any]:
+        """Hash raster pixels blockwise and retain comparison metadata."""
+        try:
+            import rasterio
+        except ImportError as exc:
+            raise RuntimeError("rasterio is required for raster signatures") from exc
+
+        path = Path(raster_path)
+        digest = hashlib.sha256()
+        with rasterio.open(path) as source:
+            for band in range(1, source.count + 1):
+                for row_offset in range(0, source.height, 256):
+                    row_stop = min(source.height, row_offset + 256)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message="Setting the shape on a NumPy array.*",
+                            category=DeprecationWarning,
+                        )
+                        block = source.read(
+                            band,
+                            window=((row_offset, row_stop), (0, source.width)),
+                        )
+                    digest.update(memoryview(block))
+            return {
+                "pixel_sha256": digest.hexdigest(),
+                "width": source.width,
+                "height": source.height,
+                "count": source.count,
+                "dtypes": list(source.dtypes),
+                "crs": source.crs.to_wkt() if source.crs else None,
+                "transform": list(source.transform),
+                "nodata": source.nodata,
+                "block_shapes": [list(shape) for shape in source.block_shapes],
+                "compression": (
+                    source.compression.value if source.compression else None
+                ),
+                "overviews": source.overviews(1) if source.count else [],
+                "overviews_by_band": [
+                    source.overviews(band) for band in range(1, source.count + 1)
+                ],
+                # pathlib handles both mapped drives and UNC paths without
+                # constructing an invalid ``\\?\\server`` extended path.
+                "file_size_bytes": path.stat().st_size,
+            }
 
     @staticmethod
     @log_call
@@ -1995,7 +2702,8 @@ class RasTerrain:
         units: str = "Feet",
         stitch: bool = True,
         hecras_version: str = "7.0",
-        generate_prj: bool = True
+        generate_prj: bool = True,
+        gdal_num_threads: Optional[Union[int, str]] = None,
     ) -> Path:
         """
         Create HEC-RAS terrain from input rasters with automatic PRJ generation.
@@ -2014,6 +2722,8 @@ class RasTerrain:
             hecras_version: HEC-RAS version. Defaults to "7.0".
             generate_prj: Auto-generate PRJ from first raster. If False,
                          expects Projection.prj to exist in output_folder.
+            gdal_num_threads: Threads made available to supported GDAL terrain
+                preprocessing. Defaults to the HEC-RAS runtime setting.
 
         Returns:
             Path: Path to created terrain HDF file.
@@ -2049,10 +2759,7 @@ class RasTerrain:
         # Generate PRJ if requested and not already present
         if generate_prj and not projection_prj.exists():
             logger.debug(f"Generating projection file from: {input_rasters[0]}")
-            RasTerrain._generate_prj_from_raster(
-                input_rasters[0],
-                projection_prj
-            )
+            RasTerrain._generate_prj_from_raster(input_rasters[0], projection_prj)
         elif not projection_prj.exists():
             raise FileNotFoundError(
                 f"Projection file not found and generate_prj=False: {projection_prj}"
@@ -2065,7 +2772,8 @@ class RasTerrain:
             projection_prj=projection_prj,
             units=units,
             stitch=stitch,
-            hecras_version=hecras_version
+            hecras_version=hecras_version,
+            gdal_num_threads=gdal_num_threads,
         )
 
     @staticmethod
